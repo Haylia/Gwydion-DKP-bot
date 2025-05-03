@@ -826,6 +826,62 @@ async def player(ctx, name):
         embed.add_field(name = "Main", value = embedvals[2], inline = True)
         embed.add_field(name = "Level", value = embedvals[3], inline = True)
         embed.add_field(name = "Class", value = embedvals[4], inline = True)
+        # embed.add_field(name = "DG", value = embedvals[5], inline = True)
+        embed.add_field(name = "Main Character", value = embedvals[6], inline = True)
+        # embed.add_field(name = "Subclass", value = embedvals[7], inline = True)
+        # embed.add_field(name = "CG Offhand", value = embedvals[8], inline = True)
+        # embed.add_field(name = "DL", value = embedvals[9], inline = True)
+        # embed.add_field(name = "DL Main", value = embedvals[10], inline = True)
+        # embed.add_field(name = "DL Offhand", value = embedvals[11], inline = True)
+        # embed.add_field(name = "EDL", value = embedvals[12], inline = True)
+        # embed.add_field(name = "EDL Main", value = embedvals[13], inline = True)
+        # embed.add_field(name = "EDL Offhand", value = embedvals[14], inline = True)
+        cell2 = bot4ws2.find(realname)
+        row_num2 = cell2.row
+        dkprowvals = bot4ws2.row_values(row_num2, value_render_option='UNFORMATTED_VALUE')
+        embed.add_field(name = "DKP", value = "Earned: " + str(dkprowvals[3]) + ", Current: " + str(dkprowvals[6]), inline = False)
+        cell3 = bot4ws3.find(realname)
+        row_num3 = cell3.row
+        dkprowvals2 = bot4ws3.row_values(row_num3, value_render_option='UNFORMATTED_VALUE')
+        embed.add_field(name = "GKP", value = "Earned: " + str(dkprowvals2[3]) + ", Current: " + str(dkprowvals2[6]), inline = False)
+        cell4 = bot4ws4.find(realname)
+        row_num4 = cell4.row
+        dkprowvals3 = bot4ws4.row_values(row_num4, value_render_option='UNFORMATTED_VALUE')
+        embed.add_field(name = "PKP", value = "Earned: " + str(dkprowvals3[3]) + ", Current: " + str(dkprowvals3[6]), inline = False)
+        cell5 = bot4ws5.find(realname)
+        row_num5 = cell5.row
+        dkprowvals4 = bot4ws5.row_values(row_num5, value_render_option='UNFORMATTED_VALUE')
+        embed.add_field(name = "AKP", value = "Earned: " + str(dkprowvals4[3]) + ", Current: " + str(dkprowvals4[6]), inline = False)
+        cell6 = bot4ws6.find(realname)
+        row_num6 = cell6.row
+        dkprowvals5 = bot4ws6.row_values(row_num6, value_render_option='UNFORMATTED_VALUE')
+        embed.add_field(name = "LEP", value = "Earned: " + str(dkprowvals5[3]) + ", Current: " + str(dkprowvals5[6]), inline = False)
+        cell7 = bot4ws7.find(realname)
+        row_num7 = cell7.row
+        dkprowvals6 = bot4ws7.row_values(row_num7, value_render_option='UNFORMATTED_VALUE')
+        embed.add_field(name = "DPKP", value = "Earned: " + str(dkprowvals6[3]) + ", Current: " + str(dkprowvals6[6]), inline = False)
+        cell8 = bot4ws8.find(realname)
+        row_num8 = cell8.row
+        dkprowvals7 = bot4ws8.row_values(row_num8, value_render_option='UNFORMATTED_VALUE')
+        embed.add_field(name = "RBPP", value = "Earned: " + str(dkprowvals7[3]) + ", Current: " + str(dkprowvals7[6]), inline = False)
+        await ctx.send(embed=embed)
+    else:
+        await ctx.send(name + " not in list!")
+
+@client.command(guild_ids = guilds)
+async def playerfull(ctx, name):
+    """Displays a player's information"""
+    user_list = bot4ws1.col_values(1)
+    realname, caps, spaces = find_name(name, user_list)
+    if realname != None:
+        cell = bot4ws1.find(realname)
+        row_num = cell.row
+        embedvals = bot4ws1.row_values(row_num, value_render_option='UNFORMATTED_VALUE')
+        embed = discord.Embed(title = realname, colour=discord.Color.orange())
+        embed.add_field(name = "Rank", value = embedvals[1], inline = True)
+        embed.add_field(name = "Main", value = embedvals[2], inline = True)
+        embed.add_field(name = "Level", value = embedvals[3], inline = True)
+        embed.add_field(name = "Class", value = embedvals[4], inline = True)
         embed.add_field(name = "DG", value = embedvals[5], inline = True)
         embed.add_field(name = "Main Character", value = embedvals[6], inline = True)
         embed.add_field(name = "Subclass", value = embedvals[7], inline = True)
@@ -2338,6 +2394,16 @@ async def unban(ctx, name):
 async def delete(ctx, *args):
     """Deletes something"""
     await ctx.send("Deleting " + " ".join(args))
+
+@client.command(guild_ids = guilds)
+async def source(ctx):
+    """posts the link for the source code"""
+    await ctx.send("https://github.com/Haylia/Gwydion-DKP-bot")
+
+@client.command(guild_ids = guilds)
+async def donate(ctx):
+    """posts the link for donations"""
+    await ctx.send("https://www.paypal.me/liastarrrr")
 
 #@client.command(guild_ids = guilds)
 #async def leaderboard(ctx, kp, number):
