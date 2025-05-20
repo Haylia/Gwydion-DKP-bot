@@ -24,7 +24,7 @@ intents = discord.Intents.all()
 client = commands.Bot(command_prefix = '$', intents = intents, case_insensitive = True)
 pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
 
-# google account 1: general kp use
+# google account 1: general kp use (lia-paranoid)
 googleacc1 = gspread.service_account(filename = "paranoid-kp-bot-43a1e7152411.json") # replace with the service account for the bot in googles apis (https://docs.gspread.org/en/latest/oauth2.html)
 bot1sheet = googleacc1.open_by_url("https://docs.google.com/spreadsheets/d/1Izu2wSmi0aEQCWTvfLAXX0ucXR2223ILzFxTiQXcl80/edit#gid=0")
 bot1ws1 = bot1sheet.get_worksheet(0)
@@ -40,7 +40,7 @@ bot1ws10 = bot1sheet.get_worksheet(9)
 bot1ws11 = bot1sheet.get_worksheet(10)
 print("accessing the spreadsheet for account 1")
 
-# google account 2: rbpp
+# google account 2: rbpp (lia-bkp-bot)
 googleacc2 = gspread.service_account(filename = "paranoid-kp-bot-513a901effbc.json") # replace with the service account for the bot in googles apis (https://docs.gspread.org/en/latest/oauth2.html)
 bot2sheet = googleacc2.open_by_url("https://docs.google.com/spreadsheets/d/1Izu2wSmi0aEQCWTvfLAXX0ucXR2223ILzFxTiQXcl80/edit#gid=0")
 bot2ws1 = bot2sheet.get_worksheet(0) 
@@ -56,7 +56,7 @@ bot2ws10 = bot2sheet.get_worksheet(9)
 bot2ws11 = bot2sheet.get_worksheet(10)
 print("accessing the spreadsheet for account 2")
 
-# google account 3: loot and logging
+# google account 3: loot and logging (lia-dkp-bot)
 googleacc3 = gspread.service_account(filename = "paranoid-kp-bot-29090cc5a87a.json") # replace with the service account for the bot in googles apis (https://docs.gspread.org/en/latest/oauth2.html)
 bot3sheet = googleacc3.open_by_url("https://docs.google.com/spreadsheets/d/1Izu2wSmi0aEQCWTvfLAXX0ucXR2223ILzFxTiQXcl80/edit#gid=0")
 bot3ws1 = bot3sheet.get_worksheet(0) 
@@ -75,7 +75,7 @@ bot3ws12 = bot3sheet2.get_worksheet(0) # bid tracking
 bot3ws13 = bot3sheet2.get_worksheet(1) # player tracking
 print("accessing the spreadsheet for account 3")
 
-# google account 4: clan member reads
+# google account 4: clan member reads (lia-leaderboard-bot)
 googleacc4 = gspread.service_account(filename = "paranoid-kp-bot-b724a91cd608.json") # replace with the service account for the bot in googles apis (https://docs.gspread.org/en/latest/oauth2.html)
 bot4sheet = googleacc4.open_by_url("https://docs.google.com/spreadsheets/d/1Izu2wSmi0aEQCWTvfLAXX0ucXR2223ILzFxTiQXcl80/edit#gid=0")
 bot4ws1 = bot4sheet.get_worksheet(0) 
@@ -91,7 +91,7 @@ bot4ws10 = bot4sheet.get_worksheet(9)
 bot4ws11 = bot4sheet.get_worksheet(10) 
 print("accessing the spreadsheet for account 4")
 
-# google account 5: admin use
+# google account 5: admin use (lia-reaping-bot)
 googleacc5 = gspread.service_account(filename = "paranoid-kp-bot-410d8c0e26d1.json") # replace with the service account for the bot in googles apis (https://docs.gspread.org/en/latest/oauth2.html)
 bot5sheet = googleacc5.open_by_url("https://docs.google.com/spreadsheets/d/1Izu2wSmi0aEQCWTvfLAXX0ucXR2223ILzFxTiQXcl80/edit#gid=0")
 bot5ws1 = bot5sheet.get_worksheet(0) 
@@ -105,15 +105,17 @@ bot5ws8 = bot5sheet.get_worksheet(7)
 bot5ws9 = bot5sheet.get_worksheet(8)
 bot5ws10 = bot5sheet.get_worksheet(9)
 bot5ws11 = bot5sheet.get_worksheet(10)
+bot5ws12 = bot5sheet.get_worksheet(11) 
+bot5ws13 = bot5sheet.get_worksheet(12)
 print("accessing the spreadsheet for account 5")
 
-dkp_bosses = {}
+vkp_bosses = {"Crom": 125}
 gkp_bosses = {"Reaver":5, "Lich":5, "Bt":50}
 pkp_bosses = {"Bane": 10}
 akp_bosses = {"Gele":50, "Base":10, "Prime":20}
-lep_bosses = {}
+rbppunox_bosses = {"Unox5":1, "Unox6": 1}
 dpkp_bosses = {"Dino":75, "Dinofast":100}
-rbpp_bosses = {"Unox5":1, "Rev6":1, "Kroth6":1, "Gron6":1, "Unox6": 1, "Hrung":1, "Mord":1, "Necro":1, "Dino":1, "Dinofast":1, "Bane": 1, "Bt":1, "Base":1, "Prime":1, "Gele":1}
+rbpp_bosses = {"Unox5":1, "Rev6":1, "Kroth6":1, "Gron6":1, "Unox6": 1, "Hrung":1, "Mord":1, "Necro":1, "Dino":1, "Dinofast":1, "Bane": 1, "Bt":1, "Base":1, "Prime":1, "Gele":1, "Crom":1}
 
 
 bidslastupdate = time.time()
@@ -152,7 +154,7 @@ async def bidloop():
     global bidslastupdate
     bidslastupdate = time.time()
     twelvehoursinseconds = 43200
-    resultschannel = 1232181306519978034
+    resultschannel = 1232811852811993169
     try:
         bidopentimes = bot3ws12.col_values(1)
         itemids = bot3ws12.col_values(2)
@@ -186,7 +188,13 @@ async def bidloop():
                     results.append([player, bid])
                     print(player, bid)
                 results.sort(key = lambda x: x[1], reverse = True)
-                await client.get_channel(resultschannel).send("The bid for " + combilist[i][3] + " has been closed. The highest bidder was " + results[0][0] + " with a bid of " + str(results[0][1]) + " " + combilist[i][4])
+                msgtosend = "The bid for " + combilist[i][3] + " has been closed. The highest bidder was " + results[0][0] + " with a bid of " + str(results[0][1]) + " " + combilist[i][4]
+                print(msgtosend)
+                for k in range(1, len(results)):
+                    msgtosend += "\n" + results[k][0] + " bid " + str(results[k][1]) + " " + combilist[i][4]
+                print(msgtosend)
+                await client.get_channel(resultschannel).send(msgtosend)
+                
     except Exception as e:
         print(e, e.__traceback__.tb_lineno)
 
@@ -338,7 +346,27 @@ async def on_command_error(ctx, error):
         print(error)
     elif isinstance(error, commands.CommandInvokeError):
         await ctx.send("Winston is crying himself to sleep (google sheets may have been rate limited, there was an error, or reda sucks at programming)")
-        print(error, error.__traceback__.tb_lineno)
+        # test all the service accounts to see if they are rate limited
+        try:
+            bot1ws1.get_all_records()
+        except Exception as e:
+            print("bot1 is rate limited")
+        try:
+            bot2ws1.get_all_records()
+        except Exception as e:
+            print("bot2 is rate limited")
+        try:
+            bot3ws1.get_all_records()
+        except Exception as e:
+            print("bot3 is rate limited")
+        try:
+            bot4ws1.get_all_records()
+        except Exception as e:
+            print("bot4 is rate limited")
+        try:
+            bot5ws1.get_all_records()
+        except Exception as e:
+            print("bot5 is rate limited")
     elif isinstance(error, commands.CommandNotFound):
         await ctx.send("command doesn't exist. yet? try $information for text based help or $help for a full list of commands. If what you want isn't there, DM reda to get it added!")
     elif isinstance(error, commands.NoPrivateMessage):
@@ -353,8 +381,8 @@ async def on_command_error(ctx, error):
 async def startbid(ctx, item, startprice, kp, startbidder):
     """Starts a bid for a new item"""
     kp = kp.upper()
-    if kp not in ["DKP", "GKP", "PKP", "AKP", "LEP", "DPKP"]:
-        await ctx.send("Invalid kp type! Please use DKP, GKP, PKP, AKP, LEP, DPKP")
+    if kp not in ["VKP", "GKP", "PKP", "AKP", "RBPPUNOX", "DPKP"]:
+        await ctx.send("Invalid kp type! Please use VKP, GKP, PKP, AKP, RBPPUNOX, DPKP")
         return
     #get the bottom row for the id
     id = len(bot3ws12.col_values(1))
@@ -506,13 +534,18 @@ async def bidinfo(ctx, id):
 async def addpoints(ctx, playername, pointtype, earned, spent, adjusted):
     """setup command for initializing points on the sheet. only to be used in setup"""
     pointtype = pointtype.upper()
-    if pointtype not in ["DKP", "GKP", "PKP", "AKP", "LEP", "DPKP", "RBPP"]:
-        await ctx.send("Invalid point type! Please use DKP, GKP, PKP, AKP, LEP, DPKP, or RBPP")
+    if pointtype not in ["VKP", "GKP", "PKP", "AKP", "RBPPUNOX", "DPKP", "RBPP"]:
+        await ctx.send("Invalid point type! Please use VKP, GKP, PKP, AKP, RBPPUNOX, DPKP, or RBPP")
         return
     earned = float(earned)
     spent = float(spent)
     adjusted = float(adjusted)
-    if pointtype == "DKP":
+    findnames, caps, spaces = find_name(playername, bot5ws1.col_values(1))
+    if not findnames:
+        await ctx.send("Player not found")
+    else:
+        playername = findnames
+    if pointtype == "VKP":
         # using the playername, find the row number
         playerrow = bot5ws2.find(playername)
         rownum = playerrow.row
@@ -520,57 +553,57 @@ async def addpoints(ctx, playername, pointtype, earned, spent, adjusted):
         bot5ws2.update_cell(rownum, 4, earned)
         bot5ws2.update_cell(rownum, 5, spent)
         bot5ws2.update_cell(rownum, 6, adjusted)
-        await ctx.send("DKP for " + playername + " have been updated")
+        await ctx.send("VKP for " + playername + " has been updated")
     elif pointtype == "GKP":
         playerrow = bot5ws3.find(playername)
         rownum = playerrow.row
         bot5ws3.update_cell(rownum, 4, earned)
         bot5ws3.update_cell(rownum, 5, spent)
         bot5ws3.update_cell(rownum, 6, adjusted)
-        await ctx.send("GKP for " + playername + " have been updated")
+        await ctx.send("GKP for " + playername + " has been updated")
     elif pointtype == "PKP":
         playerrow = bot5ws4.find(playername)
         rownum = playerrow.row
         bot5ws4.update_cell(rownum, 4, earned)
         bot5ws4.update_cell(rownum, 5, spent)
         bot5ws4.update_cell(rownum, 6, adjusted)
-        await ctx.send("PKP for " + playername + " have been updated")
+        await ctx.send("PKP for " + playername + " has been updated")
     elif pointtype == "AKP":
         playerrow = bot5ws5.find(playername)
         rownum = playerrow.row
         bot5ws5.update_cell(rownum, 4, earned)
         bot5ws5.update_cell(rownum, 5, spent)
         bot5ws5.update_cell(rownum, 6, adjusted)
-        await ctx.send("AKP for " + playername + " have been updated")
-    elif pointtype == "LEP":
+        await ctx.send("AKP for " + playername + " has been updated")
+    elif pointtype == "RBPPUNOX":
         playerrow = bot5ws6.find(playername)
         rownum = playerrow.row
         bot5ws6.update_cell(rownum, 4, earned)
         bot5ws6.update_cell(rownum, 5, spent)
         bot5ws6.update_cell(rownum, 6, adjusted)
-        await ctx.send("LEP for " + playername + " have been updated")
+        await ctx.send("RBPPUNOX for " + playername + " has been updated")
     elif pointtype == "DPKP":
         playerrow = bot5ws7.find(playername)
         rownum = playerrow.row
         bot5ws7.update_cell(rownum, 4, earned)
         bot5ws7.update_cell(rownum, 5, spent)
         bot5ws7.update_cell(rownum, 6, adjusted)
-        await ctx.send("DPKP for " + playername + " have been updated")
+        await ctx.send("DPKP for " + playername + " has been updated")
     elif pointtype == "RBPP":
         playerrow = bot5ws8.find(playername)
         rownum = playerrow.row
         bot5ws8.update_cell(rownum, 4, earned)
         bot5ws8.update_cell(rownum, 5, spent)
         bot5ws8.update_cell(rownum, 6, adjusted)
-        await ctx.send("RBPP for " + playername + " have been updated")
+        await ctx.send("RBPP for " + playername + " has been updated")
 
 @client.command(guild_ids = guilds)
 @commands.has_any_role("General", "REDALiCE")
-async def addallearned(ctx, playername, DKP, GKP, PKP, AKP, LEP, DPKP, RBPP):
-    """Adds all the points earned to the player in the order DKP, GKP, PKP, AKP, LEP, DPKP, RBPP"""
+async def addallearned(ctx, playername, VKP, GKP, PKP, AKP, RBPPUNOX, DPKP, RBPP):
+    """Adds all the points earned to the player in the order VKP, GKP, PKP, AKP, RBPPUNOX, DPKP, RBPP"""
     playerrow = bot5ws2.find(playername)
     rownum = playerrow.row
-    bot5ws2.update_cell(rownum, 4, float(DKP))
+    bot5ws2.update_cell(rownum, 4, float(VKP))
     playerrow = bot5ws3.find(playername)
     rownum = playerrow.row
     bot5ws3.update_cell(rownum, 4, float(GKP))
@@ -582,7 +615,7 @@ async def addallearned(ctx, playername, DKP, GKP, PKP, AKP, LEP, DPKP, RBPP):
     bot5ws5.update_cell(rownum, 4, float(AKP))
     playerrow = bot5ws6.find(playername)
     rownum = playerrow.row
-    bot5ws6.update_cell(rownum, 4, float(LEP))
+    bot5ws6.update_cell(rownum, 4, float(RBPPUNOX))
     playerrow = bot5ws7.find(playername)
     rownum = playerrow.row
     bot5ws7.update_cell(rownum, 4, float(DPKP))
@@ -623,7 +656,7 @@ async def addmem(ctx, name, rank, main, level, cclass):
         rownum = len(bot5ws2.col_values(1)) + 1
         rownum = str(rownum)
         currformula = '=Sum(D' + rownum + '+F'+rownum+'-E'+rownum+')'
-        attendformula1 = "=(COUNTIFS('Bosses last 45'!C2:C, \"*DKP*\", 'Bosses last 45'!D2:D, \"*" + name + "*\"))/COUNTIFS('Bosses last 45'!B2:B, \"<>*HALF*\", 'Bosses last 45'!B2:B, \"<>\", 'Bosses last 45'!C2:C, \"*DKP*\")"
+        attendformula1 = "=(COUNTIFS('Bosses last 45'!C2:C, \"*VKP*\", 'Bosses last 45'!D2:D, \"*" + name + "*\"))/COUNTIFS('Bosses last 45'!B2:B, \"<>*HALF*\", 'Bosses last 45'!B2:B, \"<>\", 'Bosses last 45'!C2:C, \"*VKP*\")"
         kpbody1 = [name,0,attendformula1,0,0,0,currformula]
         attendformula2 = "=(COUNTIFS('Bosses last 45'!C2:C, \"*GKP*\", 'Bosses last 45'!D2:D, \"*" + name + "*\"))/COUNTIFS('Bosses last 45'!B2:B, \"<>*HALF*\", 'Bosses last 45'!B2:B, \"<>\", 'Bosses last 45'!C2:C, \"*GKP*\")"
         kpbody2 = [name,0,attendformula2,0,0,0,currformula]
@@ -631,7 +664,7 @@ async def addmem(ctx, name, rank, main, level, cclass):
         kpbody3 = [name,0,attendformula3,0,0,0,currformula]
         attendformula4 = "=(COUNTIFS('Bosses last 45'!C2:C, \"*AKP*\", 'Bosses last 45'!D2:D, \"*" + name + "*\"))/COUNTIFS('Bosses last 45'!B2:B, \"<>*HALF*\", 'Bosses last 45'!B2:B, \"<>\", 'Bosses last 45'!C2:C, \"*AKP*\")"
         kpbody4 = [name,0,attendformula4,0,0,0,currformula]
-        attendformula5 = "=(COUNTIFS('Bosses last 45'!C2:C, \"*LEP*\", 'Bosses last 45'!D2:D, \"*" + name + "*\"))/COUNTIFS('Bosses last 45'!B2:B, \"<>*HALF*\", 'Bosses last 45'!B2:B, \"<>\", 'Bosses last 45'!C2:C, \"*LEP*\")"
+        attendformula5 = "=(COUNTIFS('Bosses last 45'!C2:C, \"*RBPPUNOX*\", 'Bosses last 45'!D2:D, \"*" + name + "*\"))/COUNTIFS('Bosses last 45'!B2:B, \"<>*HALF*\", 'Bosses last 45'!B2:B, \"<>\", 'Bosses last 45'!C2:C, \"*RBPPUNOX*\")"
         kpbody5 = [name,0,attendformula5,0,0,0,currformula]
         attendformula6 = "=(COUNTIFS('Bosses last 45'!C2:C, \"*DPKP*\", 'Bosses last 45'!D2:D, \"*" + name + "*\"))/COUNTIFS('Bosses last 45'!B2:B, \"<>*HALF*\", 'Bosses last 45'!B2:B, \"<>\", 'Bosses last 45'!C2:C, \"*DPKP*\")"
         kpbody6 = [name,0,attendformula6,0,0,0,currformula]
@@ -839,7 +872,7 @@ async def player(ctx, name):
         cell2 = bot4ws2.find(realname)
         row_num2 = cell2.row
         dkprowvals = bot4ws2.row_values(row_num2, value_render_option='UNFORMATTED_VALUE')
-        embed.add_field(name = "DKP", value = "Earned: " + str(dkprowvals[3]) + ", Current: " + str(dkprowvals[6]), inline = False)
+        embed.add_field(name = "VKP", value = "Earned: " + str(dkprowvals[3]) + ", Current: " + str(dkprowvals[6]), inline = False)
         cell3 = bot4ws3.find(realname)
         row_num3 = cell3.row
         dkprowvals2 = bot4ws3.row_values(row_num3, value_render_option='UNFORMATTED_VALUE')
@@ -855,7 +888,7 @@ async def player(ctx, name):
         cell6 = bot4ws6.find(realname)
         row_num6 = cell6.row
         dkprowvals5 = bot4ws6.row_values(row_num6, value_render_option='UNFORMATTED_VALUE')
-        embed.add_field(name = "LEP", value = "Earned: " + str(dkprowvals5[3]) + ", Current: " + str(dkprowvals5[6]), inline = False)
+        embed.add_field(name = "RBPPUNOX", value = "Earned: " + str(dkprowvals5[3]) + ", Current: " + str(dkprowvals5[6]), inline = False)
         cell7 = bot4ws7.find(realname)
         row_num7 = cell7.row
         dkprowvals6 = bot4ws7.row_values(row_num7, value_render_option='UNFORMATTED_VALUE')
@@ -895,7 +928,7 @@ async def playerfull(ctx, name):
         cell2 = bot4ws2.find(realname)
         row_num2 = cell2.row
         dkprowvals = bot4ws2.row_values(row_num2, value_render_option='UNFORMATTED_VALUE')
-        embed.add_field(name = "DKP", value = "Earned: " + str(dkprowvals[3]) + ", Current: " + str(dkprowvals[6]), inline = False)
+        embed.add_field(name = "VKP", value = "Earned: " + str(dkprowvals[3]) + ", Current: " + str(dkprowvals[6]), inline = False)
         cell3 = bot4ws3.find(realname)
         row_num3 = cell3.row
         dkprowvals2 = bot4ws3.row_values(row_num3, value_render_option='UNFORMATTED_VALUE')
@@ -911,7 +944,7 @@ async def playerfull(ctx, name):
         cell6 = bot4ws6.find(realname)
         row_num6 = cell6.row
         dkprowvals5 = bot4ws6.row_values(row_num6, value_render_option='UNFORMATTED_VALUE')
-        embed.add_field(name = "LEP", value = "Earned: " + str(dkprowvals5[3]) + ", Current: " + str(dkprowvals5[6]), inline = False)
+        embed.add_field(name = "RBPPUNOX", value = "Earned: " + str(dkprowvals5[3]) + ", Current: " + str(dkprowvals5[6]), inline = False)
         cell7 = bot4ws7.find(realname)
         row_num7 = cell7.row
         dkprowvals6 = bot4ws7.row_values(row_num7, value_render_option='UNFORMATTED_VALUE')
@@ -934,7 +967,7 @@ async def playerkp(ctx, name):
         row_num = cell.row
         embedvals = bot4ws2.row_values(row_num)
         embed = discord.Embed(title = realname + "'s KP", colour=discord.Color.orange())
-        embed.add_field(name = "DKP", value = "Last Raid: " + embedvals[1] + ", Att %: " + embedvals[2] + ", Earned: " + embedvals[3] + ", Spent: " + embedvals[4] + ", Adjusted: " + embedvals[5] + ", Current: " + str(embedvals[6]), inline = False)
+        embed.add_field(name = "VKP", value = "Last Raid: " + embedvals[1] + ", Att %: " + embedvals[2] + ", Earned: " + embedvals[3] + ", Spent: " + embedvals[4] + ", Adjusted: " + embedvals[5] + ", Current: " + str(embedvals[6]), inline = False)
         cell2 = bot4ws3.find(realname)
         row_num2 = cell2.row
         embedvals2 = bot4ws3.row_values(row_num2)
@@ -950,7 +983,7 @@ async def playerkp(ctx, name):
         cell5 = bot4ws6.find(realname)
         row_num5 = cell5.row
         embedvals5 = bot4ws6.row_values(row_num5)
-        embed.add_field(name = "LEP", value = "Last Raid: " + embedvals5[1] + ", Att %: " + embedvals5[2] + ", Earned: " + embedvals5[3] + ", Spent: " + embedvals5[4] + ", Adjusted: " + embedvals5[5] + ", Current: " + str(embedvals5[6]), inline = False)
+        embed.add_field(name = "RBPPUNOX", value = "Last Raid: " + embedvals5[1] + ", Att %: " + embedvals5[2] + ", Earned: " + embedvals5[3] + ", Spent: " + embedvals5[4] + ", Adjusted: " + embedvals5[5] + ", Current: " + str(embedvals5[6]), inline = False)
         cell6 = bot4ws7.find(realname)
         row_num6 = cell6.row
         embedvals6 = bot4ws7.row_values(row_num6)
@@ -1007,7 +1040,7 @@ async def fullpointwipe(ctx, name, verification):
             cell1 = bot5ws2.find(realname)
             row_num1 = cell1.row
             currformula1 = '=Sum(D' + str(row_num1) + '+F'+str(row_num1)+'-E'+str(row_num1)+')'
-            attendformula1 = "=(COUNTIFS('Bosses last 45'!C2:C, \"*DKP*\", 'Bosses last 45'!D2:D, \"*" + realname + "*\"))/COUNTIFS('Bosses last 45'!B2:B, \"<>*HALF*\", 'Bosses last 45'!B2:B, \"<>\", 'Bosses last 45'!C2:C, \"*DKP*\")"
+            attendformula1 = "=(COUNTIFS('Bosses last 45'!C2:C, \"*VKP*\", 'Bosses last 45'!D2:D, \"*" + realname + "*\"))/COUNTIFS('Bosses last 45'!B2:B, \"<>*HALF*\", 'Bosses last 45'!B2:B, \"<>\", 'Bosses last 45'!C2:C, \"*VKP*\")"
             wipedrow1 = [realname,0,attendformula1,0,0,0,currformula1]
             bot5ws2.update([wipedrow1], "A" + str(row_num1), value_input_option='USER_ENTERED')
             cell2 = bot5ws3.find(realname)
@@ -1031,7 +1064,7 @@ async def fullpointwipe(ctx, name, verification):
             cell5 = bot5ws6.find(realname)
             row_num5 = cell5.row
             currformula5 = '=Sum(D' + str(row_num5) + '+F'+str(row_num5)+'-E'+str(row_num5)+')'
-            attendformula5 = "=(COUNTIFS('Bosses last 45'!C2:C, \"*LEP*\", 'Bosses last 45'!D2:D, \"*" + realname + "*\"))/COUNTIFS('Bosses last 45'!B2:B, \"<>*HALF*\", 'Bosses last 45'!B2:B, \"<>\", 'Bosses last 45'!C2:C, \"*LEP*\")"
+            attendformula5 = "=(COUNTIFS('Bosses last 45'!C2:C, \"*RBPPUNOX*\", 'Bosses last 45'!D2:D, \"*" + realname + "*\"))/COUNTIFS('Bosses last 45'!B2:B, \"<>*HALF*\", 'Bosses last 45'!B2:B, \"<>\", 'Bosses last 45'!C2:C, \"*RBPPUNOX*\")"
             wipedrow5 = [realname,0,attendformula5,0,0,0,currformula5]
             bot5ws6.update([wipedrow5], "A" + str(row_num5), value_input_option='USER_ENTERED')
             cell6 = bot5ws7.find(realname)
@@ -1063,7 +1096,7 @@ async def deduct(ctx, name, item, number, kp):
     kp = kp.upper()
     number = float(number)
 
-    if kp == "DKP":
+    if kp == "VKP":
         user_list = bot3ws2.col_values(1)
         realname, caps, spaces = find_name(name, user_list)
         if realname != None:
@@ -1082,10 +1115,10 @@ async def deduct(ctx, name, item, number, kp):
                 lootlist = bot3ws9.row_values(lootrow)
                 costlist = bot3ws9.row_values(costrow)
                 lootlist.append(item)
-                costlist.append(str(number) + " DKP")
+                costlist.append(str(number) + " VKP")
                 bot3ws9.update([lootlist], "A" + str(lootrow))
                 bot3ws9.update([costlist], "A" + str(costrow))
-                await ctx.send(realname + " has been deducted " + str(number) + " DKP for " + item)
+                await ctx.send(realname + " has been deducted " + str(number) + " VKP for " + item)
                 logbody = ["deduct", str(ctx.author.name), dt.now().strftime("%d/%m/%Y %H:%M:%S"), str([realname, item, number, kp])]
                 bot3ws11.append_row(logbody)
         else:
@@ -1171,7 +1204,7 @@ async def deduct(ctx, name, item, number, kp):
                 bot3ws11.append_row(logbody)
         else:
             await ctx.send(name + " not in list!")
-    if kp == "LEP":
+    if kp == "RBPPUNOX":
         user_list = bot3ws6.col_values(1)
         realname, caps, spaces = find_name(name, user_list)
         if realname != None:
@@ -1190,10 +1223,10 @@ async def deduct(ctx, name, item, number, kp):
                 lootlist = bot3ws9.row_values(lootrow)
                 costlist = bot3ws9.row_values(costrow)
                 lootlist.append(item)
-                costlist.append(str(number) + " LEP")
+                costlist.append(str(number) + " RBPPUNOX")
                 bot3ws9.update([lootlist], "A" + str(lootrow))
                 bot3ws9.update([costlist], "A" + str(costrow))
-                await ctx.send(realname + " has been deducted " + str(number) + " LEP for " + item)
+                await ctx.send(realname + " has been deducted " + str(number) + " RBPPUNOX for " + item)
                 logbody = ["deduct", str(ctx.author.name), dt.now().strftime("%d/%m/%Y %H:%M:%S"), str([realname, item, number, kp])]
                 bot3ws11.append_row(logbody)
         else:
@@ -1304,13 +1337,13 @@ async def refunditem(ctx, name, itemnum):
             newitemname = "[REFUNDED] " + itemname
             lootlist[itemnum] = newitemname
             bot3ws9.update([lootlist], "A" + str(row_num))
-            if itemkp == "DKP":
+            if itemkp == "VKP":
                 kpcell = bot3ws2.find(realname)
                 kprow = kpcell.row
                 spent = float(bot3ws2.cell(kprow, 5).value)
                 newspent = spent - itemprice
                 bot3ws2.update_cell(kprow, 5, newspent)
-                await ctx.send(realname + " has been refunded " + str(itemprice) + " DKP for " + itemname)
+                await ctx.send(realname + " has been refunded " + str(itemprice) + " VKP for " + itemname)
                 logbody = ["refund", str(ctx.author.name), dt.now().strftime("%d/%m/%Y %H:%M:%S"), str([realname, itemname, itemprice, itemkp])]
                 bot3ws11.append_row(logbody)
             elif itemkp == "GKP":
@@ -1340,13 +1373,13 @@ async def refunditem(ctx, name, itemnum):
                 await ctx.send(realname + " has been refunded " + str(itemprice) + " AKP for " + itemname)
                 logbody = ["refund", str(ctx.author.name), dt.now().strftime("%d/%m/%Y %H:%M:%S"), str([realname, itemname, itemprice, itemkp])]
                 bot3ws11.append_row(logbody)
-            elif itemkp == "LEP":
+            elif itemkp == "RBPPUNOX":
                 kpcell = bot3ws6.find(realname)
                 kprow = kpcell.row
                 spent = float(bot3ws6.cell(kprow, 5).value)
                 newspent = spent - itemprice
                 bot3ws6.update_cell(kprow, 5, newspent)
-                await ctx.send(realname + " has been refunded " + str(itemprice) + " LEP for " + itemname)
+                await ctx.send(realname + " has been refunded " + str(itemprice) + " RBPPUNOX for " + itemname)
                 logbody = ["refund", str(ctx.author.name), dt.now().strftime("%d/%m/%Y %H:%M:%S"), str([realname, itemname, itemprice, itemkp])]
                 bot3ws11.append_row(logbody)
             elif itemkp == "DPKP":
@@ -1368,7 +1401,7 @@ async def refundolditem(ctx, name, amount, kp):
     """Processes a refund for an item that was not added to the loot list"""
     amount = float(amount)
     kp = kp.upper()
-    if kp == "DKP":
+    if kp == "VKP":
         user_list = bot3ws2.col_values(1)
         realname, caps, spaces = find_name(name, user_list)
         if realname != None:
@@ -1377,7 +1410,7 @@ async def refundolditem(ctx, name, amount, kp):
             currentspent = float(bot3ws2.cell(row_num, 5).value)
             new = currentspent - amount
             bot3ws2.update_cell(row_num, 5, new)
-            await ctx.send(realname + " has been refunded " + str(amount) + " DKP")
+            await ctx.send(realname + " has been refunded " + str(amount) + " VKP")
             logbody = ["refund", str(ctx.author.name), dt.now().strftime("%d/%m/%Y %H:%M:%S"), str([realname, amount, kp])]
             bot3ws11.append_row(logbody)
         else:
@@ -1424,7 +1457,7 @@ async def refundolditem(ctx, name, amount, kp):
             bot3ws11.append_row(logbody)
         else:
             await ctx.send(name + " not in list!")
-    if kp == "LEP":
+    if kp == "RBPPUNOX":
         user_list = bot3ws6.col_values(1)
         realname, caps, spaces = find_name(name, user_list)
         if realname != None:
@@ -1433,7 +1466,7 @@ async def refundolditem(ctx, name, amount, kp):
             currentspent = float(bot3ws6.cell(row_num, 5).value)
             new = currentspent - amount
             bot3ws6.update_cell(row_num, 5, new)
-            await ctx.send(realname + " has been refunded " + str(amount) + " LEP")
+            await ctx.send(realname + " has been refunded " + str(amount) + " RBPPUNOX")
             logbody = ["refund", str(ctx.author.name), dt.now().strftime("%d/%m/%Y %H:%M:%S"), str([realname, amount, kp])]
             bot3ws11.append_row(logbody)
         else:
@@ -1477,7 +1510,7 @@ async def adjust(ctx, name, number, kp):
     """adjusts a players kp by a certain amount"""
     kp = kp.upper()
     number = float(number)
-    if kp == "DKP":
+    if kp == "VKP":
         user_list = bot5ws2.col_values(1)
         realname, caps, spaces = find_name(name, user_list)
         if realname != None:
@@ -1485,7 +1518,7 @@ async def adjust(ctx, name, number, kp):
             row_num = cell.row
             adjusted = float(bot5ws2.cell(row_num, 6).value) + number
             bot5ws2.update_cell(row_num, 6, adjusted)
-            await ctx.send(realname + "'s DKP has been adjusted by " + str(number))
+            await ctx.send(realname + "'s VKP has been adjusted by " + str(number))
             logbody = ["adjust", str(ctx.author.name), dt.now().strftime("%d/%m/%Y %H:%M:%S"), str([realname, number, kp])]
             bot3ws11.append_row(logbody)
         else:
@@ -1529,7 +1562,7 @@ async def adjust(ctx, name, number, kp):
             bot3ws11.append_row(logbody)
         else:
             await ctx.send(name + " not in list!")
-    if kp == "LEP":
+    if kp == "RBPPUNOX":
         user_list = bot5ws6.col_values(1)
         realname, caps, spaces = find_name(name, user_list)
         if realname != None:
@@ -1537,7 +1570,7 @@ async def adjust(ctx, name, number, kp):
             row_num = cell.row
             adjusted = float(bot5ws6.cell(row_num, 6).value) + number
             bot5ws6.update_cell(row_num, 6, adjusted)
-            await ctx.send(realname + "'s LEP has been adjusted by " + str(number))
+            await ctx.send(realname + "'s RBPPUNOX has been adjusted by " + str(number))
             logbody = ["adjust", str(ctx.author.name), dt.now().strftime("%d/%m/%Y %H:%M:%S"), str([realname, number, kp])]
             bot3ws11.append_row(logbody)
         else:
@@ -1575,7 +1608,7 @@ async def boss(ctx, bossname, toonlist):
     """attendance command"""
     # check the bossname against the lists
     # some bosses have level requirements to check also, so need to pull the row from the roster
-    user_list = bot3ws1.col_values(1)
+    user_list = bot4ws1.col_values(1)
     bossname = bossname.capitalize()
     await ctx.send("processing attendance for " + bossname)
     toonlist = toonlist.split(",")
@@ -1588,25 +1621,27 @@ async def boss(ctx, bossname, toonlist):
     pkp_list = []
     pkp_low_list = []  
     gkp_list = []
-    dkp_list = []
+    vkp_list = []
+    rbppunox_list = []
     kppool = []
     toonlist = list(set(toonlist))
-    print("Boss command set up")
     currenttime =  dt.now().strftime("%d/%m/%Y %H:%M:%S")
     for t in toonlist:
         findt, caps, spaces = find_name(t, user_list)
         print("doing attendance for " + findt)
         if findt != None:
-            cell = bot3ws1.find(findt, in_column=1)
+            cell = bot4ws1.find(findt, in_column=1)
             row_num = cell.row
-            level = int(bot3ws1.cell(row_num, 4).value)
-            maintoon = bot3ws1.cell(row_num, 3).value
+            #get the whole row
+            row = bot3ws1.row_values(row_num)
+            level = int(row[3])
+            maintoon = row[2]
             maintoon = toBool(maintoon)
-            mainchar = bot3ws1.cell(row_num, 7).value
+            mainchar = row[6]
             #insert level checking here if its needed
 
             if maintoon and findt not in rbpp_list:
-            # rbpp and dino
+            # rbpp and dino and crom
                 if bossname in rbpp_bosses:
                     cell2 = bot2ws8.find(findt, in_column=1)
                     row_num2 = cell2.row
@@ -1627,6 +1662,26 @@ async def boss(ctx, bossname, toonlist):
                     dpkp_list.append(findt)
                     if "DPKP" not in kppool:
                         kppool.append("DPKP")
+                if bossname in rbppunox_bosses:
+                    cell8 = bot2ws6.find(findt, in_column=1)
+                    row_num8 = cell8.row
+                    earned = float(bot2ws6.cell(row_num8, 4).value)
+                    new = earned + rbppunox_bosses[bossname]
+                    bot2ws6.update_cell(row_num8, 4, new)
+                    bot5ws6.update_cell(row_num8, 2, currenttime)
+                    rbppunox_list.append(findt)
+                    if "RBPPUNOX" not in kppool:
+                        kppool.append("RBPPUNOX")
+                if bossname in vkp_bosses:
+                    cell7 = bot1ws2.find(findt, in_column=1)
+                    row_num7 = cell7.row
+                    earned = float(bot1ws2.cell(row_num7, 4).value)
+                    new = earned + vkp_bosses[bossname]
+                    bot1ws2.update_cell(row_num7, 4, new)
+                    bot5ws2.update_cell(row_num7, 2, currenttime)
+                    vkp_list.append(findt)
+                    if "VKP" not in kppool:
+                        kppool.append("VKP")
             elif mainchar not in rbpp_list:
                 if bossname in rbpp_bosses:
                     cell2 = bot2ws8.find(mainchar, in_column=1)
@@ -1648,6 +1703,26 @@ async def boss(ctx, bossname, toonlist):
                     dpkp_list.append(mainchar)
                     if "DPKP" not in kppool:
                         kppool.append("DPKP")
+                if bossname in rbppunox_bosses:
+                    cell8 = bot2ws6.find(mainchar, in_column=1)
+                    row_num8 = cell8.row
+                    earned = float(bot2ws6.cell(row_num8, 4).value)
+                    new = earned + rbppunox_bosses[bossname]
+                    bot2ws6.update_cell(row_num8, 4, new)
+                    bot5ws6.update_cell(row_num8, 2, currenttime)
+                    rbppunox_list.append(mainchar)
+                    if "RBPPUNOX" not in kppool:
+                        kppool.append("RBPPUNOX")
+                if bossname in vkp_bosses:
+                    cell7 = bot1ws2.find(mainchar, in_column=1)
+                    row_num7 = cell7.row
+                    earned = float(bot1ws2.cell(row_num7, 4).value)
+                    new = earned + vkp_bosses[bossname]
+                    bot1ws2.update_cell(row_num7, 4, new)
+                    bot5ws2.update_cell(row_num7, 2, currenttime)
+                    vkp_list.append(mainchar)
+                    if "VKP" not in kppool:
+                        kppool.append("VKP")
             if bossname in akp_bosses:
                 if level >= 220:
                     cell4 = bot1ws5.find(findt, in_column=1)
@@ -1700,16 +1775,6 @@ async def boss(ctx, bossname, toonlist):
                 gkp_list.append(findt)
                 if "GKP" not in kppool:
                     kppool.append("GKP")
-            if bossname in dkp_bosses:
-                cell7 = bot1ws2.find(findt, in_column=1)
-                row_num7 = cell7.row
-                earned = float(bot1ws2.cell(row_num7, 4).value)
-                new = earned + dkp_bosses[bossname]
-                bot1ws2.update_cell(row_num7, 4, new)
-                bot5ws2.update_cell(row_num7, 2, currenttime)
-                dkp_list.append(findt)
-                if "DKP" not in kppool:
-                    kppool.append("DKP")
         else:
             await ctx.send(t + " not in list!")
             toonlist.pop(toonlist.index(t))
@@ -1754,10 +1819,15 @@ async def boss(ctx, bossname, toonlist):
         embed.add_field(name = str(gkp_bosses[bossname])+ " GKP", value = gkp_to_send, inline = False)
         bosslog = [dt.now().strftime("%d/%m/%Y %H:%M:%S"), str(bossname), "GKP", str(gkp_list)]
         bot3ws10.append_row(bosslog, value_input_option='USER_ENTERED')
-    if dkp_list != []:
-        dkp_to_send = ', '.join(map(str, dkp_list))
-        embed.add_field(name = str(dkp_bosses[bossname])+ " DKP", value = dkp_to_send, inline = False)
-        bosslog = [dt.now().strftime("%d/%m/%Y %H:%M:%S"), str(bossname), "DKP", str(dkp_list)]
+    if vkp_list != []:
+        vkp_to_send = ', '.join(map(str, vkp_list))
+        embed.add_field(name = str(vkp_bosses[bossname])+ " VKP", value = vkp_to_send, inline = False)
+        bosslog = [dt.now().strftime("%d/%m/%Y %H:%M:%S"), str(bossname), "VKP", str(vkp_list)]
+        bot3ws10.append_row(bosslog, value_input_option='USER_ENTERED')
+    if rbppunox_list != []:
+        rbppunox_to_send = ', '.join(map(str, rbppunox_list))
+        embed.add_field(name = str(rbppunox_bosses[bossname])+ " RBPPUNOX", value = rbppunox_to_send, inline = False)
+        bosslog = [dt.now().strftime("%d/%m/%Y %H:%M:%S"), str(bossname), "RBPPUNOX", str(rbppunox_list)]
         bot3ws10.append_row(bosslog, value_input_option='USER_ENTERED')
     
     print("sending embed")
@@ -1788,7 +1858,8 @@ async def bosshalf(ctx, bossname, toonlist):
     pkp_list = []
     pkp_low_list = []  
     gkp_list = []
-    dkp_list = []
+    vkp_list = []
+    rbppunox_list = []
     kppool = []
     toonlist = list(set(toonlist))
     currenttime =  dt.now().strftime("%d/%m/%Y %H:%M:%S")
@@ -1800,28 +1871,39 @@ async def bosshalf(ctx, bossname, toonlist):
             level = int(bot3ws1.cell(row_num, 4).value)
             maintoon = bot3ws1.cell(row_num, 3).value
             maintoon = toBool(maintoon)
-            if maintoon:
-            # rbpp and dino
-                if bossname in rbpp_bosses:
-                    cell2 = bot2ws8.find(findt)
-                    row_num2 = cell2.row
-                    earned = float(bot2ws8.cell(row_num2, 4).value)
-                    new = earned + 1
-                    bot2ws8.update_cell(row_num2, 4, new)
-                    bot5ws8.update_cell(row_num2, 2, currenttime)
-                    rbpp_list.append(findt)
-                    if "RBPP" not in kppool:
-                        kppool.append("RBPP")
-                if bossname in dpkp_bosses:
-                    cell3 = bot1ws7.find(findt)
-                    row_num3 = cell3.row
-                    earned = float(bot1ws7.cell(row_num3, 4).value)
-                    new = earned + (dpkp_bosses[bossname])/2
-                    bot1ws7.update_cell(row_num3, 4, new)
-                    bot5ws7.update_cell(row_num3, 2, currenttime)
-                    dpkp_list.append(findt)
-                    if "DPKP" not in kppool:
-                        kppool.append("DPKP")
+            # fun times: no dpkp and rbpp from bosshalf
+            # if maintoon:
+            # # rbpp and dino
+            #     if bossname in rbpp_bosses:
+            #         cell2 = bot2ws8.find(findt)
+            #         row_num2 = cell2.row
+            #         earned = float(bot2ws8.cell(row_num2, 4).value)
+            #         new = earned + 1
+            #         bot2ws8.update_cell(row_num2, 4, new)
+            #         bot5ws8.update_cell(row_num2, 2, currenttime)
+            #         rbpp_list.append(findt)
+            #         if "RBPP" not in kppool:
+            #             kppool.append("RBPP")
+            #     if bossname in dpkp_bosses:
+            #         cell3 = bot1ws7.find(findt)
+            #         row_num3 = cell3.row
+            #         earned = float(bot1ws7.cell(row_num3, 4).value)
+            #         new = earned + (dpkp_bosses[bossname])/2
+            #         bot1ws7.update_cell(row_num3, 4, new)
+            #         bot5ws7.update_cell(row_num3, 2, currenttime)
+            #         dpkp_list.append(findt)
+            #         if "DPKP" not in kppool:
+            #             kppool.append("DPKP")
+            #     if bossname in rbppunox_bosses:
+            #         cell8 = bot2ws6.find(findt)
+            #         row_num8 = cell8.row
+            #         earned = float(bot2ws6.cell(row_num8, 4).value)
+            #         new = earned + (rbppunox_bosses[bossname])/2
+            #         bot2ws6.update_cell(row_num8, 4, new)
+            #         bot5ws6.update_cell(row_num8, 2, currenttime)
+            #         rbppunox_list.append(findt)
+            #         if "RBPPUNOX" not in kppool:
+            #             kppool.append("RBPPUNOX")
             if bossname in akp_bosses:
                 if level >= 220:
                     cell4 = bot1ws5.find(findt)
@@ -1874,16 +1956,6 @@ async def bosshalf(ctx, bossname, toonlist):
                 gkp_list.append(findt)
                 if "GKP" not in kppool:
                     kppool.append("GKP")
-            if bossname in dkp_bosses:
-                cell7 = bot1ws2.find(findt)
-                row_num7 = cell7.row
-                earned = float(bot1ws2.cell(row_num7, 4).value)
-                new = earned + (dkp_bosses[bossname])/2
-                bot1ws2.update_cell(row_num7, 4, new)
-                bot5ws2.update_cell(row_num7, 2, currenttime)
-                dkp_list.append(findt)
-                if "DKP" not in kppool:
-                    kppool.append("DKP")
         else:
             await ctx.send(t + " not in list!")
             toonlist.pop(toonlist.index(t))
@@ -1913,9 +1985,9 @@ async def bosshalf(ctx, bossname, toonlist):
     if gkp_list != []:
         gkp_to_send = ', '.join(map(str, gkp_list))
         embed.add_field(name = str(gkp_bosses[bossname]/2)+ " GKP", value = gkp_to_send, inline = False)
-    if dkp_list != []:
-        dkp_to_send = ', '.join(map(str, dkp_list))
-        embed.add_field(name = str(dkp_bosses[bossname]/2)+ " DKP", value = dkp_to_send, inline = False)
+    if vkp_list != []:
+        vkp_to_send = ', '.join(map(str, vkp_list))
+        embed.add_field(name = str(vkp_bosses[bossname]/2)+ " VKP", value = vkp_to_send, inline = False)
 
     if not emptyattend:
         bosslog = [dt.now().strftime("%d/%m/%Y %H:%M:%S"), str(bossname + " HALF"), str(kppool), str(toonlist)]
@@ -1933,7 +2005,7 @@ async def pointleaderboard(ctx, kp, maxkp = 99999, number = 10):
     """displays the leaderboard for current points in a certain KP pool"""
     kp = kp.upper()
     maxkp = float(maxkp)
-    if kp == "DKP":
+    if kp == "VKP":
         namelist = bot4ws2.col_values(1)
         pointlist = bot4ws2.col_values(7)
     elif kp == "GKP":
@@ -1945,7 +2017,7 @@ async def pointleaderboard(ctx, kp, maxkp = 99999, number = 10):
     elif kp == "AKP":
         namelist = bot4ws5.col_values(1)
         pointlist = bot4ws5.col_values(7)
-    elif kp == "LEP":
+    elif kp == "RBPPUNOX":
         namelist = bot4ws6.col_values(1)
         pointlist = bot4ws6.col_values(7)
     elif kp == "DPKP":
@@ -1973,11 +2045,57 @@ async def pointleaderboard(ctx, kp, maxkp = 99999, number = 10):
     await ctx.send(embed=embed)
     
 
+# @client.command(guild_ids = guilds)
+# async def classpointleaderboard(ctx, kp, classname, maxkp = 99999, number = 10):
+#     """displays the leaderboard for current points in a certain KP pool"""
+#     kp = kp.upper()
+#     classname = classname.capitalize()
+#     maxkp = float(maxkp)
+#     if kp == "VKP":
+#         namelist = bot4ws2.col_values(1)
+#         pointlist = bot4ws2.col_values(7)
+#     elif kp == "GKP":
+#         namelist = bot4ws3.col_values(1)
+#         pointlist = bot4ws3.col_values(7)
+#     elif kp == "PKP":
+#         namelist = bot4ws4.col_values(1)
+#         pointlist = bot4ws4.col_values(7)
+#     elif kp == "AKP":
+#         namelist = bot4ws5.col_values(1)
+#         pointlist = bot4ws5.col_values(7)
+#     elif kp == "RBPPUNOX":
+#         namelist = bot4ws6.col_values(1)
+#         pointlist = bot4ws6.col_values(7)
+#     elif kp == "DPKP":
+#         namelist = bot4ws7.col_values(1)
+#         pointlist = bot4ws7.col_values(7)
+#     elif kp == "RBPP":
+#         namelist = bot4ws8.col_values(1)
+#         pointlist = bot4ws8.col_values(7)
+#     else:
+#         await ctx.send("Invalid KP pool")
+#     del namelist[0]
+#     del pointlist[0]
+#     floatpointlist = list(map(float, pointlist))
+#     combined = list(zip(namelist, floatpointlist))
+#     sortedcombined = sorted(combined, key=lambda x: x[1], reverse=True)
+#     # remove the people who have more than maxkp
+#     sortedcombined = [x for x in sortedcombined if x[1] <= maxkp]
+#     embed = discord.Embed(title = kp + " Leaderboard", colour=discord.Color.orange())
+#     if number < len(sortedcombined):
+#         for i in range(number):
+#             embed.add_field(name = str(i + 1) + ". " + sortedcombined[i][0], value = sortedcombined[i][1], inline = False)
+#     else:
+#         for i in range(len(sortedcombined)):
+#             embed.add_field(name = str(i + 1) + ". " + sortedcombined[i][0], value = sortedcombined[i][1], inline = False)
+#     await ctx.send(embed=embed)
+    
+
 @client.command(guild_ids = guilds)
 async def earnedleaderboard(ctx, kp, number = 10):
     """displays the leaderboard for total points earned in a certain KP pool"""
     kp = kp.upper()
-    if kp == "DKP":
+    if kp == "VKP":
         namelist = bot4ws2.col_values(1)
         pointlist = bot4ws2.col_values(4)
     elif kp == "GKP":
@@ -1989,7 +2107,7 @@ async def earnedleaderboard(ctx, kp, number = 10):
     elif kp == "AKP":
         namelist = bot4ws5.col_values(1)
         pointlist = bot4ws5.col_values(4)
-    elif kp == "LEP":
+    elif kp == "RBPPUNOX":
         namelist = bot4ws6.col_values(1)
         pointlist = bot4ws6.col_values(4)
     elif kp == "DPKP":
@@ -2039,7 +2157,7 @@ A leader will approve all this shortly so you can start earning KP (Kill points)
                    
 All the point acronyms may be confusing at first, but here is the break down:
                    
-DKP - Dragon Kill Points (earned for killing Mord, Necro, Hrung, Unox Legit, Mono and Osan)
+VKP - Dragon Kill Points (earned for killing Crom)
 PKP - Proteus Kill Points (earned for killing Proteus and Bane Legits)
 AKP - Arcane Kill Points (earned for killing Gelebron and Proteus)
 GKP - Gardens Kill Points (earned for killing Bloodthorn and Factions)
@@ -2083,15 +2201,15 @@ async def kpinfo(ctx):
     """Displays the KP information"""
     await ctx.send("""Here is the breakdown of the KP pools:
                    
-DKP (Dragon kill points); earned from Unox Legit, Rev Legit, Mord, Necro, Hrung.
-Used to bid on Mord, Necro, Hrung drops and Snorri crowns
+VKP (Valley kill points); earned from Crom (maybe future Valley content)
+Used to bid on Crom Gear
 GKP (Garden kill points); earned from Bloodthorn and Weekly bosses
 Used to bid on Bloodthorn items
 AKP (Arcane kill points); earned from Gelebron and Proteus
 Used to bid on Gelebron items
 PKP (Proteus kill points); earned from Proteus and Bane Legit
 Used to bid on Proteus items                  
-LEP (Legacy kill points); Old legacy point pool. unused for now
+LEP (Legacy kill points); Old legacy point pool. unused, repurposed for RBPPUNOX
 DPKP (Dhiothu kill points); earned from Dhiothu
 Used to bid on Dhiothu items
 RBPP (attendance points); earned from all bosses listed above except Weekly bosses and Legacy bosses
@@ -2119,7 +2237,7 @@ Warriors:
               -MT STATS - MINIMUM OF 28k HP and 13k DEFENSE with SOME DIRECT TAUNT GEAR (more is always better)
                 (This can be a Mord/Dino Taunt brace, Taunting bloom ring or BT bands)
               -Add tanks stats - MINIMUN OF 17K HP and 7k defense. 
-        - DPS Warriors - Gelebron Axe (or Dino wep) - Hexforged Axe of Mighty (400 DAMAGE OFFHAND) - 42 Skill points in Bash - Ability to time Dino Heal
+        - DPS Warriors - Gelebron Axe (or Dino wep) - Hexforged Axe of Might (400 DAMAGE OFFHAND) - 42 Skill points in Bash - Ability to time Dino Heal
 *Changes* Last Requirement made it so DPS warriors needed to have full dg but they are now able to participate in raids. DPS Warriors will now have to have 42 points in bash and bash dino. 
 **IN THE EVENT THAT WE ARE MISSING PLAYERS AND NEED A PLAYER TO FULLFILL THE ROLES BUT THEY DON” T REACH REQUIREMENTS, LEADERS MAY DEEM IT APPROPIATE FOR THEM TO JOIN DINO AND THEY WILL BE ABLE TO EARN POINTS DURNG THAT SPECIFIC DINO**""")
     if cclass == "ranger":
