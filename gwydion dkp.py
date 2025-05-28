@@ -512,7 +512,9 @@ async def bidinfo(ctx, id):
     """Shows the info for a bid"""
     try:
         id = int(id)
-        bidrow = bot3ws12.find(str(id))
+        # bidrow = bot3ws12.find(str(id))
+        # search column 2 for the id
+        bidrow = bot3ws12.find(str(id), in_column=2)
         if bidrow:
             bidrownum = bidrow.row
             bidrow = bot3ws12.row_values(bidrownum)
@@ -521,7 +523,11 @@ async def bidinfo(ctx, id):
             minutesleft = (timeleft % 3600) // 60
             timeleft = str(int(hoursleft)) + " hours and " + str(int(minutesleft)) + " minutes"
             await ctx.send("Bid ID " + str(bidrow[1]) + " for " + bidrow[2] + " is currently " + bidrow[4] + " with a starting bid of " + str(bidrow[6]) + " " + bidrow[3])
-            await ctx.send("This bid was opened at " + bidrow[0] + " and has " + timeleft + " left")
+            if timeleft.startswith("-"):
+                timeleft = timeleft[1:]
+                await ctx.send("This bid for " + bidrow[2] + " ended " + timeleft + " ago")
+            else:
+                await ctx.send("This bid was opened at " + bidrow[0] + " and has " + timeleft + " left")
         else:
             await ctx.send("No bid with that ID exists")
     except Exception as e:
@@ -2439,6 +2445,11 @@ async def spawntimes(ctx):
 async def spreadsheet(ctx):
     """Links Winston's master point spreadsheet"""
     await ctx.send("https://docs.google.com/spreadsheets/d/1Izu2wSmi0aEQCWTvfLAXX0ucXR2223ILzFxTiQXcl80/edit#gid=393681553")
+
+@client.command(guild_ids=guilds)
+async def oldwins(ctx):
+    """Links Alice's old wins spreadsheet"""
+    await ctx.send("https://docs.google.com/spreadsheets/d/1FbfNkF9SkD0A8a61ChoKvcG88yC2vpaHL8ffm37TSb8/edit?gid=1217357805#gid=1217357805")
 
 @client.command(guild_ids = guilds)
 async def kpsite(ctx):
