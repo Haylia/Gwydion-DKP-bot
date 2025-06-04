@@ -347,6 +347,8 @@ async def on_command_error(ctx, error):
     elif isinstance(error, commands.CommandInvokeError):
         await ctx.send("Winston is crying himself to sleep (google sheets may have been rate limited, there was an error, or reda sucks at programming)")
         # test all the service accounts to see if they are rate limited
+        # print out the error
+        print(error)
         try:
             bot1ws1.get_all_records()
         except Exception as e:
@@ -788,6 +790,15 @@ async def roster(ctx, subcommand, name, params):
         elif subcommand == "level":
             bot5ws1.update_cell(row_num, 4, params)
             await ctx.send(realname + "'s level has been updated to " + str(params))
+            logbody = ["roster", str(ctx.author.name), dt.now().strftime("%d/%m/%Y %H:%M:%S"), str([realname, subcommand, params])]
+            bot3ws11.append_row(logbody)
+        elif subcommand == "class":
+            params = params.capitalize()
+            if params not in ["Warrior", "Rogue", "Mage", "Druid", "Ranger"]:
+                await ctx.send("Invalid class! Please use Warrior, Rogue, Mage, Druid, or Ranger")
+                return
+            bot5ws1.update_cell(row_num, 5, params)
+            await ctx.send(realname + "'s class has been updated to " + str(params))
             logbody = ["roster", str(ctx.author.name), dt.now().strftime("%d/%m/%Y %H:%M:%S"), str([realname, subcommand, params])]
             bot3ws11.append_row(logbody)
         elif subcommand == "subclass":
@@ -2011,6 +2022,7 @@ async def pointleaderboard(ctx, kp, maxkp = 99999, number = 10):
     """displays the leaderboard for current points in a certain KP pool"""
     kp = kp.upper()
     maxkp = float(maxkp)
+    number = int(number)
     if kp == "VKP":
         namelist = bot4ws2.col_values(1)
         pointlist = bot4ws2.col_values(7)
@@ -2050,6 +2062,66 @@ async def pointleaderboard(ctx, kp, maxkp = 99999, number = 10):
             embed.add_field(name = str(i + 1) + ". " + sortedcombined[i][0], value = sortedcombined[i][1], inline = False)
     await ctx.send(embed=embed)
     
+
+@client.command(guild_ids = guilds)
+async def pointleaderboardlast30(ctx, kp, maxatt = 100, number = 10):
+    """darkhealz last 30 command"""
+    kp = kp.upper()
+    maxatt = int(maxatt)
+    number = int(number)
+    if kp == "VKP":
+       namelist = bot4ws2.col_values(1)
+       pointlist = bot4ws2.col_values(7)
+       attlist = bot4ws2.col_values(3)
+    elif kp == "GKP":
+        namelist = bot4ws3.col_values(1)
+        pointlist = bot4ws3.col_values(7)
+        attlist = bot4ws3.col_values(3)
+    elif kp == "PKP":
+        namelist = bot4ws4.col_values(1)
+        pointlist = bot4ws4.col_values(7)
+        attlist = bot4ws4.col_values(3)
+    elif kp == "AKP":
+        namelist = bot4ws5.col_values(1)
+        pointlist = bot4ws5.col_values(7)
+        attlist = bot4ws5.col_values(3)
+    elif kp == "RBPPUNOX":
+        namelist = bot4ws6.col_values(1)
+        pointlist = bot4ws6.col_values(7)
+        attlist = bot4ws6.col_values(3)
+    elif kp == "DPKP":
+        namelist = bot4ws7.col_values(1)
+        pointlist = bot4ws7.col_values(7)
+        attlist = bot4ws7.col_values(3)
+    elif kp == "RBPP":
+        namelist = bot4ws8.col_values(1)
+        pointlist = bot4ws8.col_values(7)
+        attlist = bot4ws8.col_values(3)
+    else:
+        await ctx.send("Invalid KP pool")
+
+    del namelist[0]
+    del pointlist[0]
+    del attlist[0]
+    floatpointlist = list(map(float, pointlist))
+    # attlist is in the format "7.49%", so we need to convert it to a float and remove the percentage sign
+    floatattlist = [float(x.strip('%')) for x in attlist]
+    combined = list(zip(namelist, floatpointlist, floatattlist))
+    # sort by attlist
+    sortedcombined = sorted(combined, key=lambda x: x[2], reverse=True)
+    # remove the people who have more than maxatt
+    sortedcombined = [x for x in sortedcombined if x[2] <= maxatt]
+    embed = discord.Embed(title = kp + " Leaderboard", colour=discord.Color.orange())
+    if number < len(sortedcombined):
+        for i in range(number):
+            embed.add_field(name = str(i + 1) + ". " + sortedcombined[i][0], value = f"{sortedcombined[i][1]} ({sortedcombined[i][2]}%)", inline = False)
+    else:
+        for i in range(len(sortedcombined)):
+            embed.add_field(name = str(i + 1) + ". " + sortedcombined[i][0], value = f"{sortedcombined[i][1]} ({sortedcombined[i][2]}%)", inline = False)
+    await ctx.send(embed=embed)
+
+
+
 
 # @client.command(guild_ids = guilds)
 # async def classpointleaderboard(ctx, kp, classname, maxkp = 99999, number = 10):
