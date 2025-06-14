@@ -115,7 +115,7 @@ pkp_bosses = {"Bane": 10}
 akp_bosses = {"Gele":50, "Base":10, "Prime":20}
 rbppunox_bosses = {"Unox5":1, "Unox6": 1}
 dpkp_bosses = {"Dino":75, "Dinofast":100}
-rbpp_bosses = {"Unox5":1, "Rev6":1, "Kroth6":1, "Gron6":1, "Unox6": 1, "Hrung":1, "Mord":1, "Necro":1, "Dino":1, "Dinofast":1, "Bane": 1, "Bt":1, "Base":1, "Prime":1, "Gele":1, "Crom":1}
+rbpp_bosses = {"Unox5":1, "Rev6":1, "Kroth6":1, "Gron6":1, "Unox6": 1, "Hrung":1, "Mord":1, "Necro":1, "Dino":1, "Dinofast":1, "Bane": 1, "Bt":1, "Base":1, "Prime":1, "Gele":1, "Crom":1, "Rd":1, "Cd":1, "Tree":1, "Doom":1, "Gd":1}
 
 
 bidslastupdate = time.time()
@@ -637,7 +637,31 @@ async def addallearned(ctx, playername, VKP, GKP, PKP, AKP, RBPPUNOX, DPKP, RBPP
 async def inputterinfo(ctx):
      """Displays the help for point inputters"""
      embed = discord.Embed(title = "Info Dump", colour=discord.Color.orange())
-     embed.add_field(name = "Bosses", value = "Mono, Osan, Rev6, Kroth6, Gron6, Unox5, Unox6, Hrung, Mord, Necro, Bane, Base, Prime, Gele, Reaver, Lich, Bt, Dino, Dinofast", inline = False)
+     bosses = ""
+     # get the boss names from the dicts
+     for bossnames in akp_bosses.keys():
+         bosses += bossnames + ", "
+     for bossnames in gkp_bosses.keys():
+            if bossnames not in bosses:
+                bosses += bossnames + ", "
+     for bossnames in vkp_bosses.keys():
+                if bossnames not in bosses:
+                    bosses += bossnames + ", "
+     for bossnames in pkp_bosses.keys():
+            if bossnames not in bosses:
+                bosses += bossnames + ", "
+     for bossnames in rbppunox_bosses.keys():
+         if bossnames not in bosses:
+             bosses += bossnames + ", "
+     for bossnames in dpkp_bosses.keys():
+         if bossnames not in bosses:
+             bosses += bossnames + ", "
+     for bossnames in rbpp_bosses.keys():
+         if bossnames not in bosses:
+             bosses += bossnames + ", "
+     bosses = bosses[:-2]  # remove the last comma and space
+     
+     embed.add_field(name = "Bosses", value = bosses, inline = False)
      embed.add_field(name = "Command usage for adding points", value = "$boss <bossname> <list of characters> \n remember to put the list of characters in quotes", inline=False)
      embed.add_field(name = "Command usage for adding half points", value = "$bosshalf <bossname> <list of characters> \n remember to put the list of characters in quotes", inline=False)
      await ctx.send(embed=embed)
@@ -664,19 +688,19 @@ async def addmem(ctx, name, rank, main, level, cclass):
         rownum = len(bot5ws2.col_values(1)) + 1
         rownum = str(rownum)
         currformula = '=Sum(D' + rownum + '+F'+rownum+'-E'+rownum+')'
-        attendformula1 = "=(COUNTIFS('Bosses last 45'!C2:C, \"*VKP*\", 'Bosses last 45'!D2:D, \"*" + name + "*\"))/COUNTIFS('Bosses last 45'!B2:B, \"<>*HALF*\", 'Bosses last 45'!B2:B, \"<>\", 'Bosses last 45'!C2:C, \"*VKP*\")"
+        attendformula1 = "=(COUNTIFS('Bosses last 30'!C2:C, \"*VKP*\", 'Bosses last 30'!D2:D, \"*" + name + "*\"))/COUNTIFS('Bosses last 30'!B2:B, \"<>*HALF*\", 'Bosses last 30'!B2:B, \"<>\", 'Bosses last 30'!C2:C, \"*VKP*\")"
         kpbody1 = [name,0,attendformula1,0,0,0,currformula]
-        attendformula2 = "=(COUNTIFS('Bosses last 45'!C2:C, \"*GKP*\", 'Bosses last 45'!D2:D, \"*" + name + "*\"))/COUNTIFS('Bosses last 45'!B2:B, \"<>*HALF*\", 'Bosses last 45'!B2:B, \"<>\", 'Bosses last 45'!C2:C, \"*GKP*\")"
+        attendformula2 = "=(COUNTIFS('Bosses last 30'!C2:C, \"*GKP*\", 'Bosses last 30'!D2:D, \"*" + name + "*\"))/COUNTIFS('Bosses last 30'!B2:B, \"<>*HALF*\", 'Bosses last 30'!B2:B, \"<>\", 'Bosses last 30'!C2:C, \"*GKP*\")"
         kpbody2 = [name,0,attendformula2,0,0,0,currformula]
-        attendformula3 = "=(COUNTIFS('Bosses last 45'!C2:C, \"*PKP*\", 'Bosses last 45'!D2:D, \"*" + name + "*\"))/COUNTIFS('Bosses last 45'!B2:B, \"<>*HALF*\", 'Bosses last 45'!B2:B, \"<>\", 'Bosses last 45'!C2:C, \"*PKP*\")"
+        attendformula3 = "=(COUNTIFS('Bosses last 30'!C2:C, \"*PKP*\", 'Bosses last 30'!D2:D, \"*" + name + "*\"))/COUNTIFS('Bosses last 30'!B2:B, \"<>*HALF*\", 'Bosses last 30'!B2:B, \"<>\", 'Bosses last 30'!C2:C, \"*PKP*\")"
         kpbody3 = [name,0,attendformula3,0,0,0,currformula]
-        attendformula4 = "=(COUNTIFS('Bosses last 45'!C2:C, \"*AKP*\", 'Bosses last 45'!D2:D, \"*" + name + "*\"))/COUNTIFS('Bosses last 45'!B2:B, \"<>*HALF*\", 'Bosses last 45'!B2:B, \"<>\", 'Bosses last 45'!C2:C, \"*AKP*\")"
+        attendformula4 = "=(COUNTIFS('Bosses last 30'!C2:C, \"*AKP*\", 'Bosses last 30'!D2:D, \"*" + name + "*\"))/COUNTIFS('Bosses last 30'!B2:B, \"<>*HALF*\", 'Bosses last 30'!B2:B, \"<>\", 'Bosses last 30'!C2:C, \"*AKP*\")"
         kpbody4 = [name,0,attendformula4,0,0,0,currformula]
-        attendformula5 = "=(COUNTIFS('Bosses last 45'!C2:C, \"*RBPPUNOX*\", 'Bosses last 45'!D2:D, \"*" + name + "*\"))/COUNTIFS('Bosses last 45'!B2:B, \"<>*HALF*\", 'Bosses last 45'!B2:B, \"<>\", 'Bosses last 45'!C2:C, \"*RBPPUNOX*\")"
+        attendformula5 = "=(COUNTIFS('Bosses last 30'!C2:C, \"*RBPPUNOX*\", 'Bosses last 30'!D2:D, \"*" + name + "*\"))/COUNTIFS('Bosses last 30'!B2:B, \"<>*HALF*\", 'Bosses last 30'!B2:B, \"<>\", 'Bosses last 30'!C2:C, \"*RBPPUNOX*\")"
         kpbody5 = [name,0,attendformula5,0,0,0,currformula]
-        attendformula6 = "=(COUNTIFS('Bosses last 45'!C2:C, \"*DPKP*\", 'Bosses last 45'!D2:D, \"*" + name + "*\"))/COUNTIFS('Bosses last 45'!B2:B, \"<>*HALF*\", 'Bosses last 45'!B2:B, \"<>\", 'Bosses last 45'!C2:C, \"*DPKP*\")"
+        attendformula6 = "=(COUNTIFS('Bosses last 30'!C2:C, \"*DPKP*\", 'Bosses last 30'!D2:D, \"*" + name + "*\"))/COUNTIFS('Bosses last 30'!B2:B, \"<>*HALF*\", 'Bosses last 30'!B2:B, \"<>\", 'Bosses last 30'!C2:C, \"*DPKP*\")"
         kpbody6 = [name,0,attendformula6,0,0,0,currformula]
-        attendformula7 = "=(COUNTIFS('Bosses last 45'!C2:C, \"*RBPP*\", 'Bosses last 45'!D2:D, \"*" + name + "*\"))/COUNTIFS('Bosses last 45'!B2:B, \"<>*HALF*\", 'Bosses last 45'!B2:B, \"<>\", 'Bosses last 45'!C2:C, \"*RBPP*\")"
+        attendformula7 = "=(COUNTIFS('Bosses last 30'!C2:C, \"*RBPP*\", 'Bosses last 30'!D2:D, \"*" + name + "*\"))/COUNTIFS('Bosses last 30'!B2:B, \"<>*HALF*\", 'Bosses last 30'!B2:B, \"<>\", 'Bosses last 30'!C2:C, \"*RBPP*\")"
         kpbody7 = [name,0,attendformula7,0,0,0,currformula]
         bot5ws2.append_row(kpbody1, value_input_option='USER_ENTERED')
         bot5ws3.append_row(kpbody2, value_input_option='USER_ENTERED')
@@ -1057,43 +1081,43 @@ async def fullpointwipe(ctx, name, verification):
             cell1 = bot5ws2.find(realname)
             row_num1 = cell1.row
             currformula1 = '=Sum(D' + str(row_num1) + '+F'+str(row_num1)+'-E'+str(row_num1)+')'
-            attendformula1 = "=(COUNTIFS('Bosses last 45'!C2:C, \"*VKP*\", 'Bosses last 45'!D2:D, \"*" + realname + "*\"))/COUNTIFS('Bosses last 45'!B2:B, \"<>*HALF*\", 'Bosses last 45'!B2:B, \"<>\", 'Bosses last 45'!C2:C, \"*VKP*\")"
+            attendformula1 = "=(COUNTIFS('Bosses last 30'!C2:C, \"*VKP*\", 'Bosses last 30'!D2:D, \"*" + realname + "*\"))/COUNTIFS('Bosses last 30'!B2:B, \"<>*HALF*\", 'Bosses last 30'!B2:B, \"<>\", 'Bosses last 30'!C2:C, \"*VKP*\")"
             wipedrow1 = [realname,0,attendformula1,0,0,0,currformula1]
             bot5ws2.update([wipedrow1], "A" + str(row_num1), value_input_option='USER_ENTERED')
             cell2 = bot5ws3.find(realname)
             row_num2 = cell2.row
             currformula2 = '=Sum(D' + str(row_num2) + '+F'+str(row_num2)+'-E'+str(row_num2)+')'
-            attendformula2 = "=(COUNTIFS('Bosses last 45'!C2:C, \"*GKP*\", 'Bosses last 45'!D2:D, \"*" + realname + "*\"))/COUNTIFS('Bosses last 45'!B2:B, \"<>*HALF*\", 'Bosses last 45'!B2:B, \"<>\", 'Bosses last 45'!C2:C, \"*GKP*\")"
+            attendformula2 = "=(COUNTIFS('Bosses last 30'!C2:C, \"*GKP*\", 'Bosses last 30'!D2:D, \"*" + realname + "*\"))/COUNTIFS('Bosses last 30'!B2:B, \"<>*HALF*\", 'Bosses last 30'!B2:B, \"<>\", 'Bosses last 30'!C2:C, \"*GKP*\")"
             wipedrow2 = [realname,0,attendformula2,0,0,0,currformula2]
             bot5ws3.update([wipedrow2], "A" + str(row_num2), value_input_option='USER_ENTERED')
             cell3 = bot5ws4.find(realname)
             row_num3 = cell3.row
             currformula3 = '=Sum(D' + str(row_num3) + '+F'+str(row_num3)+'-E'+str(row_num3)+')'
-            attendformula3 = "=(COUNTIFS('Bosses last 45'!C2:C, \"*PKP*\", 'Bosses last 45'!D2:D, \"*" + realname + "*\"))/COUNTIFS('Bosses last 45'!B2:B, \"<>*HALF*\", 'Bosses last 45'!B2:B, \"<>\", 'Bosses last 45'!C2:C, \"*PKP*\")"
+            attendformula3 = "=(COUNTIFS('Bosses last 30'!C2:C, \"*PKP*\", 'Bosses last 30'!D2:D, \"*" + realname + "*\"))/COUNTIFS('Bosses last 30'!B2:B, \"<>*HALF*\", 'Bosses last 30'!B2:B, \"<>\", 'Bosses last 30'!C2:C, \"*PKP*\")"
             wipedrow3 = [realname,0,attendformula3,0,0,0,currformula3]
             bot5ws4.update([wipedrow3], "A" + str(row_num3), value_input_option='USER_ENTERED')
             cell4 = bot5ws5.find(realname)
             row_num4 = cell4.row
             currformula4 = '=Sum(D' + str(row_num4) + '+F'+str(row_num4)+'-E'+str(row_num4)+')'
-            attendformula4 = "=(COUNTIFS('Bosses last 45'!C2:C, \"*AKP*\", 'Bosses last 45'!D2:D, \"*" + realname + "*\"))/COUNTIFS('Bosses last 45'!B2:B, \"<>*HALF*\", 'Bosses last 45'!B2:B, \"<>\", 'Bosses last 45'!C2:C, \"*AKP*\")"
+            attendformula4 = "=(COUNTIFS('Bosses last 30'!C2:C, \"*AKP*\", 'Bosses last 30'!D2:D, \"*" + realname + "*\"))/COUNTIFS('Bosses last 30'!B2:B, \"<>*HALF*\", 'Bosses last 30'!B2:B, \"<>\", 'Bosses last 30'!C2:C, \"*AKP*\")"
             wipedrow4 = [realname,0,attendformula4,0,0,0,currformula4]
             bot5ws5.update([wipedrow4], "A" + str(row_num4), value_input_option='USER_ENTERED')
             cell5 = bot5ws6.find(realname)
             row_num5 = cell5.row
             currformula5 = '=Sum(D' + str(row_num5) + '+F'+str(row_num5)+'-E'+str(row_num5)+')'
-            attendformula5 = "=(COUNTIFS('Bosses last 45'!C2:C, \"*RBPPUNOX*\", 'Bosses last 45'!D2:D, \"*" + realname + "*\"))/COUNTIFS('Bosses last 45'!B2:B, \"<>*HALF*\", 'Bosses last 45'!B2:B, \"<>\", 'Bosses last 45'!C2:C, \"*RBPPUNOX*\")"
+            attendformula5 = "=(COUNTIFS('Bosses last 30'!C2:C, \"*RBPPUNOX*\", 'Bosses last 30'!D2:D, \"*" + realname + "*\"))/COUNTIFS('Bosses last 30'!B2:B, \"<>*HALF*\", 'Bosses last 30'!B2:B, \"<>\", 'Bosses last 30'!C2:C, \"*RBPPUNOX*\")"
             wipedrow5 = [realname,0,attendformula5,0,0,0,currformula5]
             bot5ws6.update([wipedrow5], "A" + str(row_num5), value_input_option='USER_ENTERED')
             cell6 = bot5ws7.find(realname)
             row_num6 = cell6.row
             currformula6 = '=Sum(D' + str(row_num6) + '+F'+str(row_num6)+'-E'+str(row_num6)+')'
-            attendformula6 = "=(COUNTIFS('Bosses last 45'!C2:C, \"*DPKP*\", 'Bosses last 45'!D2:D, \"*" + realname + "*\"))/COUNTIFS('Bosses last 45'!B2:B, \"<>*HALF*\", 'Bosses last 45'!B2:B, \"<>\", 'Bosses last 45'!C2:C, \"*DPKP*\")"
+            attendformula6 = "=(COUNTIFS('Bosses last 30'!C2:C, \"*DPKP*\", 'Bosses last 30'!D2:D, \"*" + realname + "*\"))/COUNTIFS('Bosses last 30'!B2:B, \"<>*HALF*\", 'Bosses last 30'!B2:B, \"<>\", 'Bosses last 30'!C2:C, \"*DPKP*\")"
             wipedrow6 = [realname,0,attendformula6,0,0,0,currformula6]
             bot5ws7.update([wipedrow6], "A" + str(row_num6), value_input_option='USER_ENTERED')
             cell7 = bot5ws8.find(realname)
             row_num7 = cell7.row
             currformula7 = '=Sum(D' + str(row_num7) + '+F'+str(row_num7)+'-E'+str(row_num7)+')'
-            attendformula7 = "=(COUNTIFS('Bosses last 45'!C2:C, \"*RBPP*\", 'Bosses last 45'!D2:D, \"*" + realname + "*\"))/COUNTIFS('Bosses last 45'!B2:B, \"<>*HALF*\", 'Bosses last 45'!B2:B, \"<>\", 'Bosses last 45'!C2:C, \"*RBPP*\")"
+            attendformula7 = "=(COUNTIFS('Bosses last 30'!C2:C, \"*RBPP*\", 'Bosses last 30'!D2:D, \"*" + realname + "*\"))/COUNTIFS('Bosses last 30'!B2:B, \"<>*HALF*\", 'Bosses last 30'!B2:B, \"<>\", 'Bosses last 30'!C2:C, \"*RBPP*\")"
             wipedrow7 = [realname,0,attendformula7,0,0,0,currformula7]
             bot5ws8.update([wipedrow7], "A" + str(row_num7), value_input_option='USER_ENTERED')
             await ctx.send(realname + "'s points have been fully wiped")
@@ -2111,6 +2135,8 @@ async def pointleaderboardlast30(ctx, kp, maxatt = 100, number = 10):
     sortedcombined = sorted(combined, key=lambda x: x[2], reverse=True)
     # remove the people who have more than maxatt
     sortedcombined = [x for x in sortedcombined if x[2] <= maxatt]
+    # remove people with 0 points
+    sortedcombined = [x for x in sortedcombined if x[1] > 0]
     embed = discord.Embed(title = kp + " Leaderboard", colour=discord.Color.orange())
     if number < len(sortedcombined):
         for i in range(number):
