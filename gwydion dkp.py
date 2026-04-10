@@ -125,6 +125,85 @@ bot5ws12 = bot5sheet.get_worksheet(11)
 bot5ws13 = bot5sheet.get_worksheet(12)
 print("accessing the spreadsheet for account 5")
 
+# Rate-limit fallback: all 5 accounts share the same spreadsheet (indices 0-10).
+# When one account hits a 429, automatically retry with a different account.
+from gspread.exceptions import APIError
+
+# Pool of worksheets per sheet index (same data, different service accounts)
+_WS_POOL = {}
+for _idx in range(11):
+    _WS_POOL[_idx] = [
+        bot1sheet.get_worksheet(_idx) if _idx <= 10 else None,
+        bot2sheet.get_worksheet(_idx) if _idx <= 10 else None,
+        bot3sheet.get_worksheet(_idx) if _idx <= 10 else None,
+        bot4sheet.get_worksheet(_idx) if _idx <= 10 else None,
+        bot5sheet.get_worksheet(_idx) if _idx <= 10 else None,
+    ]
+
+class RetryWorksheet:
+    """Proxies a gspread Worksheet. On 429 rate limit, retries with a different service account."""
+
+    def __init__(self, ws, siblings=None):
+        object.__setattr__(self, '_ws', ws)
+        object.__setattr__(self, '_siblings', siblings or [])
+
+    def __getattr__(self, name):
+        attr = getattr(self._ws, name)
+        if not callable(attr):
+            return attr
+
+        def wrapper(*args, **kwargs):
+            try:
+                return attr(*args, **kwargs)
+            except APIError as e:
+                if e.response.status_code != 429:
+                    raise
+                print(f"Rate limited on account, trying fallback for {name}...")
+                for sib in self._siblings:
+                    if sib is self._ws:
+                        continue
+                    try:
+                        return getattr(sib, name)(*args, **kwargs)
+                    except APIError as e2:
+                        if e2.response.status_code == 429:
+                            continue
+                        raise
+                # All accounts exhausted — wait and retry original
+                print("All accounts rate limited, waiting 10s...")
+                time.sleep(10)
+                return attr(*args, **kwargs)
+
+        return wrapper
+
+def _wrap_ws(ws, sheet_index):
+    """Wrap a worksheet with rate-limit retry using sibling accounts."""
+    if sheet_index in _WS_POOL:
+        return RetryWorksheet(ws, _WS_POOL[sheet_index])
+    return ws
+
+# Wrap all main spreadsheet worksheets with fallback retry
+bot1ws1  = _wrap_ws(bot1ws1, 0);  bot1ws2  = _wrap_ws(bot1ws2, 1);  bot1ws3  = _wrap_ws(bot1ws3, 2)
+bot1ws4  = _wrap_ws(bot1ws4, 3);  bot1ws5  = _wrap_ws(bot1ws5, 4);  bot1ws6  = _wrap_ws(bot1ws6, 5)
+bot1ws7  = _wrap_ws(bot1ws7, 6);  bot1ws8  = _wrap_ws(bot1ws8, 7);  bot1ws9  = _wrap_ws(bot1ws9, 8)
+bot1ws10 = _wrap_ws(bot1ws10, 9); bot1ws11 = _wrap_ws(bot1ws11, 10)
+bot2ws1  = _wrap_ws(bot2ws1, 0);  bot2ws2  = _wrap_ws(bot2ws2, 1);  bot2ws3  = _wrap_ws(bot2ws3, 2)
+bot2ws4  = _wrap_ws(bot2ws4, 3);  bot2ws5  = _wrap_ws(bot2ws5, 4);  bot2ws6  = _wrap_ws(bot2ws6, 5)
+bot2ws7  = _wrap_ws(bot2ws7, 6);  bot2ws8  = _wrap_ws(bot2ws8, 7);  bot2ws9  = _wrap_ws(bot2ws9, 8)
+bot2ws10 = _wrap_ws(bot2ws10, 9); bot2ws11 = _wrap_ws(bot2ws11, 10)
+bot3ws1  = _wrap_ws(bot3ws1, 0);  bot3ws2  = _wrap_ws(bot3ws2, 1);  bot3ws3  = _wrap_ws(bot3ws3, 2)
+bot3ws4  = _wrap_ws(bot3ws4, 3);  bot3ws5  = _wrap_ws(bot3ws5, 4);  bot3ws6  = _wrap_ws(bot3ws6, 5)
+bot3ws7  = _wrap_ws(bot3ws7, 6);  bot3ws8  = _wrap_ws(bot3ws8, 7);  bot3ws9  = _wrap_ws(bot3ws9, 8)
+bot3ws10 = _wrap_ws(bot3ws10, 9); bot3ws11 = _wrap_ws(bot3ws11, 10)
+bot4ws1  = _wrap_ws(bot4ws1, 0);  bot4ws2  = _wrap_ws(bot4ws2, 1);  bot4ws3  = _wrap_ws(bot4ws3, 2)
+bot4ws4  = _wrap_ws(bot4ws4, 3);  bot4ws5  = _wrap_ws(bot4ws5, 4);  bot4ws6  = _wrap_ws(bot4ws6, 5)
+bot4ws7  = _wrap_ws(bot4ws7, 6);  bot4ws8  = _wrap_ws(bot4ws8, 7);  bot4ws9  = _wrap_ws(bot4ws9, 8)
+bot4ws10 = _wrap_ws(bot4ws10, 9); bot4ws11 = _wrap_ws(bot4ws11, 10)
+bot5ws1  = _wrap_ws(bot5ws1, 0);  bot5ws2  = _wrap_ws(bot5ws2, 1);  bot5ws3  = _wrap_ws(bot5ws3, 2)
+bot5ws4  = _wrap_ws(bot5ws4, 3);  bot5ws5  = _wrap_ws(bot5ws5, 4);  bot5ws6  = _wrap_ws(bot5ws6, 5)
+bot5ws7  = _wrap_ws(bot5ws7, 6);  bot5ws8  = _wrap_ws(bot5ws8, 7);  bot5ws9  = _wrap_ws(bot5ws9, 8)
+bot5ws10 = _wrap_ws(bot5ws10, 9); bot5ws11 = _wrap_ws(bot5ws11, 10)
+print("rate-limit fallback wrapping complete")
+
 vkp_bosses = {}
 gkp_bosses = {}
 pkp_bosses = {}
