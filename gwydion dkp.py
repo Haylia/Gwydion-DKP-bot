@@ -14,6 +14,7 @@ import requests
 import aiohttp
 from io import BytesIO
 import re
+import difflib
 import cv2
 import numpy as np
 import asyncio
@@ -124,13 +125,53 @@ bot5ws12 = bot5sheet.get_worksheet(11)
 bot5ws13 = bot5sheet.get_worksheet(12)
 print("accessing the spreadsheet for account 5")
 
-vkp_bosses = {"Crom": 125}
-gkp_bosses = {"Reaver":5, "Lich":5, "Bt":50}
-pkp_bosses = {"Bane": 10}
-akp_bosses = {"Gele":50, "Base":10, "Prime":20}
-rbppunox_bosses = {"Unox5":1, "Unox6": 1}
-dpkp_bosses = {"Dino":75, "Dinofast":100}
-rbpp_bosses = {"Unox5":1, "Rev6":1, "Kroth6":1, "Gron6":1, "Unox6": 1, "Hrung":1, "Mord":1, "Necro":1, "Dino":1, "Dinofast":1, "Bane": 1, "Bt":1, "Base":1, "Prime":1, "Gele":1, "Crom":1, "Rd":1, "Cd":1, "Tree":1, "Doom":1, "Gd":1}
+vkp_bosses = {}
+gkp_bosses = {}
+pkp_bosses = {}
+akp_bosses = {}
+rbppunox_bosses = {}
+dpkp_bosses = {}
+rbpp_bosses = {}
+
+BOSS_DICTS = {
+    "VKP": vkp_bosses,
+    "GKP": gkp_bosses,
+    "PKP": pkp_bosses,
+    "AKP": akp_bosses,
+    "RBPPUNOX": rbppunox_bosses,
+    "DPKP": dpkp_bosses,
+    "RBPP": rbpp_bosses,
+}
+
+BOSSES_FILE = "bosses.txt"
+
+def load_bosses():
+    """Load boss mappings from bosses.txt into the global dicts"""
+    for d in BOSS_DICTS.values():
+        d.clear()
+    current_pool = None
+    with open(BOSSES_FILE, "r") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            if line.startswith("[") and line.endswith("]"):
+                current_pool = line[1:-1]
+            elif "=" in line and current_pool in BOSS_DICTS:
+                bossname, points = line.split("=", 1)
+                BOSS_DICTS[current_pool][bossname.strip()] = int(points.strip())
+
+def save_bosses():
+    """Save the current boss dicts back to bosses.txt"""
+    with open(BOSSES_FILE, "w") as f:
+        for pool in ["VKP", "GKP", "PKP", "AKP", "RBPPUNOX", "DPKP", "RBPP"]:
+            f.write("[" + pool + "]\n")
+            for bossname, points in BOSS_DICTS[pool].items():
+                f.write(bossname + "=" + str(points) + "\n")
+            f.write("\n")
+
+load_bosses()
+print("loaded boss mappings from " + BOSSES_FILE)
 
 KP_TYPES = ["VKP", "GKP", "PKP", "AKP", "RBPPUNOX", "DPKP", "RBPP"]
 KP_WORKSHEETS = {
@@ -296,36 +337,59 @@ def process_images(paths):
     return df
 
 def find_name(name, namelist):
-    # name might be misspelled, so we will check for partial matches and return the closest one
-    ogname = name
-    # remove dupes from list
     namelist = list(set(namelist))
-    # print("looking for " + name + " in " + str(namelist))
-    name = name.lower()
-    for i in range(len(namelist)):
-        if name == namelist[i].lower():
-            #print("found " + namelist[i] + " in " + str(namelist) + " for " + ogname)
-            return namelist[i], True, False
-    name = name.replace(" ","")
-    for i in range(len(namelist)):
-        if name == namelist[i].lower().replace(" ",""):
-            #print("found " + namelist[i] + " in " + str(namelist) + " for " + ogname)
-            return namelist[i], True, True
-    # name might be a partial match like "reda" for "redalice", but only use this if there is one possible match
-    for i in range(len(namelist)):
-        if name in namelist[i].lower().replace(" ",""):
-            # check if there are other possible matches
-            possiblematches = 0
-            for j in range(len(namelist)):
-                if name in namelist[j].lower().replace(" ",""):
-                    possiblematches += 1
-            if possiblematches == 1:
-                #print("found " + namelist[i] + " in " + str(namelist) + " for " + ogname)
-                return namelist[i], False, True
-            else:
-                print("multiple possible matches for " + name + " in " + str(namelist) + " for " + ogname)
-    #print("could not find " + name + " in " + str(namelist) + " for " + ogname)
-    return None, False, False
+    if not name or not namelist:
+        return None, False, False, []
+
+    name_lower = name.lower()
+    name_compact = name_lower.replace(" ", "")
+
+    # Pass 1: exact case-insensitive
+    for candidate in namelist:
+        if name_lower == candidate.lower():
+            return candidate, True, False, []
+
+    # Pass 2: exact match ignoring spaces
+    for candidate in namelist:
+        if name_compact == candidate.lower().replace(" ", ""):
+            return candidate, True, True, []
+
+    # Pass 3: prefix match (unique only)
+    prefix_matches = [c for c in namelist if c.lower().replace(" ", "").startswith(name_compact)]
+    if len(prefix_matches) == 1:
+        return prefix_matches[0], False, True, []
+    if prefix_matches:
+        return None, False, False, prefix_matches
+
+    # Pass 4: substring match (unique only)
+    substr_matches = [c for c in namelist if name_compact in c.lower().replace(" ", "")]
+    if len(substr_matches) == 1:
+        return substr_matches[0], False, True, []
+    if substr_matches:
+        return None, False, False, substr_matches
+
+    # Pass 5: edit distance (only for inputs >= 3 chars)
+    if len(name_compact) >= 3:
+        scored = []
+        for candidate in namelist:
+            ratio = difflib.SequenceMatcher(None, name_compact, candidate.lower().replace(" ", "")).ratio()
+            scored.append((candidate, ratio))
+        scored.sort(key=lambda x: x[1], reverse=True)
+
+        if len(scored) >= 2:
+            best_name, best_score = scored[0]
+            second_score = scored[1][1]
+            if best_score >= 0.75 and (best_score - second_score) >= 0.10:
+                return best_name, False, True, []
+        elif len(scored) == 1 and scored[0][1] >= 0.75:
+            return scored[0][0], False, True, []
+
+    return None, False, False, []
+
+def not_found_message(name, suggestions):
+    if suggestions:
+        return "Could not find player '" + name + "'. Did you mean: " + ", ".join(suggestions) + "?"
+    return "Could not find player '" + name + "'."
             
     
 @tasks.loop(seconds=60)
@@ -355,12 +419,9 @@ async def bidloop():
                         bot3ws13.update_cell(j + 1, 7, "Closed")
                 cell = bot3ws12.find(combilist[i][1])
                 row_num = cell.row
-                print(row_num)
                 bidrow = bot3ws12.row_values(row_num)
                 #cut off everything but the player name and the bids
-                print(bidrow)
                 bidrow = bidrow[5:]
-                print(bidrow)
                 # split the rest alternating between the player and their bid
                 length = len(bidrow)
                 results = []
@@ -368,17 +429,14 @@ async def bidloop():
                     player = bidrow.pop(0)
                     bid = bidrow.pop(0)
                     results.append([player, bid])
-                    print(player, bid)
                 results.sort(key = lambda x: float(x[1]), reverse = True)
                 msgtosend = "The bid for " + combilist[i][3] + " has been closed. The highest bidder was " + results[0][0] + " with a bid of " + str(results[0][1]) + " " + combilist[i][4]
-                print(msgtosend)
                 for k in range(1, len(results)):
                     msgtosend += "\n" + results[k][0] + " bid " + str(results[k][1]) + " " + combilist[i][4]
-                print(msgtosend)
                 await client.get_channel(resultschannel).send(msgtosend)
-                
+
     except Exception as e:
-        print(e, e.__traceback__.tb_lineno)
+        logger.exception("Error in bidloop")
 
 
 
@@ -807,9 +865,9 @@ async def addpoints(ctx, playername, pointtype, earned, spent, adjusted):
     earned = float(earned)
     spent = float(spent)
     adjusted = float(adjusted)
-    findnames, caps, spaces = find_name(playername, bot5ws1.col_values(1))
+    findnames, caps, spaces, suggestions = find_name(playername, bot5ws1.col_values(1))
     if not findnames:
-        await ctx.send("Player not found")
+        await ctx.send(not_found_message(playername, suggestions))
         return
     playername = findnames
     ws = KP_WORKSHEETS[pointtype]["admin"]
@@ -893,7 +951,7 @@ async def addmem(ctx, name, rank, main, level, cclass):
     if rank not in ["General", "Guardian", "Clansman", "Recruit", "Chieftain"]:
         await ctx.send("Invalid rank! Please use General, Guardian, Clansman, Recruit, or Chieftain")
         return
-    realname, caps, spaces = find_name(name, user_list)
+    realname, caps, spaces, suggestions = find_name(name, user_list)
     if realname == None:
         if main:
 
@@ -947,7 +1005,7 @@ async def rosteradmin(ctx, subcommand, name, params):
     """roster management for admins
     subcommands: rank, main"""
     user_list = bot5ws1.col_values(1)
-    realname, caps, spaces = find_name(name, user_list)
+    realname, caps, spaces, suggestions = find_name(name, user_list)
     if realname != None:
         cell = bot5ws1.find(realname, in_column=1)
         row_num = cell.row
@@ -978,7 +1036,7 @@ async def roster(ctx, subcommand, name, params):
     """Roster Management Command
     subcommands: dg, subclass, cgoffhand, dl, dlmain, dloffhand, edl, edlmain, edloffhand, setall, level, setmain, bulksetmain, faction"""
     user_list = bot5ws1.col_values(1)
-    realname, caps, spaces = find_name(name, user_list)
+    realname, caps, spaces, suggestions = find_name(name, user_list)
     if realname != None:
         cell = bot5ws1.find(realname, in_column=1)
         row_num = cell.row
@@ -1004,7 +1062,7 @@ async def roster(ctx, subcommand, name, params):
             await ctx.send(realname + "'s Main character has been updated to " + str(realname))
             if realname != None:
                 for names in names_list:
-                    findnames, caps, spaces = find_name(names, user_list)
+                    findnames, caps, spaces, suggestions = find_name(names, user_list)
                     if findnames != None:
                         cell = bot5ws1.find(findnames, in_column=1)
                         row_num = cell.row
@@ -1014,7 +1072,7 @@ async def roster(ctx, subcommand, name, params):
                         logbody = ["roster", str(ctx.author.name), dt.now().strftime("%d/%m/%Y %H:%M:%S"), str([findnames, subcommand, realname])]
                         bot3ws11.append_row(logbody)
                     else:
-                        await ctx.send(names + " not in list!")
+                        await ctx.send(not_found_message(names, suggestions))
         elif subcommand == "bulksetmain":
             names_list = params.split(",")
             # set the realname main to itself as well
@@ -1023,7 +1081,7 @@ async def roster(ctx, subcommand, name, params):
             await ctx.send(realname + "'s Main character has been updated to " + str(realname))
             if realname != None:
                 for names in names_list:
-                    findnames, caps, spaces = find_name(names, user_list)
+                    findnames, caps, spaces, suggestions = find_name(names, user_list)
                     if findnames != None:
                         cell = bot5ws1.find(findnames, in_column=1)
                         row_num = cell.row
@@ -1033,7 +1091,7 @@ async def roster(ctx, subcommand, name, params):
                         logbody = ["roster", str(ctx.author.name), dt.now().strftime("%d/%m/%Y %H:%M:%S"), str([findnames, subcommand, realname])]
                         bot3ws11.append_row(logbody)
                     else:
-                        await ctx.send(names + " not in list!")
+                        await ctx.send(not_found_message(names, suggestions))
         elif subcommand == "level":
             bot5ws1.update_cell(row_num, 4, params)
             await ctx.send(realname + "'s level has been updated to " + str(params))
@@ -1115,14 +1173,14 @@ async def roster(ctx, subcommand, name, params):
         else:
             await ctx.send("invalid subcommand")
     else:
-        await ctx.send(name + " not in list!")
+        await ctx.send(not_found_message(name, suggestions))
 
 @client.command(guild_ids = guilds, aliases=["p", "toon", "char", "character"])
 async def player(ctx, *name):
     """Displays a player's information"""
     name = " ".join(name)
     user_list = cached_col_values(bot4ws1, 1, "roster_names")
-    realname, caps, spaces = find_name(name, user_list)
+    realname, caps, spaces, suggestions = find_name(name, user_list)
     if realname != None:
         cell = bot4ws1.find(realname, in_column=1)
         row_num = cell.row
@@ -1169,14 +1227,14 @@ async def player(ctx, *name):
         embed.add_field(name = "RBPP", value = "Earned: " + str(dkprowvals7[3]) + ", Current: " + str(dkprowvals7[6]), inline = False)
         await ctx.send(embed=embed)
     else:
-        await ctx.send(name + " not in list!")
+        await ctx.send(not_found_message(name, suggestions))
 
 @client.command(guild_ids = guilds, aliases=["pf", "playerfullinfo", "playerfullinformation"])
 async def playerfull(ctx, *name):
     """Displays a player's information"""
     name = " ".join(name)
     user_list = cached_col_values(bot4ws1, 1, "roster_names")
-    realname, caps, spaces = find_name(name, user_list)
+    realname, caps, spaces, suggestions = find_name(name, user_list)
     if realname != None:
         cell = bot4ws1.find(realname, in_column=1)
         row_num = cell.row
@@ -1222,14 +1280,14 @@ async def playerfull(ctx, *name):
         embed.add_field(name = "RBPP", value = "Earned: " + str(dkprowvals7[3]) + ", Current: " + str(dkprowvals7[6]), inline = False)
         await ctx.send(embed=embed)
     else:
-        await ctx.send(name + " not in list!")
+        await ctx.send(not_found_message(name, suggestions))
 
 @client.command(guild_ids = guilds, aliases=["pkp"])
 async def playerkp(ctx, *name):
     """Displays a player's KP information"""
     name = " ".join(name)
     user_list = cached_col_values(bot4ws1, 1, "roster_names")
-    realname, caps, spaces = find_name(name, user_list)
+    realname, caps, spaces, suggestions = find_name(name, user_list)
     if realname != None:
         cell = bot4ws2.find(realname, in_column=1)
         row_num = cell.row
@@ -1258,7 +1316,7 @@ async def playerkp(ctx, *name):
         embed.add_field(name = "RBPP", value = "Last Raid: " + embedvals7[1] + ", Att %: " + embedvals7[2] + ", Earned: " + embedvals7[3] + ", Spent: " + embedvals7[4] + ", Adjusted: " + embedvals7[5] + ", Current: " + str(embedvals7[6]), inline = False)
         await ctx.send(embed=embed)
     else:
-        await ctx.send(name + " not in list!")
+        await ctx.send(not_found_message(name, suggestions))
 
 @client.command(guild_ids = guilds, aliases=["toons", "chars", "characterlist"])
 async def characters(ctx, *name):
@@ -1273,7 +1331,7 @@ async def characters(ctx, *name):
     mains_to_chars = list(mains_to_chars)[1:]
     # sort so that mains come first, then by level descending
     mains_to_chars = sorted(mains_to_chars, key=lambda x: (x[0] != x[1], -int(x[2])))
-    realname, caps, spaces = find_name(name, mains_list)
+    realname, caps, spaces, suggestions = find_name(name, mains_list)
     if realname != None:
         embed = discord.Embed(title = realname + "'s Characters", colour=discord.Color.orange())
         #find all instances of main name in the character list, add to the embed and return
@@ -1282,7 +1340,7 @@ async def characters(ctx, *name):
                 embed.add_field(name = character, value = "Level " + str(level) + " " + cclass, inline = False)
         await ctx.send(embed=embed)
         return
-    altrealname, caps, spaces = find_name(name, characters_list)
+    altrealname, caps, spaces, alt_suggestions = find_name(name, characters_list)
     if altrealname != None:
         #pull the main first, then find all instances of the main in the character list, add to the embed and return
         cell = bot4ws1.find(altrealname, in_column=1)
@@ -1292,10 +1350,10 @@ async def characters(ctx, *name):
         for main, character, level, cclass in mains_to_chars:
             if main == main_name:
                 embed.add_field(name = character, value = "Level " + str(level) + " " + cclass, inline = False)
-        
+
         await ctx.send(embed=embed)
     else:
-        await ctx.send(name + " not in list!")
+        await ctx.send(not_found_message(name, suggestions or alt_suggestions))
         
 
 @client.command(guild_ids = guilds)
@@ -1304,7 +1362,7 @@ async def fullpointwipe(ctx, name, verification):
     """fully wipes someones points, including earned points"""
     if verification == "releleaderfullwipe":
         user_list = bot5ws1.col_values(1)
-        realname, caps, spaces = find_name(name, user_list)
+        realname, caps, spaces, suggestions = find_name(name, user_list)
         if realname != None:
             cell1 = bot5ws2.find(realname, in_column=1)
             row_num1 = cell1.row
@@ -1352,9 +1410,9 @@ async def fullpointwipe(ctx, name, verification):
             logbody = ["wipe", str(ctx.author.name), dt.now().strftime("%d/%m/%Y %H:%M:%S"), str([realname])]
             bot3ws11.append_row(logbody)
         else:
-            await ctx.send(name + " not in list!")
+            await ctx.send(not_found_message(name, suggestions))
 
-        
+
 def parse_deduct_args(args_str):
     """Parse deduct arguments from a string like: $deduct "name" "item" 123 KP
     Returns (name, item, number, kp) or (None, None, None, None) on parse error"""
@@ -1393,7 +1451,7 @@ def internal_deduct(args_str):
 
     if kp == "VKP":
         user_list = bot3ws2.col_values(1)
-        realname, caps, spaces = find_name(name, user_list)
+        realname, caps, spaces, suggestions = find_name(name, user_list)
         if realname != None:
             cell = bot3ws2.find(realname, in_column=1)
             row_num = cell.row
@@ -1418,10 +1476,10 @@ def internal_deduct(args_str):
                 return(realname + " has been deducted " + str(number) + " VKP for " + item)
                 
         else:
-            return(name + " not in list!")
+            return(not_found_message(name, suggestions))
     elif kp == "GKP":
         user_list = bot3ws3.col_values(1)
-        realname, caps, spaces = find_name(name, user_list)
+        realname, caps, spaces, suggestions = find_name(name, user_list)
         if realname != None:
             cell = bot3ws3.find(realname, in_column=1)
             row_num = cell.row
@@ -1445,10 +1503,10 @@ def internal_deduct(args_str):
                 bot3ws11.append_row(logbody)
                 return(realname + " has been deducted " + str(number) + " GKP for " + item)
         else:
-            return(name + " not in list!")
+            return(not_found_message(name, suggestions))
     elif kp == "PKP":
         user_list = bot3ws4.col_values(1)
-        realname, caps, spaces = find_name(name, user_list)
+        realname, caps, spaces, suggestions = find_name(name, user_list)
         if realname != None:
             cell = bot3ws4.find(realname, in_column=1)
             row_num = cell.row
@@ -1473,10 +1531,10 @@ def internal_deduct(args_str):
                 return(realname + " has been deducted " + str(number) + " PKP for " + item)
                 
         else:
-            return(name + " not in list!")
+            return(not_found_message(name, suggestions))
     elif kp == "AKP":
         user_list = bot3ws5.col_values(1)
-        realname, caps, spaces = find_name(name, user_list)
+        realname, caps, spaces, suggestions = find_name(name, user_list)
         if realname != None:
             cell = bot3ws5.find(realname, in_column=1)
             row_num = cell.row
@@ -1501,10 +1559,10 @@ def internal_deduct(args_str):
                 return(realname + " has been deducted " + str(number) + " AKP for " + item)
                 
         else:
-            return(name + " not in list!")
+            return(not_found_message(name, suggestions))
     elif kp == "RBPPUNOX":
         user_list = bot3ws6.col_values(1)
-        realname, caps, spaces = find_name(name, user_list)
+        realname, caps, spaces, suggestions = find_name(name, user_list)
         if realname != None:
             cell = bot3ws6.find(realname, in_column=1)
             row_num = cell.row
@@ -1529,10 +1587,10 @@ def internal_deduct(args_str):
                 return(realname + " has been deducted " + str(number) + " RBPPUNOX for " + item)
                 
         else:
-            return(name + " not in list!")
+            return(not_found_message(name, suggestions))
     elif kp == "DPKP":
         user_list = bot3ws7.col_values(1)
-        realname, caps, spaces = find_name(name, user_list)
+        realname, caps, spaces, suggestions = find_name(name, user_list)
         if realname != None:
             cell = bot3ws7.find(realname, in_column=1)
             row_num = cell.row
@@ -1557,7 +1615,7 @@ def internal_deduct(args_str):
                 return(realname + " has been deducted " + str(number) + " DPKP for " + item)
                 
         else:
-            return(name + " not in list!")
+            return(not_found_message(name, suggestions))
     else:
         return("Invalid KP type: " + kp)
 
@@ -1570,7 +1628,7 @@ async def deduct(ctx, name, item, number, kp):
 
     if kp == "VKP":
         user_list = bot3ws2.col_values(1)
-        realname, caps, spaces = find_name(name, user_list)
+        realname, caps, spaces, suggestions = find_name(name, user_list)
         if realname != None:
             cell = bot3ws2.find(realname, in_column=1)
             row_num = cell.row
@@ -1594,10 +1652,10 @@ async def deduct(ctx, name, item, number, kp):
                 logbody = ["deduct", str(ctx.author.name), dt.now().strftime("%d/%m/%Y %H:%M:%S"), str([realname, item, number, kp])]
                 bot3ws11.append_row(logbody)
         else:
-            await ctx.send(name + " not in list!")
+            await ctx.send(not_found_message(name, suggestions))
     elif kp == "GKP":
         user_list = bot3ws3.col_values(1)
-        realname, caps, spaces = find_name(name, user_list)
+        realname, caps, spaces, suggestions = find_name(name, user_list)
         if realname != None:
             cell = bot3ws3.find(realname, in_column=1)
             row_num = cell.row
@@ -1621,10 +1679,10 @@ async def deduct(ctx, name, item, number, kp):
                 logbody = ["deduct", str(ctx.author.name), dt.now().strftime("%d/%m/%Y %H:%M:%S"), str([realname, item, number, kp])]
                 bot3ws11.append_row(logbody)
         else:
-            await ctx.send(name + " not in list!")
+            await ctx.send(not_found_message(name, suggestions))
     elif kp == "PKP":
         user_list = bot3ws4.col_values(1)
-        realname, caps, spaces = find_name(name, user_list)
+        realname, caps, spaces, suggestions = find_name(name, user_list)
         if realname != None:
             cell = bot3ws4.find(realname, in_column=1)
             row_num = cell.row
@@ -1648,10 +1706,10 @@ async def deduct(ctx, name, item, number, kp):
                 logbody = ["deduct", str(ctx.author.name), dt.now().strftime("%d/%m/%Y %H:%M:%S"), str([realname, item, number, kp])]
                 bot3ws11.append_row(logbody)
         else:
-            await ctx.send(name + " not in list!")
+            await ctx.send(not_found_message(name, suggestions))
     elif kp == "AKP":
         user_list = bot3ws5.col_values(1)
-        realname, caps, spaces = find_name(name, user_list)
+        realname, caps, spaces, suggestions = find_name(name, user_list)
         if realname != None:
             cell = bot3ws5.find(realname, in_column=1)
             row_num = cell.row
@@ -1675,10 +1733,10 @@ async def deduct(ctx, name, item, number, kp):
                 logbody = ["deduct", str(ctx.author.name), dt.now().strftime("%d/%m/%Y %H:%M:%S"), str([realname, item, number, kp])]
                 bot3ws11.append_row(logbody)
         else:
-            await ctx.send(name + " not in list!")
+            await ctx.send(not_found_message(name, suggestions))
     elif kp == "RBPPUNOX":
         user_list = bot3ws6.col_values(1)
-        realname, caps, spaces = find_name(name, user_list)
+        realname, caps, spaces, suggestions = find_name(name, user_list)
         if realname != None:
             cell = bot3ws6.find(realname, in_column=1)
             row_num = cell.row
@@ -1702,10 +1760,10 @@ async def deduct(ctx, name, item, number, kp):
                 logbody = ["deduct", str(ctx.author.name), dt.now().strftime("%d/%m/%Y %H:%M:%S"), str([realname, item, number, kp])]
                 bot3ws11.append_row(logbody)
         else:
-            await ctx.send(name + " not in list!")
+            await ctx.send(not_found_message(name, suggestions))
     elif kp == "DPKP":
         user_list = bot3ws7.col_values(1)
-        realname, caps, spaces = find_name(name, user_list)
+        realname, caps, spaces, suggestions = find_name(name, user_list)
         if realname != None:
             cell = bot3ws7.find(realname, in_column=1)
             row_num = cell.row
@@ -1729,7 +1787,7 @@ async def deduct(ctx, name, item, number, kp):
                 logbody = ["deduct", str(ctx.author.name), dt.now().strftime("%d/%m/%Y %H:%M:%S"), str([realname, item, number, kp])]
                 bot3ws11.append_row(logbody)
         else:
-            await ctx.send(name + " not in list!")
+            await ctx.send(not_found_message(name, suggestions))
     else:
         await ctx.send("Invalid pointpool! Use VKP, GKP, PKP, AKP, RBPPUNOX, or DPKP.")
         
@@ -1798,12 +1856,13 @@ async def bidgen(ctx, *message):
         await ctx.send("No valid loot entries found. Please check the format:\n```\nPlayer Name - Item Name\n(amount pointpool)\n```")
 
 @client.command(guild_ids = guilds, aliases=["loot", "wonitems"])
-async def winnings(ctx, name, kp = "ALL"):
+async def winnings(ctx, name, kp = None):
     """Displays a player's loot winnings"""
-    kp = kp.upper()
-    if kp == "ALL":
+    if kp != None:
+        kp = kp.upper()
+    if kp == None:
         user_list = bot4ws9.col_values(1)
-        realname, caps, spaces = find_name(name, user_list)
+        realname, caps, spaces, suggestions = find_name(name, user_list)
         if realname != None:
             cell = bot4ws9.find(realname, in_column=1)
             row_num = cell.row
@@ -1824,10 +1883,10 @@ async def winnings(ctx, name, kp = "ALL"):
                     embed.add_field(name = str(i + 1) + ". " + lootlist[i], value = costlist[i], inline = False)
                 await ctx.send(embed=embed)
         else:
-            await ctx.send(name + " not in list!")
+            await ctx.send(not_found_message(name, suggestions))
     else:
         user_list = bot4ws9.col_values(1)
-        realname, caps, spaces = find_name(name, user_list)
+        realname, caps, spaces, suggestions = find_name(name, user_list)
         if realname != None:
             cell = bot4ws9.find(realname, in_column=1)
             row_num = cell.row
@@ -1851,7 +1910,7 @@ async def winnings(ctx, name, kp = "ALL"):
             else:
                 await ctx.send(embed=embed)
         else:
-            await ctx.send(name + " not in list!")
+            await ctx.send(not_found_message(name, suggestions))
 
 @client.command(guild_ids = guilds)
 @commands.has_any_role("General", "Guardian", "REDALiCE", "Helper")
@@ -1859,7 +1918,7 @@ async def refunditem(ctx, name, itemnum):
     """Refunds an item and returns the points to the player"""
     itemnum = int(itemnum)
     user_list = bot3ws9.col_values(1)
-    realname, caps, spaces = find_name(name, user_list)
+    realname, caps, spaces, suggestions = find_name(name, user_list)
     if realname != None:
         cell = bot3ws9.find(realname, in_column=1)
         row_num = cell.row
@@ -1943,7 +2002,7 @@ async def refundolditem(ctx, name, amount, kp):
         return
     ws = KP_WORKSHEETS[kp]["deduct"]
     user_list = ws.col_values(1)
-    realname, caps, spaces = find_name(name, user_list)
+    realname, caps, spaces, suggestions = find_name(name, user_list)
     if realname != None:
         cell = ws.find(realname, in_column=1)
         row_num = cell.row
@@ -1954,8 +2013,8 @@ async def refundolditem(ctx, name, amount, kp):
         logbody = ["refund", str(ctx.author.name), dt.now().strftime("%d/%m/%Y %H:%M:%S"), str([realname, amount, kp])]
         bot3ws11.append_row(logbody)
     else:
-        await ctx.send(name + " not in list!")
-    
+        await ctx.send(not_found_message(name, suggestions))
+
 
 
     
@@ -1971,7 +2030,7 @@ async def adjust(ctx, name, number, kp):
         return
     ws = KP_WORKSHEETS[kp]["admin"]
     user_list = ws.col_values(1)
-    realname, caps, spaces = find_name(name, user_list)
+    realname, caps, spaces, suggestions = find_name(name, user_list)
     if realname != None:
         cell = ws.find(realname, in_column=1)
         row_num = cell.row
@@ -1981,7 +2040,71 @@ async def adjust(ctx, name, number, kp):
         logbody = ["adjust", str(ctx.author.name), dt.now().strftime("%d/%m/%Y %H:%M:%S"), str([realname, number, kp])]
         bot3ws11.append_row(logbody)
     else:
-        await ctx.send(name + " not in list!")
+        await ctx.send(not_found_message(name, suggestions))
+
+@client.command(guild_ids=guilds, aliases=["bc"])
+@commands.has_any_role("General", "REDALiCE")
+async def bossconfig(ctx, action, pool = None, bossname = None, points = None):
+    """Manage boss-to-KP-pool mappings. Subcommands: list, add, remove, update"""
+    action = action.lower()
+    if action == "list":
+        embed = discord.Embed(title="Boss Configuration", colour=discord.Color.orange())
+        for pool_name in ["VKP", "GKP", "PKP", "AKP", "RBPPUNOX", "DPKP", "RBPP"]:
+            bosses = BOSS_DICTS[pool_name]
+            if bosses:
+                boss_lines = ", ".join(b + " (" + str(p) + ")" for b, p in bosses.items())
+            else:
+                boss_lines = "None"
+            embed.add_field(name=pool_name, value=boss_lines, inline=False)
+        await ctx.send(embed=embed)
+        return
+    # all other actions require pool and bossname
+    if pool is None or bossname is None:
+        await ctx.send("Usage: `$bossconfig " + action + " <pool> <bossname>" + (" <points>`" if action in ["add", "update"] else "`"))
+        return
+    pool = pool.upper()
+    bossname = bossname.capitalize()
+    if pool not in BOSS_DICTS:
+        await ctx.send("Invalid pool! Valid pools: " + ", ".join(BOSS_DICTS.keys()))
+        return
+    if action == "add":
+        if points is None:
+            await ctx.send("Usage: `$bossconfig add <pool> <bossname> <points>`")
+            return
+        points = int(points)
+        if bossname in BOSS_DICTS[pool]:
+            await ctx.send(bossname + " already exists in " + pool + " with " + str(BOSS_DICTS[pool][bossname]) + " points. Use `$bossconfig update` to change it.")
+            return
+        BOSS_DICTS[pool][bossname] = points
+        save_bosses()
+        await ctx.send("Added " + bossname + " to " + pool + " with " + str(points) + " points.")
+        logbody = ["bossconfig add", str(ctx.author.name), dt.now().strftime("%d/%m/%Y %H:%M:%S"), str([pool, bossname, points])]
+        bot3ws11.append_row(logbody)
+    elif action == "remove":
+        if bossname not in BOSS_DICTS[pool]:
+            await ctx.send(bossname + " is not in " + pool + "!")
+            return
+        old_points = BOSS_DICTS[pool].pop(bossname)
+        save_bosses()
+        await ctx.send("Removed " + bossname + " from " + pool + " (was " + str(old_points) + " points).")
+        logbody = ["bossconfig remove", str(ctx.author.name), dt.now().strftime("%d/%m/%Y %H:%M:%S"), str([pool, bossname, old_points])]
+        bot3ws11.append_row(logbody)
+    elif action == "update":
+        if points is None:
+            await ctx.send("Usage: `$bossconfig update <pool> <bossname> <points>`")
+            return
+        points = int(points)
+        if bossname not in BOSS_DICTS[pool]:
+            await ctx.send(bossname + " is not in " + pool + "! Use `$bossconfig add` to add it.")
+            return
+        old_points = BOSS_DICTS[pool][bossname]
+        BOSS_DICTS[pool][bossname] = points
+        save_bosses()
+        await ctx.send("Updated " + bossname + " in " + pool + " from " + str(old_points) + " to " + str(points) + " points.")
+        logbody = ["bossconfig update", str(ctx.author.name), dt.now().strftime("%d/%m/%Y %H:%M:%S"), str([pool, bossname, old_points, points])]
+        bot3ws11.append_row(logbody)
+    else:
+        await ctx.send("Unknown action! Use: `list`, `add`, `remove`, or `update`")
 
 @client.command(guild_ids = guilds)
 @commands.has_any_role("General", "Guardian", "REDALiCE", "Helper")
@@ -2008,8 +2131,7 @@ async def boss(ctx, bossname, toonlist):
     toonlist = list(set(toonlist))
     currenttime =  dt.now().strftime("%d/%m/%Y %H:%M:%S")
     for t in toonlist:
-        findt, caps, spaces = find_name(t, user_list)
-        print("doing attendance for " + str(findt))
+        findt, caps, spaces, suggestions = find_name(t, user_list)
         if findt is not None:
             cell = bot4ws1.find(findt, in_column=1)
             row_num = cell.row
@@ -2157,7 +2279,7 @@ async def boss(ctx, bossname, toonlist):
                 if "GKP" not in kppool:
                     kppool.append("GKP")
         else:
-            await ctx.send(str(t) + " not in list!")
+            await ctx.send(not_found_message(t, suggestions))
             toonlist.pop(toonlist.index(t))
     print("creating embed")
     embed = discord.Embed(title = bossname + " Attendance", colour=discord.Color.orange())
@@ -2244,7 +2366,7 @@ async def bosshalf(ctx, bossname, toonlist):
     toonlist = list(set(toonlist))
     currenttime =  dt.now().strftime("%d/%m/%Y %H:%M:%S")
     for t in toonlist:
-        findt, caps, spaces = find_name(t, user_list)
+        findt, caps, spaces, suggestions = find_name(t, user_list)
         if findt is not None:
             cell = bot3ws1.find(findt, in_column=1)
             row_num = cell.row
@@ -2304,7 +2426,7 @@ async def bosshalf(ctx, bossname, toonlist):
                 if "GKP" not in kppool:
                     kppool.append("GKP")
         else:
-            await ctx.send(str(t) + " not in list!")
+            await ctx.send(not_found_message(t, suggestions))
             toonlist.pop(toonlist.index(t))
     embed = discord.Embed(title = bossname + " Attendance", colour=discord.Color.orange())
     emptyattend = False
@@ -2408,8 +2530,8 @@ async def mainswap(ctx, oldname, newname):
 
     # get oldname current points
     roster_names = cached_col_values(bot3ws1, 1, "roster_names")
-    findoldname, caps, spaces = find_name(oldname, roster_names)
-    findnewname, caps, spaces = find_name(newname, roster_names)
+    findoldname, caps, spaces, suggestions = find_name(oldname, roster_names)
+    findnewname, caps, spaces, suggestions = find_name(newname, roster_names)
 
     # cache all find() row lookups — avoids ~25 redundant API reads
     old_roster_row = bot1ws1.find(findoldname, in_column = 1).row
@@ -2489,7 +2611,7 @@ async def newowner(ctx, *charnames):
     charnames = [x.strip() for x in charnames]
     sendlist = []
     for c in charnames:
-        findc, caps, spaces = find_name(c, cached_col_values(bot3ws1, 1, "roster_names"))
+        findc, caps, spaces, suggestions = find_name(c, cached_col_values(bot3ws1, 1, "roster_names"))
         if findc is not None:
             # set the main to Blank
             bot5ws1.update_acell(f'G{bot1ws1.find(findc, in_column = 1).row}', '')
@@ -2546,7 +2668,7 @@ async def newowner(ctx, *charnames):
 
             sendlist.append(findc)
         else:
-            await ctx.send(str(c) + " not in list!")
+            await ctx.send(not_found_message(c, suggestions))
     await ctx.send("Processed the following characters: " + ', '.join(sendlist))
 
 @client.command(guild_ids = guilds, aliases=['cplb', 'classpointsleaderboard', 'classpointslb', 'classpointlb'])
@@ -2644,7 +2766,7 @@ async def gen(ctx):
             tokens = content.split()
             for token in tokens:
                 clean_token = re.sub(r'[^0-9A-Za-z]', '', token)
-                findt, caps, spaces = find_name(token, toonnames)
+                findt, caps, spaces, suggestions = find_name(token, toonnames)
                 # first check if the next token is "HALF"xxxxxxx
                 if clean_token.upper() == "HALF":
                     if len(charnames) > 0:
@@ -2662,7 +2784,7 @@ async def gen(ctx):
                 elif len(tokens) > 1:
                     prev_token = tokens[tokens.index(token) - 1]
                     combined_token = prev_token + clean_token
-                    findt, caps, spaces = find_name(combined_token, toonnames)
+                    findt, caps, spaces, suggestions = find_name(combined_token, toonnames)
                     if findt is not None and findt not in charnames:
                         charnames.append(findt)
                 else:
@@ -3192,14 +3314,15 @@ async def oldwins(ctx):
     await ctx.send("https://docs.google.com/spreadsheets/d/1FbfNkF9SkD0A8a61ChoKvcG88yC2vpaHL8ffm37TSb8/edit?gid=1217357805#gid=1217357805")
 
 @client.command(guild_ids=guilds, aliases=["oldloot"])
-async def oldwinnings(ctx, name, kp = "ALL"):
+async def oldwinnings(ctx, name, kp = None):
     """Displays a player's old loot winnings from Alice's spreadsheet"""
-    kp = kp.upper()
+    if kp != None:
+        kp = kp.upper()
     all_rows = bot4ws14.get_all_values()
     char_names = [row[2] for row in all_rows if len(row) >= 5 and row[2] != ""]
-    realname, caps, spaces = find_name(name, char_names)
+    realname, caps, spaces, suggestions = find_name(name, char_names)
     if realname == None:
-        await ctx.send(name + " not found in old wins!")
+        await ctx.send(not_found_message(name, suggestions))
         return
     # check if character exists in the current system
     current_players = bot4ws9.col_values(1)
@@ -3210,10 +3333,10 @@ async def oldwinnings(ctx, name, kp = "ALL"):
     for row in all_rows:
         if len(row) >= 5 and row[2].lower() == realname.lower():
             date, pool, charname, item, price = row[0], row[1], row[2], row[3], row[4]
-            if kp == "ALL" or kp in pool.upper():
+            if kp == None or kp in pool.upper():
                 matches.append((date, pool, item, price))
     if len(matches) == 0:
-        if kp == "ALL":
+        if kp == None:
             await ctx.send(realname + warning + " has no old loot winnings")
         else:
             await ctx.send(realname + warning + " has no old loot winnings for " + kp)
@@ -3225,7 +3348,7 @@ async def oldwinnings(ctx, name, kp = "ALL"):
                 await ctx.send(embed=embed)
             pagecounter += 1
             title = realname + "'s Old Winnings"
-            if kp != "ALL":
+            if kp != None:
                 title += " (" + kp + ")"
             title += " Page " + str(pagecounter) + warning
             embed = discord.Embed(title=title, colour=discord.Color.orange())
