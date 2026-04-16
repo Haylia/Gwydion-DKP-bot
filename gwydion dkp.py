@@ -140,46 +140,230 @@ for _idx in range(11):
         bot5sheet.get_worksheet(_idx) if _idx <= 10 else None,
     ]
 
-class RetryWorksheet:
-    """Proxies a gspread Worksheet. On 429 rate limit, retries with a different service account."""
+class CachedCell:
+    """Lightweight Cell object returned by CachingWorksheet.find() and .cell()."""
+    __slots__ = ('row', 'col', 'value')
 
-    def __init__(self, ws, siblings=None):
+    def __init__(self, row, col, value=''):
+        self.row = row
+        self.col = col
+        self.value = value
+
+    def __repr__(self):
+        return f'CachedCell(row={self.row}, col={self.col}, value={self.value!r})'
+
+    def __eq__(self, other):
+        if other is None:
+            return False
+        return self.row == other.row and self.col == other.col and self.value == other.value
+
+    def __bool__(self):
+        return True
+
+def _parse_a1(label):
+    """Parse A1 notation (e.g., 'G5', 'AA12') into (row, col) 1-indexed tuple."""
+    col_str = ''
+    row_str = ''
+    for ch in label:
+        if ch.isalpha():
+            col_str += ch
+        else:
+            row_str += ch
+    col = 0
+    for ch in col_str.upper():
+        col = col * 26 + (ord(ch) - ord('A') + 1)
+    return int(row_str), col
+
+# Global registry: maps a registry key -> list of CachingWorksheet instances.
+# For main spreadsheet worksheets: key = sheet_index (0-10).
+# For secondary worksheets: key = unique string like "bot3ws12".
+_CACHE_REGISTRY = {}
+
+def _invalidate_siblings(registry_key):
+    """Mark all CachingWorksheet instances for this sheet as stale."""
+    for cws in _CACHE_REGISTRY.get(registry_key, []):
+        object.__setattr__(cws, '_stale', True)
+        object.__setattr__(cws, '_stale_unformatted', True)
+
+class CachingWorksheet:
+    """Wraps a gspread Worksheet with in-memory caching and rate-limit retry.
+
+    Read methods serve from a cached get_all_values() snapshot.
+    Write methods pass through to the API (with retry on 429), then mark
+    all sibling caches for the same sheet as stale.
+    """
+
+    def __init__(self, ws, siblings=None, registry_key=None):
         object.__setattr__(self, '_ws', ws)
         object.__setattr__(self, '_siblings', siblings or [])
+        object.__setattr__(self, '_registry_key', registry_key)
+        object.__setattr__(self, '_data', None)              # List[List[str]] FORMATTED
+        object.__setattr__(self, '_data_unformatted', None)  # List[List] UNFORMATTED (lazy)
+        object.__setattr__(self, '_stale', True)
+        object.__setattr__(self, '_stale_unformatted', True)
+        if registry_key is not None:
+            _CACHE_REGISTRY.setdefault(registry_key, []).append(self)
+
+    # ── API call with rate-limit retry ───────────────────────────────────
+
+    def _api_call(self, method_name, *args, **kwargs):
+        """Call a method on the underlying worksheet with 429 retry via siblings."""
+        try:
+            return getattr(self._ws, method_name)(*args, **kwargs)
+        except APIError as e:
+            if e.response.status_code != 429:
+                raise
+            logger.warning(f"Rate limited on account, trying fallback for {method_name}...")
+            for sib in self._siblings:
+                if sib is self._ws:
+                    continue
+                try:
+                    return getattr(sib, method_name)(*args, **kwargs)
+                except APIError as e2:
+                    if e2.response.status_code == 429:
+                        continue
+                    raise
+            logger.warning("All accounts rate limited, waiting 10s...")
+            time.sleep(10)
+            return getattr(self._ws, method_name)(*args, **kwargs)
+
+    # ── Cache management ─────────────────────────────────────────────────
+
+    def _ensure_fresh(self):
+        """Refresh the formatted cache if stale or unloaded."""
+        if self._stale or self._data is None:
+            logger.debug(f"Refreshing formatted cache for registry_key={self._registry_key}")
+            object.__setattr__(self, '_data', self._api_call('get_all_values'))
+            object.__setattr__(self, '_stale', False)
+
+    def _ensure_fresh_unformatted(self):
+        """Refresh the unformatted cache if stale or unloaded."""
+        if self._stale_unformatted or self._data_unformatted is None:
+            logger.debug(f"Refreshing unformatted cache for registry_key={self._registry_key}")
+            try:
+                raw = self._api_call('get_all_values', value_render_option='UNFORMATTED_VALUE')
+            except TypeError:
+                # Older gspread versions: get_all_values() may not accept the kwarg
+                raw = self._api_call('get', value_render_option='UNFORMATTED_VALUE')
+            object.__setattr__(self, '_data_unformatted', raw if raw else [])
+            object.__setattr__(self, '_stale_unformatted', False)
+
+    def _mark_all_stale(self):
+        """Invalidate caches for ALL worksheet instances sharing this sheet."""
+        if self._registry_key is not None:
+            _invalidate_siblings(self._registry_key)
+        else:
+            object.__setattr__(self, '_stale', True)
+            object.__setattr__(self, '_stale_unformatted', True)
+
+    def refresh(self):
+        """Force-refresh this worksheet's cache on next read."""
+        object.__setattr__(self, '_stale', True)
+        object.__setattr__(self, '_stale_unformatted', True)
+
+    # ── Read methods (served from cache) ─────────────────────────────────
+
+    def get_all_values(self, **kwargs):
+        self._ensure_fresh()
+        return [list(row) for row in self._data]
+
+    def col_values(self, col):
+        self._ensure_fresh()
+        result = []
+        for row in self._data:
+            if col <= len(row):
+                result.append(row[col - 1])
+            else:
+                result.append('')
+        return result
+
+    def row_values(self, row, value_render_option=None):
+        if value_render_option == 'UNFORMATTED_VALUE':
+            self._ensure_fresh_unformatted()
+            data = self._data_unformatted
+        else:
+            self._ensure_fresh()
+            data = self._data
+        if data and 1 <= row <= len(data):
+            return list(data[row - 1])
+        return []
+
+    def cell(self, row, col):
+        self._ensure_fresh()
+        if self._data and 1 <= row <= len(self._data):
+            r = self._data[row - 1]
+            if 1 <= col <= len(r):
+                return CachedCell(row, col, r[col - 1])
+        return CachedCell(row, col, '')
+
+    def acell(self, label):
+        row, col = _parse_a1(label)
+        return self.cell(row, col)
+
+    def find(self, value, in_column=None):
+        self._ensure_fresh()
+        search_val = str(value)
+        for r_idx, row in enumerate(self._data, start=1):
+            if in_column is not None:
+                if in_column <= len(row) and row[in_column - 1] == search_val:
+                    return CachedCell(r_idx, in_column, row[in_column - 1])
+            else:
+                for c_idx, cell_val in enumerate(row, start=1):
+                    if cell_val == search_val:
+                        return CachedCell(r_idx, c_idx, cell_val)
+        return None
+
+    # ── Write methods (pass through to API, then invalidate) ─────────────
+
+    def update_cell(self, row, col, value):
+        result = self._api_call('update_cell', row, col, value)
+        self._mark_all_stale()
+        return result
+
+    def update(self, values, *args, **kwargs):
+        result = self._api_call('update', values, *args, **kwargs)
+        self._mark_all_stale()
+        return result
+
+    def append_row(self, values, **kwargs):
+        result = self._api_call('append_row', values, **kwargs)
+        self._mark_all_stale()
+        return result
+
+    def delete_rows(self, start, end=None):
+        if end is not None:
+            result = self._api_call('delete_rows', start, end)
+        else:
+            result = self._api_call('delete_rows', start)
+        self._mark_all_stale()
+        return result
+
+    def update_acell(self, label, value):
+        result = self._api_call('update_acell', label, value)
+        self._mark_all_stale()
+        return result
+
+    # ── Proxy unknown attributes to underlying worksheet ─────────────────
 
     def __getattr__(self, name):
         attr = getattr(self._ws, name)
         if not callable(attr):
             return attr
-
+        # Wrap unknown callable methods with retry logic
         def wrapper(*args, **kwargs):
-            try:
-                return attr(*args, **kwargs)
-            except APIError as e:
-                if e.response.status_code != 429:
-                    raise
-                print(f"Rate limited on account, trying fallback for {name}...")
-                for sib in self._siblings:
-                    if sib is self._ws:
-                        continue
-                    try:
-                        return getattr(sib, name)(*args, **kwargs)
-                    except APIError as e2:
-                        if e2.response.status_code == 429:
-                            continue
-                        raise
-                # All accounts exhausted — wait and retry original
-                print("All accounts rate limited, waiting 10s...")
-                time.sleep(10)
-                return attr(*args, **kwargs)
-
+            return self._api_call(name, *args, **kwargs)
         return wrapper
 
+    def __setattr__(self, name, value):
+        if name.startswith('_'):
+            object.__setattr__(self, name, value)
+        else:
+            raise AttributeError(f"Cannot set attribute '{name}' on CachingWorksheet")
+
 def _wrap_ws(ws, sheet_index):
-    """Wrap a worksheet with rate-limit retry using sibling accounts."""
-    if sheet_index in _WS_POOL:
-        return RetryWorksheet(ws, _WS_POOL[sheet_index])
-    return ws
+    """Wrap a worksheet with caching and rate-limit retry using sibling accounts."""
+    siblings = _WS_POOL.get(sheet_index, [])
+    return CachingWorksheet(ws, siblings=siblings, registry_key=sheet_index)
 
 # Wrap all main spreadsheet worksheets with fallback retry
 bot1ws1  = _wrap_ws(bot1ws1, 0);  bot1ws2  = _wrap_ws(bot1ws2, 1);  bot1ws3  = _wrap_ws(bot1ws3, 2)
@@ -203,6 +387,27 @@ bot5ws4  = _wrap_ws(bot5ws4, 3);  bot5ws5  = _wrap_ws(bot5ws5, 4);  bot5ws6  = _
 bot5ws7  = _wrap_ws(bot5ws7, 6);  bot5ws8  = _wrap_ws(bot5ws8, 7);  bot5ws9  = _wrap_ws(bot5ws9, 8)
 bot5ws10 = _wrap_ws(bot5ws10, 9); bot5ws11 = _wrap_ws(bot5ws11, 10)
 print("rate-limit fallback wrapping complete")
+
+# Wrap secondary spreadsheet worksheets (no sibling pool — single account each)
+bot3ws12 = CachingWorksheet(bot3ws12, registry_key="bot3ws12")
+bot3ws13 = CachingWorksheet(bot3ws13, registry_key="bot3ws13")
+bot4ws12 = CachingWorksheet(bot4ws12, registry_key="bot4ws12")
+# bot4ws13 left unwrapped — DG sheet always does fresh reads
+bot4ws14 = CachingWorksheet(bot4ws14, registry_key="bot4ws14")
+print("secondary worksheets wrapped")
+
+# Pre-populate all caches at startup so the first command has zero latency.
+# Only load the formatted cache once per sheet index, then share across all
+# sibling instances (same data, different service accounts).
+print("warming worksheet caches...")
+for _rk, _instances in _CACHE_REGISTRY.items():
+    if _instances:
+        _instances[0]._ensure_fresh()
+        # Share the loaded data with sibling instances to avoid redundant API calls
+        for _sib in _instances[1:]:
+            object.__setattr__(_sib, '_data', _instances[0]._data)
+            object.__setattr__(_sib, '_stale', False)
+print("worksheet caches warmed")
 
 vkp_bosses = {}
 gkp_bosses = {}
@@ -275,36 +480,10 @@ guilds=[814048353603813376,1116453904922726544,1215443011400376391,9204116372975
 
 print("setup done")
 
-class SheetCache:
-    def __init__(self):
-        self._cache = {}
-
-    def get(self, key, ttl_seconds):
-        if key in self._cache:
-            value, timestamp = self._cache[key]
-            if time.time() - timestamp < ttl_seconds:
-                return value
-        return None
-
-    def set(self, key, value):
-        self._cache[key] = (value, time.time())
-
-    def invalidate(self, key):
-        self._cache.pop(key, None)
-
-    def invalidate_prefix(self, prefix):
-        for k in [k for k in self._cache if k.startswith(prefix)]:
-            del self._cache[k]
-
-sheet_cache = SheetCache()
-
-def cached_col_values(worksheet, col, cache_key, ttl=300):
-    cached = sheet_cache.get(cache_key, ttl)
-    if cached is not None:
-        return cached
-    result = worksheet.col_values(col)
-    sheet_cache.set(cache_key, result)
-    return result
+def cached_col_values(worksheet, col, cache_key=None, ttl=None):
+    """Thin wrapper — caching is now handled by CachingWorksheet.
+    cache_key and ttl kept for call-site compatibility but are unused."""
+    return worksheet.col_values(col)
 
 def toBool(string):
     string = string.capitalize()
@@ -1073,8 +1252,6 @@ async def addmem(ctx, name, rank, main, level, cclass):
         await ctx.send(name + " (" + str(level) + " " + cclass + ", " + maintext + ", " + rank + ") was added to the list")
         logbody = ["addmem", str(ctx.author.name), dt.now().strftime("%d/%m/%Y %H:%M:%S"), str([name, rank, main, level, cclass])]
         bot3ws11.append_row(logbody)
-        sheet_cache.invalidate("roster_names")
-        sheet_cache.invalidate("roster_classes")
     else:
         await ctx.send(name + " is already in the list!")
 
@@ -1100,7 +1277,6 @@ async def rosteradmin(ctx, subcommand, name, params):
                     bot5ws1.update_cell(i + 1, 2, params)
             logbody = ["roster", str(ctx.author.name), dt.now().strftime("%d/%m/%Y %H:%M:%S"), str([realname, subcommand, params])]
             bot3ws11.append_row(logbody)
-            sheet_cache.invalidate("roster_names")
         elif subcommand == "main":
             params = toBool(params)
             bot5ws1.update_cell(row_num, 3, params)
@@ -2565,10 +2741,20 @@ async def pointleaderboard(ctx, kp, maxkp = 99999, number = 10):
     sortedcombined = sorted(combined, key=lambda x: x[1], reverse=True)
     # remove the people who have more than maxkp
     sortedcombined = [x for x in sortedcombined if x[1] <= maxkp]
-    embed = discord.Embed(title = kp + " Leaderboard", colour=discord.Color.orange())
-    for i in range(min(number, len(sortedcombined))):
-        embed.add_field(name = str(i + 1) + ". " + sortedcombined[i][0], value = sortedcombined[i][1], inline = False)
-    await ctx.send(embed=embed)
+    total = min(number, len(sortedcombined))
+    pagecounter = 0
+    for i in range(total):
+        if i % 20 == 0:
+            if i != 0:
+                await ctx.send(embed=embed)
+            pagecounter += 1
+            title = kp + " Leaderboard"
+            if total > 20:
+                title += " Page " + str(pagecounter)
+            embed = discord.Embed(title=title, colour=discord.Color.orange())
+        embed.add_field(name=str(i + 1) + ". " + sortedcombined[i][0], value=sortedcombined[i][1], inline=False)
+    if total > 0:
+        await ctx.send(embed=embed)
 
 
 @client.command(guild_ids = guilds, aliases=['plb30', 'pointsleaderboardlast30', 'pointslb30', 'pointlb30'])
@@ -2593,10 +2779,20 @@ async def pointleaderboardlast30(ctx, kp, maxatt = 100, number = 10):
     sortedcombined = sorted(combined, key=lambda x: x[2], reverse=True)
     sortedcombined = [x for x in sortedcombined if x[2] <= maxatt]
     sortedcombined = [x for x in sortedcombined if x[1] > 0]
-    embed = discord.Embed(title = kp + " Leaderboard", colour=discord.Color.orange())
-    for i in range(min(number, len(sortedcombined))):
-        embed.add_field(name = str(i + 1) + ". " + sortedcombined[i][0], value = f"{sortedcombined[i][1]} ({sortedcombined[i][2]}%)", inline = False)
-    await ctx.send(embed=embed)
+    total = min(number, len(sortedcombined))
+    pagecounter = 0
+    for i in range(total):
+        if i % 20 == 0:
+            if i != 0:
+                await ctx.send(embed=embed)
+            pagecounter += 1
+            title = kp + " Leaderboard"
+            if total > 20:
+                title += " Page " + str(pagecounter)
+            embed = discord.Embed(title=title, colour=discord.Color.orange())
+        embed.add_field(name=str(i + 1) + ". " + sortedcombined[i][0], value=f"{sortedcombined[i][1]} ({sortedcombined[i][2]}%)", inline=False)
+    if total > 0:
+        await ctx.send(embed=embed)
 
 
 @client.command(guild_ids = guilds)
@@ -2679,7 +2875,6 @@ async def mainswap(ctx, oldname, newname):
     bot5ws7.update_acell(f'F{old_dpkp_row}', 0)
     bot5ws2.update_acell(f'F{old_vkp_row}', 0)
 
-    sheet_cache.invalidate("roster_names")
     await ctx.send(f"Swapped main from {findoldname} to {findnewname}. {findnewname} now has {oldrbppe} RBPP, {olddpkpe} DPKP, and {oldvkpe} VKP")
 
 @client.command(guild_ids = guilds)
@@ -2773,11 +2968,21 @@ async def classpointleaderboard(ctx, kp, classname, maxkp = 99999, number = 10):
     sortedcombined = sorted(combined, key=lambda x: x[1], reverse=True)
     sortedcombined = [x for x in sortedcombined if x[1] <= maxkp]
     sortedcombined = [x for x in sortedcombined if x[0] in classnamelist]
-    embed = discord.Embed(title = kp + " Leaderboard", colour=discord.Color.orange())
-    for i in range(min(number, len(sortedcombined))):
-        embed.add_field(name = str(i + 1) + ". " + sortedcombined[i][0], value = sortedcombined[i][1], inline = False)
-    await ctx.send(embed=embed)
-    
+    total = min(number, len(sortedcombined))
+    pagecounter = 0
+    for i in range(total):
+        if i % 20 == 0:
+            if i != 0:
+                await ctx.send(embed=embed)
+            pagecounter += 1
+            title = kp + " Leaderboard"
+            if total > 20:
+                title += " Page " + str(pagecounter)
+            embed = discord.Embed(title=title, colour=discord.Color.orange())
+        embed.add_field(name=str(i + 1) + ". " + sortedcombined[i][0], value=sortedcombined[i][1], inline=False)
+    if total > 0:
+        await ctx.send(embed=embed)
+
 
 @client.command(guild_ids = guilds, aliases=['elb', 'earnedpointsleaderboard', 'earnedpointslb', 'earnedpointlb'])
 async def earnedleaderboard(ctx, kp, number = 10):
@@ -2792,10 +2997,20 @@ async def earnedleaderboard(ctx, kp, number = 10):
     floatpointlist = list(map(float, pointlist))
     combined = list(zip(namelist, floatpointlist))
     sortedcombined = sorted(combined, key=lambda x: x[1], reverse=True)
-    embed = discord.Embed(title = kp + " Leaderboard", colour=discord.Color.orange())
-    for i in range(min(number, len(sortedcombined))):
-        embed.add_field(name = str(i + 1) + ". " + sortedcombined[i][0], value = sortedcombined[i][1], inline = False)
-    await ctx.send(embed=embed)
+    total = min(number, len(sortedcombined))
+    pagecounter = 0
+    for i in range(total):
+        if i % 20 == 0:
+            if i != 0:
+                await ctx.send(embed=embed)
+            pagecounter += 1
+            title = kp + " Leaderboard"
+            if total > 20:
+                title += " Page " + str(pagecounter)
+            embed = discord.Embed(title=title, colour=discord.Color.orange())
+        embed.add_field(name=str(i + 1) + ". " + sortedcombined[i][0], value=sortedcombined[i][1], inline=False)
+    if total > 0:
+        await ctx.send(embed=embed)
 
 @client.command(guild_ids = guilds, aliases=["generate"])
 async def gen(ctx):
@@ -2896,6 +3111,8 @@ async def dg(ctx):
     dglist = bot4ws13.col_values(1)
     mainlist = bot4ws13.col_values(2)
     set_number = bot4ws13.col_values(4)
+    helm = bot4ws13.col_values(10)
+    bt_helm = bot4ws13.col_values(11)
     next_item = bot4ws13.col_values(12)
     last_received = bot4ws13.col_values(13) # last received and last polls are dates, like Dec 20, 2025
     last_polls = bot4ws13.col_values(15)
@@ -2904,16 +3121,18 @@ async def dg(ctx):
     del dglist[0]
     del mainlist[0]
     del set_number[0]
+    del helm[0]
+    del bt_helm[0]
     del next_item[0]
     del last_received[0]
     del last_polls[0]
     print(f"[DG] Processing {len(dglist)} players")
 
-    # players are eligible if they have 15% rbpp and they are x or more polls since last item received, where x is the set number
-    # there are also rbpp requirements per piece. 
-    # set 1: gloves 100, top 200, boots 250, legs 350, no helms
-    # set 2: needs to have at least 750 rbpp
-    # set 3: needs to have at least 1500 rbpp
+    # Set 1: 15% RBPP attendance, poll CD >= 1, per-item RBPP (Gloves 100, Top 200, Boots 250, Legs 350)
+    # Set 2: 25% RBPP attendance, poll CD >= 2, total RBPP >= 500
+    # Set 3+: 25% RBPP attendance, poll CD >= 3, total RBPP >= 1000
+    #         BT Helm -> 3 pures (gloves+boots), No BT Helm -> 5 pures (gloves+legs)
+    #         Must finish previous toon's set before eligible for next
 
     def parse_date(raw_value):
         if raw_value is None:
@@ -3012,6 +3231,37 @@ async def dg(ctx):
     del rbpp_percentage_list[0]
     del rbpp_total_list[0]
     print(f"[DG] Loaded RBPP data for {len(rbpp_list)} players")
+
+    # Pre-build lookups per owner
+    owner_incomplete_sets = {}  # which set numbers are still incomplete
+    for i in range(len(dglist)):
+        owner = mainlist[i].lower()
+        try:
+            sn = int(set_number[i])
+        except (ValueError, TypeError):
+            continue
+        if next_item[i].lower() != "complete":
+            owner_incomplete_sets.setdefault(owner, set()).add(sn)
+
+    # Build owner -> {set_number: last_received} from the UNFILTERED Doch Tracker (bot4ws12)
+    # so completed sets are included in the fallback lookup
+    all_dg_owners = bot4ws12.col_values(2)
+    all_dg_set_numbers = bot4ws12.col_values(4)
+    all_dg_last_received = bot4ws12.col_values(13)
+    del all_dg_owners[0]
+    del all_dg_set_numbers[0]
+    del all_dg_last_received[0]
+    owner_set_last_received = {}
+    for i in range(len(all_dg_owners)):
+        owner = all_dg_owners[i].lower() if i < len(all_dg_owners) else ""
+        lr = all_dg_last_received[i] if i < len(all_dg_last_received) else ""
+        try:
+            sn = int(all_dg_set_numbers[i]) if i < len(all_dg_set_numbers) else 0
+        except (ValueError, TypeError):
+            continue
+        if owner and lr:
+            owner_set_last_received.setdefault(owner, {})[sn] = lr
+
     eligible_players = []
     for i in range(len(dglist)):
         rbpp_index = None
@@ -3020,49 +3270,93 @@ async def dg(ctx):
                 rbpp_index = j
                 break
         rbpp_percentage = float(rbpp_percentage_list[rbpp_index].strip('%')) if rbpp_index is not None else 0.0
-        print(f"[DG] Checking {dglist[i]}: RBPP%={rbpp_percentage}%, Set={set_number[i]}, NextItem={next_item[i]}")
-        if rbpp_percentage >= 15.0:
-            setnum = int(set_number[i])
-            polls_since_last = polls_since(last_received[i], last_polls)
-            rbpp = float(rbpp_total_list[rbpp_index]) if rbpp_index is not None else 0.0
-            print(f"[DG] {dglist[i]}: RBPP%>= 15%, Set={setnum}, PollsSince={polls_since_last}, RBPP={rbpp}")
-            if setnum == 1:
-                if polls_since_last >= 1:
-                    if next_item[i].lower() == "gloves" and rbpp >= 100:
-                        print(f"[DG] {dglist[i]}: ELIGIBLE - Set 1 Gloves")
-                        eligible_players.append((dglist[i], mainlist[i], next_item[i], last_received[i], rbpp_percentage))
-                    elif next_item[i].lower() == "chest" and rbpp >= 200:
-                        print(f"[DG] {dglist[i]}: ELIGIBLE - Set 1 Chest")
-                        eligible_players.append((dglist[i], mainlist[i], next_item[i], last_received[i], rbpp_percentage))
-                    elif next_item[i].lower() == "boots" and rbpp >= 250:
-                        print(f"[DG] {dglist[i]}: ELIGIBLE - Set 1 Boots")
-                        eligible_players.append((dglist[i], mainlist[i], next_item[i], last_received[i], rbpp_percentage))
-                    elif next_item[i].lower() == "pants" and rbpp >= 350:
-                        print(f"[DG] {dglist[i]}: ELIGIBLE - Set 1 Pants")
-                        eligible_players.append((dglist[i], mainlist[i], next_item[i], last_received[i], rbpp_percentage))
-                    else:
-                        print(f"[DG] {dglist[i]}: Not eligible - item/rbpp requirement not met")
+
+        setnum_raw = set_number[i]
+        try:
+            setnum = int(setnum_raw)
+        except (ValueError, TypeError):
+            print(f"[DG] {dglist[i]}: Skipping - invalid set number '{setnum_raw}'")
+            continue
+
+        print(f"[DG] Checking {dglist[i]}: RBPP%={rbpp_percentage}%, Set={setnum}, NextItem={next_item[i]}")
+
+        if next_item[i].lower() == "complete":
+            continue
+
+        # Set 1 requires 15% RBPP attendance, Set 2+ requires 25%
+        required_attendance = 15.0 if setnum == 1 else 25.0
+        if rbpp_percentage < required_attendance:
+            print(f"[DG] {dglist[i]}: Not eligible - RBPP%={rbpp_percentage} < {required_attendance}%")
+            continue
+
+        # Use the owner's previous set's last_received for polls_since and display (e.g. set 4 falls back to 3, then 2, then 1)
+        owner_key = mainlist[i].lower()
+        owner_sets = owner_set_last_received.get(owner_key, {})
+        prev_sets = sorted([s for s in owner_sets if s < setnum], reverse=True)
+        effective_last_received = owner_sets[prev_sets[0]] if prev_sets else last_received[i]
+        polls_since_last = polls_since(effective_last_received, last_polls)
+        display_last_received = effective_last_received
+        rbpp = float(rbpp_total_list[rbpp_index]) if rbpp_index is not None else 0.0
+        has_bt_helm = (bt_helm[i].strip().upper() == "BT" if i < len(bt_helm) else False) or \
+                      (helm[i].strip().upper() == "BT" if i < len(helm) else False)
+
+        print(f"[DG] {dglist[i]}: Attendance OK, Set={setnum}, PollsSince={polls_since_last}, RBPP={rbpp}, BT_Helm={has_bt_helm}")
+
+        if setnum == 1:
+            if polls_since_last >= 1:
+                item_lower = next_item[i].lower()
+                if item_lower == "gloves" and rbpp >= 100:
+                    print(f"[DG] {dglist[i]}: ELIGIBLE - Set 1 Gloves")
+                    eligible_players.append((dglist[i], mainlist[i], next_item[i], display_last_received, rbpp_percentage, setnum, None))
+                elif item_lower in ("chest", "top") and rbpp >= 200:
+                    print(f"[DG] {dglist[i]}: ELIGIBLE - Set 1 Top")
+                    eligible_players.append((dglist[i], mainlist[i], next_item[i], display_last_received, rbpp_percentage, setnum, None))
+                elif item_lower == "boots" and rbpp >= 250:
+                    print(f"[DG] {dglist[i]}: ELIGIBLE - Set 1 Boots")
+                    eligible_players.append((dglist[i], mainlist[i], next_item[i], display_last_received, rbpp_percentage, setnum, None))
+                elif item_lower in ("pants", "legs") and rbpp >= 350:
+                    print(f"[DG] {dglist[i]}: ELIGIBLE - Set 1 Legs")
+                    eligible_players.append((dglist[i], mainlist[i], next_item[i], display_last_received, rbpp_percentage, setnum, None))
                 else:
-                    print(f"[DG] {dglist[i]}: Not eligible - polls_since_last={polls_since_last} < 1")
-            elif setnum == 2:
-                if polls_since_last >= 2 and rbpp >= 750:
-                    print(f"[DG] {dglist[i]}: ELIGIBLE - Set 2")
-                    eligible_players.append((dglist[i], mainlist[i], next_item[i], last_received[i], rbpp_percentage))
+                    print(f"[DG] {dglist[i]}: Not eligible - item/rbpp requirement not met")
+            else:
+                print(f"[DG] {dglist[i]}: Not eligible - polls_since_last={polls_since_last} < 1")
+
+        elif setnum == 2:
+            if polls_since_last >= 2 and rbpp >= 500:
+                print(f"[DG] {dglist[i]}: ELIGIBLE - Set 2")
+                eligible_players.append((dglist[i], mainlist[i], next_item[i], display_last_received, rbpp_percentage, setnum, None))
+            else:
+                print(f"[DG] {dglist[i]}: Not eligible - polls={polls_since_last}<2 or rbpp={rbpp}<500")
+
+        elif setnum >= 3:
+            # Must finish farming previous toon's set before eligible for next
+            owner = mainlist[i].lower()
+            incomplete = owner_incomplete_sets.get(owner, set())
+            lower_incomplete = {s for s in incomplete if s < setnum}
+            if lower_incomplete:
+                print(f"[DG] {dglist[i]}: Not eligible - owner has incomplete lower sets: {lower_incomplete}")
+                continue
+
+            if polls_since_last >= 3 and rbpp >= 1000:
+                if has_bt_helm:
+                    alloc_note = "3 pures (gloves+boots) | Farm chest+legs from VoA"
                 else:
-                    print(f"[DG] {dglist[i]}: Not eligible - polls={polls_since_last}<2 or rbpp={rbpp}<750")
-            elif setnum == 3:
-                if polls_since_last >= 3 and rbpp >= 1500:
-                    print(f"[DG] {dglist[i]}: ELIGIBLE - Set 3")
-                    eligible_players.append((dglist[i], mainlist[i], next_item[i], last_received[i], rbpp_percentage))
-                else:
-                    print(f"[DG] {dglist[i]}: Not eligible - polls={polls_since_last}<3 or rbpp={rbpp}<1500")
-        else:
-            print(f"[DG] {dglist[i]}: Not eligible - RBPP%={rbpp_percentage} < 15%")
+                    alloc_note = "5 pures (gloves+legs) | Farm helm+chest+boots from VoA"
+                print(f"[DG] {dglist[i]}: ELIGIBLE - Set {setnum} ({alloc_note})")
+                eligible_players.append((dglist[i], mainlist[i], next_item[i], display_last_received, rbpp_percentage, setnum, alloc_note))
+            else:
+                print(f"[DG] {dglist[i]}: Not eligible - polls={polls_since_last}<3 or rbpp={rbpp}<1000")
 
     print(f"[DG] Found {len(eligible_players)} eligible players")
     embed = discord.Embed(title = "DG Armour Eligibility", colour=discord.Color.orange())
-    for i in range(len(eligible_players)):
-        embed.add_field(name = f"{eligible_players[i][0]} (Main: {eligible_players[i][1]})", value = f"Next Item: {eligible_players[i][2]}, Last Received: {eligible_players[i][3]}, RBPP%: {eligible_players[i][4]}", inline = False)
+    for toon, main, nxt_item, last_recv, pct, sn, alloc in eligible_players:
+        value_text = f"Next Item: {nxt_item}, Last Received: {last_recv}, RBPP%: {pct}"
+        if alloc:
+            value_text += f"\n{alloc}"
+        embed.add_field(name=f"{toon} (Main: {main}) [Set {sn}]", value=value_text, inline=False)
+    if not eligible_players:
+        embed.description = "No players currently eligible."
     await ctx.send(embed=embed)
     print("[DG] DG eligibility check complete")
 
@@ -3359,14 +3653,16 @@ DL weapons (crowns) need to be obtained by calling and rolling at snorri, or pur
 EDL Armor is available to Clansman upon reaching 205, request this with a clan General.
 Due to the changes in main priority raids and the introduction of mid-game priority raids, the requirement for EDL Offhand has been modified. To qualify, you must now have attended Unox raids with a minimum RBPP of 15%, along with participation in 4 Hrung, 4 Mord, and 4 Necro within the past 45 days.
 Doch upgrades, when the clan acquires 15 pures in bank, a poll will be created in the “Doch Voters” chat. This chat consists of all leaders, and all clannies who have full doch sets. It is the persons preference who they vote for while following the limited number of pures we have available, although most base their votes off attends (RBPP and AKP)
-once awarded a piece there is a 2 poll waiting period before your next upgrade eligibility. You must be in the clan for 90 days and have 25%+ RBPP in the past 90 days to be eligible to be placed on the Doch poll.
-You must meet the following RBPP milestones for your next upgrade piece to be eligible:
-Gloves ——-> 200 TOTAL RBPP
-Top————>400 TOTAL RBPP
-Boots———> 550 TOTAL RBPP
-Legs———-> 700 TOTAL RBPP
-Hat————>850 TOTAL RBPP                                     
-Exception to Doch voting, when leaders seem fit and all leaders agree, there is a possibility of a expedited use of pures to upgrade a certain toon(s) or to complete a set. Although this is rare, leaders may do this at a desperate time to benefit the clan. This action will count as a poll during a previously awarded persons 2 poll waiting period.
+First Toon (Set 1): 15% RBPP attendance required, 1 poll cooldown. Hat farmed from VoA or BT helm won.
+Gloves ——-> 100 TOTAL RBPP
+Top————>200 TOTAL RBPP
+Boots———> 250 TOTAL RBPP
+Legs———-> 350 TOTAL RBPP
+Second Toon (Set 2): 500 RBPP to start, 25% RBPP attendance in last 30 days, 2 poll cooldown. Hat farmed from VoA or BT helm won.
+Third+ Toons (Set 3+): 1000 RBPP to start, 25% RBPP attendance in last 30 days, 3 poll cooldown. Must finish previous toon's set first.
+BT Helm: 3 pures allocated (gloves+boots). Farm chest and legs from VoA.
+No BT Helm: 5 pures allocated (gloves+legs). Farm helm, chest, and boots from VoA.
+Exception to Doch voting, when leaders seem fit and all leaders agree, there is a possibility of a expedited use of pures to upgrade a certain toon(s) or to complete a set. Although this is rare, leaders may do this at a desperate time to benefit the clan. This action will count as a poll during a previously awarded persons poll waiting period.
 Echos and Seeds, weeklies are scheduled by leaders at a clannies request, reach out to any guardian to schedule a weekly to get 7 echos to upgrade your EDL OH to T8, reminder weeklies award GKP so help out your fellow clannies. Once you reach a T8 OH reach out to a General to receive 2 Bloodthorn seeds, to upgrade your offhand to T10.""")
 
 
@@ -3517,6 +3813,17 @@ async def source(ctx):
 async def donate(ctx):
     """posts the link for donations"""
     await ctx.send("https://www.paypal.me/liastarrrr")
+
+@client.command(guild_ids = guilds)
+@commands.has_any_role("General", "REDALiCE")
+async def reload(ctx):
+    """Force-refresh all worksheet caches (use after manual sheet edits)"""
+    count = 0
+    for key, instances in _CACHE_REGISTRY.items():
+        for cws in instances:
+            cws.refresh()
+            count += 1
+    await ctx.send(f"Marked {count} worksheet caches as stale. They will refresh on next access.")
 
 
 print("Starting bot")
