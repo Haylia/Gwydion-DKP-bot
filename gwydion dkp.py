@@ -391,8 +391,7 @@ print("rate-limit fallback wrapping complete")
 # Wrap secondary spreadsheet worksheets (no sibling pool — single account each)
 bot3ws12 = CachingWorksheet(bot3ws12, registry_key="bot3ws12")
 bot3ws13 = CachingWorksheet(bot3ws13, registry_key="bot3ws13")
-bot4ws12 = CachingWorksheet(bot4ws12, registry_key="bot4ws12")
-# bot4ws13 left unwrapped — DG sheet always does fresh reads
+# bot4ws12 and bot4ws13 left unwrapped — DG sheets always do fresh reads
 bot4ws14 = CachingWorksheet(bot4ws14, registry_key="bot4ws14")
 print("secondary worksheets wrapped")
 
@@ -3177,7 +3176,6 @@ async def dg(ctx):
                     return result
                 except ValueError:
                     continue
-        print(f"[DG] Failed to parse date: '{raw_value}'")
         return None
 
     def extract_poll_dates(raw_value):
@@ -3259,24 +3257,25 @@ async def dg(ctx):
         if next_item[i].lower() != "complete":
             owner_incomplete_sets.setdefault(owner, set()).add(sn)
 
-    # Build owner -> {set_number: last_received} from the UNFILTERED Doch Tracker (bot4ws12)
-    # so completed sets are included in the fallback lookup
+    # Build owner -> list of (parsed_date, raw_string) from UNFILTERED Doch Tracker (bot4ws12)
+    # Scan columns F-K (item award dates: Gloves/Chest/Boots/Pants/Helm/BtHelm) AND M (Last received)
+    # so we find the most recent award even if Last Received column wasn't updated.
     all_dg_owners = bot4ws12.col_values(2)
-    all_dg_set_numbers = bot4ws12.col_values(4)
-    all_dg_last_received = bot4ws12.col_values(13)
+    item_cols = [bot4ws12.col_values(c) for c in (6, 7, 8, 9, 10, 11, 13)]
     del all_dg_owners[0]
-    del all_dg_set_numbers[0]
-    del all_dg_last_received[0]
-    owner_set_last_received = {}
+    for c in item_cols:
+        del c[0]
+    owner_dates = {}  # owner_lower -> list of (parsed_date, raw_value)
     for i in range(len(all_dg_owners)):
-        owner = all_dg_owners[i].lower() if i < len(all_dg_owners) else ""
-        lr = all_dg_last_received[i] if i < len(all_dg_last_received) else ""
-        try:
-            sn = int(all_dg_set_numbers[i]) if i < len(all_dg_set_numbers) else 0
-        except (ValueError, TypeError):
+        owner = all_dg_owners[i].strip().lower()
+        if not owner:
             continue
-        if owner and lr:
-            owner_set_last_received.setdefault(owner, {})[sn] = lr
+        for col_list in item_cols:
+            if i < len(col_list):
+                v = col_list[i]
+                p = parse_date(v)
+                if p is not None and p.year >= 1900:
+                    owner_dates.setdefault(owner, []).append((p, v))
 
     eligible_players = []
     for i in range(len(dglist)):
@@ -3305,15 +3304,15 @@ async def dg(ctx):
             print(f"[DG] {dglist[i]}: Not eligible - RBPP%={rbpp_percentage} < {required_attendance}%")
             continue
 
-        # Use the most recent last_received across ALL of the owner's characters for polls_since and display
-        owner_key = mainlist[i].lower()
-        owner_sets = owner_set_last_received.get(owner_key, {})
-        candidates = list(owner_sets.values()) + [last_received[i]]
-        parsed_candidates = [(parse_date(v), v) for v in candidates]
-        # Filter out None and the Excel zero date (Dec 30, 1899)
-        valid_candidates = [(p, v) for p, v in parsed_candidates if p is not None and p.year >= 1900]
-        if valid_candidates:
-            best_parsed, best_raw = max(valid_candidates, key=lambda x: x[0])
+        # Use the most recent date across ALL of the owner's characters & item columns for polls_since and display
+        owner_key = mainlist[i].strip().lower()
+        candidates = list(owner_dates.get(owner_key, []))
+        # Include this character's own last_received as a fallback safety net
+        own_parsed = parse_date(last_received[i])
+        if own_parsed is not None and own_parsed.year >= 1900:
+            candidates.append((own_parsed, last_received[i]))
+        if candidates:
+            best_parsed, best_raw = max(candidates, key=lambda x: x[0])
             effective_last_received = best_raw
             display_last_received = best_raw
         else:
@@ -3373,6 +3372,17 @@ async def dg(ctx):
                 print(f"[DG] {dglist[i]}: Not eligible - polls={polls_since_last}<3 or rbpp={rbpp}<1000")
 
     print(f"[DG] Found {len(eligible_players)} eligible players")
+
+    # Sanity check: warn if the same character name appears more than once in the sheet
+    char_counts = {}
+    for name in dglist:
+        key = name.strip().lower()
+        if key:
+            char_counts[key] = char_counts.get(key, 0) + 1
+    duplicate_chars = [n for n, c in char_counts.items() if c > 1]
+    if duplicate_chars:
+        print(f"[DG] WARNING: Duplicate character names found in sheet: {duplicate_chars}")
+
     embed = discord.Embed(title = "DG Armour Eligibility", colour=discord.Color.orange())
     for toon, main, nxt_item, last_recv, pct, sn, alloc in eligible_players:
         value_text = f"Next Item: {nxt_item}, Last Received: {last_recv}, RBPP%: {pct}"
