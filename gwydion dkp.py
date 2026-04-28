@@ -1696,6 +1696,47 @@ def parse_deduct_args(args_str):
     return (None, None, None, None)
 
 
+def _loot_next_col(lootlist, costlist):
+    """Return the 1-based column to write the next (item, cost) pair into.
+
+    Ignores trailing blanks (so the gspread-rectangular padding on cached rows
+    doesn't push writes far to the right), and prefers the earliest column
+    where BOTH rows are blank — reusing gaps from prior mis-writes.
+    """
+    def _effective_len(lst):
+        n = len(lst)
+        while n > 0 and (lst[n - 1] is None or str(lst[n - 1]).strip() == ""):
+            n -= 1
+        return n
+
+    loot_n = _effective_len(lootlist)
+    cost_n = _effective_len(costlist)
+    scan_to = max(loot_n, cost_n)
+
+    for idx in range(1, scan_to):  # 0 = player name cell, skip it
+        item_cell = lootlist[idx] if idx < len(lootlist) else ""
+        cost_cell = costlist[idx] if idx < len(costlist) else ""
+        if (item_cell is None or str(item_cell).strip() == "") and \
+           (cost_cell is None or str(cost_cell).strip() == ""):
+            return idx + 1  # convert 0-based list index to 1-based column
+
+    return max(max(loot_n, cost_n) + 1, 2)
+
+
+def _write_loot(ws, lootrow, item, cost_str):
+    """Write a single (item, cost) pair to the player's loot/cost row pair.
+
+    Refreshes the cache first to avoid staleness, then targets two cells
+    directly rather than rewriting whole rows.
+    """
+    ws.refresh()
+    lootlist = ws.row_values(lootrow)
+    costlist = ws.row_values(lootrow + 1)
+    col = _loot_next_col(lootlist, costlist)
+    ws.update_cell(lootrow, col, item)
+    ws.update_cell(lootrow + 1, col, cost_str)
+
+
 def internal_deduct(args_str):
     name, item, number, kp = parse_deduct_args(args_str)
     
@@ -1718,14 +1759,7 @@ def internal_deduct(args_str):
             else:
                 bot3ws2.update_cell(row_num, 5, newspent)
                 lootcell = bot3ws9.find(realname, in_column=1)
-                lootrow = lootcell.row
-                costrow = lootcell.row + 1
-                lootlist = bot3ws9.row_values(lootrow)
-                costlist = bot3ws9.row_values(costrow)
-                lootlist.append(item)
-                costlist.append(str(number) + " VKP")
-                bot3ws9.update([lootlist], "A" + str(lootrow))
-                bot3ws9.update([costlist], "A" + str(costrow))
+                _write_loot(bot3ws9, lootcell.row, item, str(number) + " VKP")
                 logbody = ["deduct", "internal", dt.now().strftime("%d/%m/%Y %H:%M:%S"), str([realname, item, number, kp])]
                 bot3ws11.append_row(logbody)
                 return(realname + " has been deducted " + str(number) + " VKP for " + item)
@@ -1746,14 +1780,7 @@ def internal_deduct(args_str):
             else:
                 bot3ws3.update_cell(row_num, 5, newspent)
                 lootcell = bot3ws9.find(realname, in_column=1)
-                lootrow = lootcell.row
-                costrow = lootcell.row + 1
-                lootlist = bot3ws9.row_values(lootrow)
-                costlist = bot3ws9.row_values(costrow)
-                lootlist.append(item)
-                costlist.append(str(number) + " GKP")
-                bot3ws9.update([lootlist], "A" + str(lootrow))
-                bot3ws9.update([costlist], "A" + str(costrow))
+                _write_loot(bot3ws9, lootcell.row, item, str(number) + " GKP")
                 logbody = ["deduct", "internal", dt.now().strftime("%d/%m/%Y %H:%M:%S"), str([realname, item, number, kp])]
                 bot3ws11.append_row(logbody)
                 return(realname + " has been deducted " + str(number) + " GKP for " + item)
@@ -1773,14 +1800,7 @@ def internal_deduct(args_str):
             else:
                 bot3ws4.update_cell(row_num, 5, newspent)
                 lootcell = bot3ws9.find(realname, in_column=1)
-                lootrow = lootcell.row
-                costrow = lootcell.row + 1
-                lootlist = bot3ws9.row_values(lootrow)
-                costlist = bot3ws9.row_values(costrow)
-                lootlist.append(item)
-                costlist.append(str(number) + " PKP")
-                bot3ws9.update([lootlist], "A" + str(lootrow))
-                bot3ws9.update([costlist], "A" + str(costrow))
+                _write_loot(bot3ws9, lootcell.row, item, str(number) + " PKP")
                 logbody = ["deduct", "internal", dt.now().strftime("%d/%m/%Y %H:%M:%S"), str([realname, item, number, kp])]
                 bot3ws11.append_row(logbody)
                 return(realname + " has been deducted " + str(number) + " PKP for " + item)
@@ -1801,14 +1821,7 @@ def internal_deduct(args_str):
             else:
                 bot3ws5.update_cell(row_num, 5, newspent)
                 lootcell = bot3ws9.find(realname, in_column=1)
-                lootrow = lootcell.row
-                costrow = lootcell.row + 1
-                lootlist = bot3ws9.row_values(lootrow)
-                costlist = bot3ws9.row_values(costrow)
-                lootlist.append(item)
-                costlist.append(str(number) + " AKP")
-                bot3ws9.update([lootlist], "A" + str(lootrow))
-                bot3ws9.update([costlist], "A" + str(costrow))
+                _write_loot(bot3ws9, lootcell.row, item, str(number) + " AKP")
                 logbody = ["deduct", "internal", dt.now().strftime("%d/%m/%Y %H:%M:%S"), str([realname, item, number, kp])]
                 bot3ws11.append_row(logbody)
                 return(realname + " has been deducted " + str(number) + " AKP for " + item)
@@ -1829,14 +1842,7 @@ def internal_deduct(args_str):
             else:
                 bot3ws6.update_cell(row_num, 5, newspent)
                 lootcell = bot3ws9.find(realname, in_column=1)
-                lootrow = lootcell.row
-                costrow = lootcell.row + 1
-                lootlist = bot3ws9.row_values(lootrow)
-                costlist = bot3ws9.row_values(costrow)
-                lootlist.append(item)
-                costlist.append(str(number) + " RBPPUNOX")
-                bot3ws9.update([lootlist], "A" + str(lootrow))
-                bot3ws9.update([costlist], "A" + str(costrow))
+                _write_loot(bot3ws9, lootcell.row, item, str(number) + " RBPPUNOX")
                 logbody = ["deduct", "internal", dt.now().strftime("%d/%m/%Y %H:%M:%S"), str([realname, item, number, kp])]
                 bot3ws11.append_row(logbody)
                 return(realname + " has been deducted " + str(number) + " RBPPUNOX for " + item)
@@ -1857,14 +1863,7 @@ def internal_deduct(args_str):
             else:
                 bot3ws7.update_cell(row_num, 5, newspent)
                 lootcell = bot3ws9.find(realname, in_column=1)
-                lootrow = lootcell.row
-                costrow = lootcell.row + 1
-                lootlist = bot3ws9.row_values(lootrow)
-                costlist = bot3ws9.row_values(costrow)
-                lootlist.append(item)
-                costlist.append(str(number) + " DPKP")
-                bot3ws9.update([lootlist], "A" + str(lootrow))
-                bot3ws9.update([costlist], "A" + str(costrow))
+                _write_loot(bot3ws9, lootcell.row, item, str(number) + " DPKP")
                 logbody = ["deduct", "internal", dt.now().strftime("%d/%m/%Y %H:%M:%S"), str([realname, item, number, kp])]
                 bot3ws11.append_row(logbody)
                 return(realname + " has been deducted " + str(number) + " DPKP for " + item)
@@ -1895,14 +1894,7 @@ async def deduct(ctx, name, item, number, kp):
             else:
                 bot3ws2.update_cell(row_num, 5, newspent)
                 lootcell = bot3ws9.find(realname, in_column=1)
-                lootrow = lootcell.row
-                costrow = lootcell.row + 1
-                lootlist = bot3ws9.row_values(lootrow)
-                costlist = bot3ws9.row_values(costrow)
-                lootlist.append(item)
-                costlist.append(str(number) + " VKP")
-                bot3ws9.update([lootlist], "A" + str(lootrow))
-                bot3ws9.update([costlist], "A" + str(costrow))
+                _write_loot(bot3ws9, lootcell.row, item, str(number) + " VKP")
                 await ctx.send(realname + " has been deducted " + str(number) + " VKP for " + item)
                 logbody = ["deduct", str(ctx.author.name), dt.now().strftime("%d/%m/%Y %H:%M:%S"), str([realname, item, number, kp])]
                 bot3ws11.append_row(logbody)
@@ -1922,14 +1914,7 @@ async def deduct(ctx, name, item, number, kp):
             else:
                 bot3ws3.update_cell(row_num, 5, newspent)
                 lootcell = bot3ws9.find(realname, in_column=1)
-                lootrow = lootcell.row
-                costrow = lootcell.row + 1
-                lootlist = bot3ws9.row_values(lootrow)
-                costlist = bot3ws9.row_values(costrow)
-                lootlist.append(item)
-                costlist.append(str(number) + " GKP")
-                bot3ws9.update([lootlist], "A" + str(lootrow))
-                bot3ws9.update([costlist], "A" + str(costrow))
+                _write_loot(bot3ws9, lootcell.row, item, str(number) + " GKP")
                 await ctx.send(realname + " has been deducted " + str(number) + " GKP for " + item)
                 logbody = ["deduct", str(ctx.author.name), dt.now().strftime("%d/%m/%Y %H:%M:%S"), str([realname, item, number, kp])]
                 bot3ws11.append_row(logbody)
@@ -1949,14 +1934,7 @@ async def deduct(ctx, name, item, number, kp):
             else:
                 bot3ws4.update_cell(row_num, 5, newspent)
                 lootcell = bot3ws9.find(realname, in_column=1)
-                lootrow = lootcell.row
-                costrow = lootcell.row + 1
-                lootlist = bot3ws9.row_values(lootrow)
-                costlist = bot3ws9.row_values(costrow)
-                lootlist.append(item)
-                costlist.append(str(number) + " PKP")
-                bot3ws9.update([lootlist], "A" + str(lootrow))
-                bot3ws9.update([costlist], "A" + str(costrow))
+                _write_loot(bot3ws9, lootcell.row, item, str(number) + " PKP")
                 await ctx.send(realname + " has been deducted " + str(number) + " PKP for " + item)
                 logbody = ["deduct", str(ctx.author.name), dt.now().strftime("%d/%m/%Y %H:%M:%S"), str([realname, item, number, kp])]
                 bot3ws11.append_row(logbody)
@@ -1976,14 +1954,7 @@ async def deduct(ctx, name, item, number, kp):
             else:
                 bot3ws5.update_cell(row_num, 5, newspent)
                 lootcell = bot3ws9.find(realname, in_column=1)
-                lootrow = lootcell.row
-                costrow = lootcell.row + 1
-                lootlist = bot3ws9.row_values(lootrow)
-                costlist = bot3ws9.row_values(costrow)
-                lootlist.append(item)
-                costlist.append(str(number) + " AKP")
-                bot3ws9.update([lootlist], "A" + str(lootrow))
-                bot3ws9.update([costlist], "A" + str(costrow))
+                _write_loot(bot3ws9, lootcell.row, item, str(number) + " AKP")
                 await ctx.send(realname + " has been deducted " + str(number) + " AKP for " + item)
                 logbody = ["deduct", str(ctx.author.name), dt.now().strftime("%d/%m/%Y %H:%M:%S"), str([realname, item, number, kp])]
                 bot3ws11.append_row(logbody)
@@ -2003,14 +1974,7 @@ async def deduct(ctx, name, item, number, kp):
             else:
                 bot3ws6.update_cell(row_num, 5, newspent)
                 lootcell = bot3ws9.find(realname, in_column=1)
-                lootrow = lootcell.row
-                costrow = lootcell.row + 1
-                lootlist = bot3ws9.row_values(lootrow)
-                costlist = bot3ws9.row_values(costrow)
-                lootlist.append(item)
-                costlist.append(str(number) + " RBPPUNOX")
-                bot3ws9.update([lootlist], "A" + str(lootrow))
-                bot3ws9.update([costlist], "A" + str(costrow))
+                _write_loot(bot3ws9, lootcell.row, item, str(number) + " RBPPUNOX")
                 await ctx.send(realname + " has been deducted " + str(number) + " RBPPUNOX for " + item)
                 logbody = ["deduct", str(ctx.author.name), dt.now().strftime("%d/%m/%Y %H:%M:%S"), str([realname, item, number, kp])]
                 bot3ws11.append_row(logbody)
@@ -2030,14 +1994,7 @@ async def deduct(ctx, name, item, number, kp):
             else:
                 bot3ws7.update_cell(row_num, 5, newspent)
                 lootcell = bot3ws9.find(realname, in_column=1)
-                lootrow = lootcell.row
-                costrow = lootcell.row + 1
-                lootlist = bot3ws9.row_values(lootrow)
-                costlist = bot3ws9.row_values(costrow)
-                lootlist.append(item)
-                costlist.append(str(number) + " DPKP")
-                bot3ws9.update([lootlist], "A" + str(lootrow))
-                bot3ws9.update([costlist], "A" + str(costrow))
+                _write_loot(bot3ws9, lootcell.row, item, str(number) + " DPKP")
                 await ctx.send(realname + " has been deducted " + str(number) + " DPKP for " + item)
                 logbody = ["deduct", str(ctx.author.name), dt.now().strftime("%d/%m/%Y %H:%M:%S"), str([realname, item, number, kp])]
                 bot3ws11.append_row(logbody)
@@ -2125,17 +2082,26 @@ async def winnings(ctx, name, kp = None):
             costlist = bot4ws9.row_values(row_num + 1)
             lootlist.pop(0)
             costlist.pop(0)
+            width = max(len(lootlist), len(costlist))
+            pairs = []
+            for i in range(width):
+                item = lootlist[i] if i < len(lootlist) else ""
+                cost = costlist[i] if i < len(costlist) else ""
+                if str(item).strip() == "" and str(cost).strip() == "":
+                    continue
+                pairs.append((item if str(item).strip() else "(blank)",
+                              cost if str(cost).strip() else "(blank)"))
             pagecounter = 0
-            if len(lootlist) == 0:
+            if len(pairs) == 0:
                 await ctx.send(realname + " has no loot winnings")
             else:
-                for i in range(len(lootlist)):
+                for i, (item, cost) in enumerate(pairs):
                     if i % 20 == 0:
                         if i != 0:
                             await ctx.send(embed=embed)
                         pagecounter += 1
                         embed = discord.Embed(title = realname + "'s Winnings Page " + str(pagecounter), colour=discord.Color.orange())
-                    embed.add_field(name = str(i + 1) + ". " + lootlist[i], value = costlist[i], inline = False)
+                    embed.add_field(name = str(i + 1) + ". " + item, value = cost, inline = False)
                 await ctx.send(embed=embed)
         else:
             await ctx.send(not_found_message(name, suggestions))
@@ -2149,16 +2115,25 @@ async def winnings(ctx, name, kp = None):
             costlist = bot4ws9.row_values(row_num + 1)
             lootlist.pop(0)
             costlist.pop(0)
+            width = max(len(lootlist), len(costlist))
+            pairs = []
+            for i in range(width):
+                item = lootlist[i] if i < len(lootlist) else ""
+                cost = costlist[i] if i < len(costlist) else ""
+                if str(item).strip() == "" and str(cost).strip() == "":
+                    continue
+                pairs.append((item if str(item).strip() else "(blank)",
+                              cost if str(cost).strip() else "(blank)"))
             pagecounter = 0
             itemsadded = 0
-            for i in range(len(lootlist)):
-                if kp in costlist[i]:
+            for i, (item, cost) in enumerate(pairs):
+                if kp in cost:
                     if itemsadded % 20 == 0:
                         if itemsadded != 0:
                             await ctx.send(embed=embed)
                         pagecounter += 1
                         embed = discord.Embed(title = realname + "'s " + kp + " Winnings Page " + str(pagecounter), colour=discord.Color.orange())
-                    embed.add_field(name = str(i + 1) + ". " + lootlist[i], value = costlist[i], inline = False)
+                    embed.add_field(name = str(i + 1) + ". " + item, value = cost, inline = False)
                     itemsadded += 1
             if itemsadded == 0:
                 await ctx.send(realname + " has no loot winnings for " + kp)
@@ -2186,8 +2161,7 @@ async def refunditem(ctx, name, itemnum):
             itemprice = float(cost[0])
             itemkp = cost[1]
             newitemname = "[REFUNDED] " + itemname
-            lootlist[itemnum] = newitemname
-            bot3ws9.update([lootlist], "A" + str(row_num))
+            bot3ws9.update_cell(row_num, itemnum + 1, newitemname)
             if itemkp == "VKP":
                 kpcell = bot3ws2.find(realname, in_column=1)
                 kprow = kpcell.row
@@ -2271,8 +2245,50 @@ async def refundolditem(ctx, name, amount, kp):
         await ctx.send(not_found_message(name, suggestions))
 
 
+@client.command(guild_ids = guilds)
+@commands.has_any_role("General", "Guardian", "REDALiCE")
+async def compactloot(ctx, name):
+    """Repacks a player's loot row so items sit contiguously from column B."""
+    user_list = bot3ws9.col_values(1)
+    realname, caps, spaces, suggestions = find_name(name, user_list)
+    if realname is None:
+        await ctx.send(not_found_message(name, suggestions))
+        return
 
-    
+    cell = bot3ws9.find(realname, in_column=1)
+    row_num = cell.row
+    bot3ws9.refresh()
+    lootlist = bot3ws9.row_values(row_num)
+    costlist = bot3ws9.row_values(row_num + 1)
+
+    width = max(len(lootlist), len(costlist))
+
+    pairs = []
+    for i in range(1, width):  # skip col 0 (player name)
+        item_cell = lootlist[i] if i < len(lootlist) else ""
+        cost_cell = costlist[i] if i < len(costlist) else ""
+        item_blank = item_cell is None or str(item_cell).strip() == ""
+        cost_blank = cost_cell is None or str(cost_cell).strip() == ""
+        if item_blank and cost_blank:
+            continue
+        pairs.append((item_cell if not item_blank else "", cost_cell if not cost_blank else ""))
+
+    trailing_len = max(width - 1, len(pairs))
+    packed_items = [p[0] for p in pairs] + [""] * (trailing_len - len(pairs))
+    packed_costs = [p[1] for p in pairs] + [""] * (trailing_len - len(pairs))
+
+    if trailing_len == 0:
+        await ctx.send(realname + " has no loot entries to compact.")
+        return
+
+    bot3ws9.update([packed_items], "B" + str(row_num), value_input_option='USER_ENTERED')
+    bot3ws9.update([packed_costs], "B" + str(row_num + 1), value_input_option='USER_ENTERED')
+
+    logbody = ["compactloot", str(ctx.author.name), dt.now().strftime("%d/%m/%Y %H:%M:%S"), str([realname, len(pairs)])]
+    bot3ws11.append_row(logbody)
+
+    await ctx.send(f"Compacted {len(pairs)} item(s) for {realname}.")
+
 
 @client.command(guild_ids = guilds)
 @commands.has_any_role("General", "Guardian", "REDALiCE", "Helper")
@@ -3289,13 +3305,21 @@ async def dg(ctx):
             print(f"[DG] {dglist[i]}: Not eligible - RBPP%={rbpp_percentage} < {required_attendance}%")
             continue
 
-        # Use the owner's previous set's last_received for polls_since and display (e.g. set 4 falls back to 3, then 2, then 1)
+        # Use the most recent last_received across ALL of the owner's characters for polls_since and display
         owner_key = mainlist[i].lower()
         owner_sets = owner_set_last_received.get(owner_key, {})
-        prev_sets = sorted([s for s in owner_sets if s < setnum], reverse=True)
-        effective_last_received = owner_sets[prev_sets[0]] if prev_sets else last_received[i]
+        candidates = list(owner_sets.values()) + [last_received[i]]
+        parsed_candidates = [(parse_date(v), v) for v in candidates]
+        # Filter out None and the Excel zero date (Dec 30, 1899)
+        valid_candidates = [(p, v) for p, v in parsed_candidates if p is not None and p.year >= 1900]
+        if valid_candidates:
+            best_parsed, best_raw = max(valid_candidates, key=lambda x: x[0])
+            effective_last_received = best_raw
+            display_last_received = best_raw
+        else:
+            effective_last_received = last_received[i]
+            display_last_received = "N/A"
         polls_since_last = polls_since(effective_last_received, last_polls)
-        display_last_received = effective_last_received
         rbpp = float(rbpp_total_list[rbpp_index]) if rbpp_index is not None else 0.0
         has_bt_helm = (bt_helm[i].strip().upper() == "BT" if i < len(bt_helm) else False) or \
                       (helm[i].strip().upper() == "BT" if i < len(helm) else False)
