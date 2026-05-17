@@ -5,7 +5,7 @@ import os
 import glob
 import gspread
 import pandas as pd
-from datetime import datetime as dt
+from datetime import datetime as dt, timezone, timedelta, time as dtime
 import time
 import ast
 import pytesseract
@@ -701,8 +701,27 @@ async def bidloop():
 async def on_ready():
     print(f'{client.user} has connected to Discord!')
     bidloop.start()
+    # --- Boss Leaderboard auto-poller (UTC-anchored) ---
+    try:
+        had_state = os.path.exists(POSTED_FIGHTS_FILE)
+        initialize_posted_fights_if_needed()
+        if had_state:
+            try:
+                count = await boss_perform_auto_check()
+                if count:
+                    logger.info(f"Bot-start boss catch-up: posted {count} new fight(s)")
+            except Exception:
+                logger.exception("Bot-start boss catch-up failed")
+    except Exception:
+        logger.exception("Boss state init failed on bot start")
+    if not boss_poll_loop.is_running():
+        boss_poll_loop.start()
+        logger.info(
+            "Boss poll anchored to UTC: "
+            + ", ".join(t.strftime("%H:%M") for t in BOSS_POLL_ANCHOR_TIMES)
+        )
 
-    
+
 @client.event
 async def on_message(msg):
     if msg.author == client.user:
@@ -3858,6 +3877,1600 @@ async def reload(ctx):
             cws.refresh()
             count += 1
     await ctx.send(f"Marked {count} worksheet caches as stale. They will refresh on next access.")
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Boss Leaderboard (BossRanking.ashx integration, ported from larry_for_lia.py)
+# Auto-fetches Gwydion (World 15) fight data, generates damage-chart PNGs,
+# and posts new raids on a UTC-anchored schedule.
+# ════════════════════════════════════════════════════════════════════════════
+
+import json
+import textwrap
+from PIL import ImageDraw, ImageFont  # PIL.Image already imported above
+
+BOSS_WORLD_ID = 15
+BOSS_CHAR_ID = "123456"
+BOSS_RANKING_URL = "https://production.ch.decagames.com/gamestats_global/BossRanking.ashx"
+
+BOSS_NAMES = {
+    103028: "Proteus Prime",
+    141966: "Bloodthorn the Ravenous",
+    102982: "Gelebron",
+    103027: "Proteus Base",
+    142027: "Dhiothu",
+    73708: "Hrungnir",
+    73000: "Mordris",
+    100002: "Efnisien the Necromancer",
+    200490: "Crom's Hellborne Manikin",
+}
+
+BOSS_ALIASES = {
+    "prime": 103028, "protprime": 103028, "proteusprime": 103028,
+    "bt": 141966, "bloodthorn": 141966, "bloodthorntheravenous": 141966,
+    "gele": 102982, "gelebron": 102982,
+    "base": 103027, "protbase": 103027, "proteusbase": 103027,
+    "dino": 142027, "dhiothu": 142027,
+    "hrung": 73708, "hrungnir": 73708,
+    "mord": 73000, "mordris": 73000,
+    "necro": 100002, "efnisien": 100002, "necromancer": 100002,
+    "efnisienthenecromancer": 100002,
+    "crom": 200490, "hellborne": 200490, "manikin": 200490,
+    "cromhellborne": 200490, "cromshellborne": 200490,
+    "cromhellbornemanikin": 200490, "cromshellbornemanikin": 200490,
+}
+
+CONFIRMED_BOSS_IDS = set(BOSS_NAMES.keys())
+
+_BOSS_DIR = os.path.dirname(os.path.abspath(__file__))
+POSTED_FIGHTS_FILE = os.path.join(_BOSS_DIR, "posted_fights.json")
+RAID_HISTORY_FILE = os.path.join(_BOSS_DIR, "raid_history.json")
+
+# Discord channel ID for auto-posted raid charts.
+BOSS_AUTO_POST_CHANNEL_ID = 1232432110699282493
+
+# UTC-anchored fire times. Bot is hosted on non-local servers, so this
+# MUST be UTC (== GMT) — not local time.
+# Schedule: 00:30 / 04:30 / 08:30 / 12:30 / 16:30 / 20:30 UTC
+BOSS_POLL_ANCHOR_TIMES = [
+    dtime(0,  30, tzinfo=timezone.utc),
+    dtime(4,  30, tzinfo=timezone.utc),
+    dtime(8,  30, tzinfo=timezone.utc),
+    dtime(12, 30, tzinfo=timezone.utc),
+    dtime(16, 30, tzinfo=timezone.utc),
+    dtime(20, 30, tzinfo=timezone.utc),
+]
+
+# Date ranges to exclude from all fight queries, stats, and auto-posts.
+# Inclusive on both ends. Edit this list to change which days are dropped.
+BOSS_EXCLUDED_DATE_RANGES = [
+    ("2025-10-15", "2025-11-01"),
+    ("2026-02-09", "2026-02-12"),
+]
+
+# Candidate directories for the chscripts boss ranking traverser output.
+# The loader picks the first one that actually exists at query time, so the
+# same code works on the local dev box (absolute Windows path) and on the
+# remote host (where the folder sits next to the bot script). Add more paths
+# here if you deploy to other locations.
+BOSS_TRAVERSER_DATA_DIRS = (
+    os.path.join(_BOSS_DIR, "bossranking_data"),
+    r"D:\CH Projects\chscripts\bossranking_data",
+)
+BOSS_TRAVERSER_CACHE_TTL = 300  # seconds; the traverser is still running so re-scan periodically
+
+_BOSS_EXCLUDED_DATE_RANGES_PARSED = []
+for _start, _end in BOSS_EXCLUDED_DATE_RANGES:
+    try:
+        _BOSS_EXCLUDED_DATE_RANGES_PARSED.append((
+            dt.strptime(_start, "%Y-%m-%d").date(),
+            dt.strptime(_end, "%Y-%m-%d").date(),
+        ))
+    except Exception:
+        pass
+
+
+def _boss_parse_kill_date(date_text):
+    raw = str(date_text).strip()
+    if not raw:
+        return None
+    raw = raw.split("T")[0].split(" ")[0]
+    try:
+        return dt.strptime(raw, "%Y-%m-%d").date()
+    except Exception:
+        return None
+
+
+def _boss_is_excluded_date(date_text):
+    d = _boss_parse_kill_date(date_text)
+    if not d:
+        return False
+    return any(start <= d <= end for start, end in _BOSS_EXCLUDED_DATE_RANGES_PARSED)
+
+
+_BOSS_WINDOW_RE = re.compile(r"^(all|\d+[dwmy])$", re.IGNORECASE)
+
+
+def _boss_parse_window(token):
+    """Parses '7d', '4w', '6m', '1y', 'all'. Returns a timedelta or None (no filter).
+    Months are 30 days, years are 365 days (approximations)."""
+    if not token:
+        return None
+    t = token.lower()
+    if t == "all":
+        return None
+    m = _BOSS_WINDOW_RE.match(t)
+    if not m:
+        return None
+    n = int(t[:-1])
+    unit = t[-1]
+    if unit == "d":
+        return timedelta(days=n)
+    if unit == "w":
+        return timedelta(weeks=n)
+    if unit == "m":
+        return timedelta(days=n * 30)
+    if unit == "y":
+        return timedelta(days=n * 365)
+    return None
+
+
+def _boss_extract_window(args):
+    """Pulls a window token from the start or end of args. Returns (token, remainder)."""
+    parts = args.strip().split()
+    if not parts:
+        return None, ""
+    if _BOSS_WINDOW_RE.match(parts[0]):
+        return parts[0].lower(), " ".join(parts[1:])
+    if len(parts) > 1 and _BOSS_WINDOW_RE.match(parts[-1]):
+        return parts[-1].lower(), " ".join(parts[:-1])
+    return None, args.strip()
+
+
+def boss_normalize_name(name):
+    s = str(name).strip().lower()
+    return re.sub(r"[^a-z0-9]", "", s)
+
+
+def boss_display_name(boss_id):
+    try:
+        boss_id = int(boss_id)
+    except Exception:
+        boss_id = 0
+    return BOSS_NAMES.get(boss_id, f"BossId {boss_id}")
+
+
+def parse_boss_input(boss_text):
+    key = boss_normalize_name(boss_text)
+    if key in BOSS_ALIASES:
+        return BOSS_ALIASES[key]
+    try:
+        return int(boss_text)
+    except (ValueError, TypeError):
+        return None
+
+
+# ─── BossRanking API ──────────────────────────────────────────────────────
+
+def boss_get_fight_data(fight_id):
+    url = (
+        f"{BOSS_RANKING_URL}?board=fight"
+        f"&fightid={fight_id}"
+        f"&worldid={BOSS_WORLD_ID}"
+        f"&playerWorldId={BOSS_WORLD_ID}"
+        f"&charId={BOSS_CHAR_ID}"
+        "&sortCol=1&sortDir=0&page=1&numRecs=1"
+    )
+    resp = requests.get(url, timeout=25)
+    resp.raise_for_status()
+    return resp.json()
+
+
+def boss_get_detailed_fights(num_recs=500, page=1, exclude_dates=True):
+    """Fetches detailed fight list filtered to World 15. By default drops fights
+    whose DateOfKill falls inside any BOSS_EXCLUDED_DATE_RANGES entry.
+    Pass exclude_dates=False to bypass the filter (used when looking up a
+    specific FightId regardless of date)."""
+    url = (
+        f"{BOSS_RANKING_URL}?board=detailed"
+        f"&playerWorldId={BOSS_WORLD_ID}"
+        f"&charId={BOSS_CHAR_ID}"
+        f"&sortCol=1&sortDir=0&page={page}&numRecs={num_recs}"
+    )
+    resp = requests.get(url, timeout=25)
+    resp.raise_for_status()
+    data = resp.json()
+    fights = data.get("Data", []) if isinstance(data, dict) else data
+    fights = [f for f in fights if int(f.get("WorldId", 0)) == BOSS_WORLD_ID]
+    if exclude_dates:
+        fights = [f for f in fights if not _boss_is_excluded_date(f.get("DateOfKill", ""))]
+    return fights
+
+
+def boss_get_latest_fight_id():
+    fights = boss_get_detailed_fights(num_recs=500, page=1)
+    if not fights:
+        return None
+    newest = max(fights, key=lambda f: int(f.get("FightId", 0)))
+    return int(newest.get("FightId"))
+
+
+def boss_get_latest_boss_fight_id(boss_text):
+    boss_id = parse_boss_input(boss_text)
+    if not boss_id:
+        return None, None
+    fights = boss_get_detailed_fights(num_recs=500, page=1)
+    boss_fights = [f for f in fights if int(f.get("BossId", 0)) == boss_id]
+    if not boss_fights:
+        return boss_id, None
+    newest = max(boss_fights, key=lambda f: int(f.get("FightId", 0)))
+    return boss_id, int(newest.get("FightId"))
+
+
+# ─── State persistence ────────────────────────────────────────────────────
+
+def load_posted_fights():
+    if not os.path.exists(POSTED_FIGHTS_FILE):
+        return set()
+    try:
+        with open(POSTED_FIGHTS_FILE, "r", encoding="utf-8") as f:
+            return set(int(x) for x in json.load(f))
+    except Exception:
+        return set()
+
+
+def save_posted_fights(posted):
+    # Atomic write: tmp file + os.replace so a crash mid-write can't corrupt the
+    # canonical file. os.replace is atomic on the same filesystem on Windows/POSIX.
+    tmp = POSTED_FIGHTS_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(sorted(int(x) for x in posted), f, indent=2)
+    os.replace(tmp, POSTED_FIGHTS_FILE)
+
+
+def load_raid_history():
+    if not os.path.exists(RAID_HISTORY_FILE):
+        return {}
+    try:
+        with open(RAID_HISTORY_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def save_raid_history(history):
+    # Atomic write — see save_posted_fights for rationale. With ~20 players per
+    # fight × N fights this can be a multi-KB write, so corruption risk on crash
+    # is real if we wrote in place.
+    tmp = RAID_HISTORY_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(history, f, indent=2)
+    os.replace(tmp, RAID_HISTORY_FILE)
+
+
+# ─── Traverser data source (chscripts/bossranking_data) ───────────────────
+
+_boss_traverser_cache = {"loaded_at": 0.0, "file_count": -1, "history": {}}
+
+
+def _boss_traverser_paths():
+    """Returns (fights_dir, index_path) for the first BOSS_TRAVERSER_DATA_DIRS entry
+    that exists on disk, or (None, None) if none do. Re-checks on every call so a
+    folder appearing after bot start is picked up automatically."""
+    for root in BOSS_TRAVERSER_DATA_DIRS:
+        if root and os.path.isdir(root):
+            return os.path.join(root, "fights"), os.path.join(root, "fights_index.json")
+    return None, None
+
+
+def boss_load_traverser_history(force=False):
+    """Reads the chscripts traverser output (fights_index.json + per-fight JSONs)
+    and returns {fight_id_str: history_record} for Gwydion only. In-memory cached
+    for BOSS_TRAVERSER_CACHE_TTL seconds; invalidates immediately if the on-disk
+    file count changes. Returns {} if the traverser directory is missing."""
+    fights_dir, index_path = _boss_traverser_paths()
+    if not fights_dir or not os.path.isdir(fights_dir) or not os.path.exists(index_path):
+        return {}
+    try:
+        current_count = sum(
+            1 for f in os.listdir(fights_dir)
+            if f.startswith(f"fight_{BOSS_WORLD_ID}_") and f.endswith(".json")
+        )
+    except Exception:
+        current_count = -1
+    now = time.time()
+    stale = (now - _boss_traverser_cache["loaded_at"]) >= BOSS_TRAVERSER_CACHE_TTL
+    changed = current_count != _boss_traverser_cache["file_count"]
+    if not force and not stale and not changed and _boss_traverser_cache["history"]:
+        return _boss_traverser_cache["history"]
+    try:
+        with open(index_path, "r", encoding="utf-8") as f:
+            index = json.load(f)
+    except Exception:
+        logger.exception("Could not read traverser fights_index.json")
+        return _boss_traverser_cache["history"]
+    index_by_id = {}
+    for r in index:
+        try:
+            if int(r.get("WorldId", 0)) == BOSS_WORLD_ID:
+                index_by_id[int(r["FightId"])] = r
+        except Exception:
+            continue
+    history = {}
+    file_prefix = f"fight_{BOSS_WORLD_ID}_"
+    for filename in os.listdir(fights_dir):
+        if not filename.startswith(file_prefix) or not filename.endswith(".json"):
+            continue
+        try:
+            fight_id = int(filename[len(file_prefix):-len(".json")])
+        except ValueError:
+            continue
+        idx_row = index_by_id.get(fight_id)
+        if not idx_row:
+            continue
+        try:
+            bid = int(idx_row.get("BossId", 0))
+        except Exception:
+            continue
+        if bid not in CONFIRMED_BOSS_IDS:
+            continue
+        date = idx_row.get("DateOfKill", "")
+        if _boss_is_excluded_date(date):
+            continue
+        try:
+            with open(os.path.join(fights_dir, filename), "r", encoding="utf-8") as f:
+                detail = json.load(f)
+        except Exception:
+            continue
+        players = []
+        for p in detail.get("DetailsPerPlayer", []):
+            try:
+                level = int(p.get("Level", 0))
+            except Exception:
+                level = 0
+            try:
+                dmg = int(p.get("DamageDealt", 0))
+            except Exception:
+                dmg = 0
+            try:
+                rank = int(p.get("Rank", 0))
+            except Exception:
+                rank = 0
+            players.append({
+                "Name": str(p.get("Name", "")).strip(),
+                "ClassName": str(p.get("ClassName", "")).strip(),
+                "Clan": str(p.get("Clan", "")).strip(),
+                "DamageDealt": dmg,
+                "Level": level,
+                "Rank": rank,
+            })
+        try:
+            duration_sec = int(detail.get("FightDurationSeconds", 0))
+        except Exception:
+            duration_sec = 0
+        try:
+            total_dmg = int(detail.get("TotalDamageDone", idx_row.get("TotalDamage", 0)))
+        except Exception:
+            total_dmg = 0
+        history[str(fight_id)] = {
+            "FightId": fight_id,
+            "BossId": bid,
+            "BossName": boss_display_name(bid),
+            "DateOfKill": date,
+            "FightDuration": idx_row.get("FightDuration", ""),
+            "FightDurationSeconds": duration_sec,
+            "TotalDamageDone": total_dmg,
+            "BossHealth": int(detail.get("BossHealth", 0) or 0),
+            "BossRestoredHealth": int(detail.get("BossRestoredHealth", 0) or 0),
+            "Players": players,
+        }
+    _boss_traverser_cache["loaded_at"] = now
+    _boss_traverser_cache["file_count"] = current_count
+    _boss_traverser_cache["history"] = history
+    logger.info(
+        f"Loaded traverser Gwydion history: {len(history)} fights "
+        f"({current_count} files on disk)"
+    )
+    return history
+
+
+def get_saved_boss_id_for_fight(fight_id):
+    history = load_raid_history()
+    key = str(int(fight_id))
+    if key in history:
+        try:
+            bid = int(history[key].get("BossId", 0))
+            if bid in BOSS_NAMES:
+                return bid
+        except Exception:
+            pass
+    return 0
+
+
+def find_detailed_fight_record(fight_id, max_pages=20):
+    fight_id = int(fight_id)
+    for page in range(1, max_pages + 1):
+        try:
+            fights = boss_get_detailed_fights(num_recs=500, page=page, exclude_dates=False)
+        except Exception:
+            break
+        if not fights:
+            break
+        for f in fights:
+            try:
+                if int(f.get("FightId", 0)) == fight_id:
+                    return f
+            except Exception:
+                continue
+    return None
+
+
+def get_best_boss_id_for_fight(fight_id, fight_data=None):
+    saved = get_saved_boss_id_for_fight(fight_id)
+    if saved:
+        return saved
+    if fight_data:
+        try:
+            bid = int(fight_data.get("BossId", 0))
+            if bid in BOSS_NAMES:
+                return bid
+        except Exception:
+            pass
+    detailed = find_detailed_fight_record(fight_id, max_pages=20)
+    if detailed:
+        try:
+            bid = int(detailed.get("BossId", 0))
+            if bid in BOSS_NAMES:
+                return bid
+        except Exception:
+            pass
+    return 0
+
+
+def _boss_fight_to_history_record(fight_id, detailed_fight, fight_data):
+    boss_id = int(detailed_fight.get("BossId", fight_data.get("BossId", 0)))
+    if boss_id not in BOSS_NAMES:
+        saved = get_saved_boss_id_for_fight(fight_id)
+        if saved:
+            boss_id = saved
+    duration = int(fight_data.get("FightDurationSeconds", 0))
+    total_damage = int(fight_data.get("TotalDamageDone", detailed_fight.get("TotalDamage", 0)))
+    boss_hp = int(fight_data.get("BossHealth", 0))
+    boss_heal = int(fight_data.get("BossRestoredHealth", 0))
+    players = []
+    for p in fight_data.get("DetailsPerPlayer", []):
+        players.append({
+            "Name": str(p.get("Name", "")).strip(),
+            "ClassName": str(p.get("ClassName", "")).strip(),
+            "Clan": str(p.get("Clan", "")).strip(),
+            "DamageDealt": int(p.get("DamageDealt", 0)),
+            "Level": int(p.get("Level", 0)),
+            "Rank": int(p.get("Rank", 0)),
+        })
+    return {
+        "FightId": int(fight_id),
+        "BossId": boss_id,
+        "BossName": boss_display_name(boss_id),
+        "DateOfKill": str(detailed_fight.get("DateOfKill", "")),
+        "FightDuration": str(detailed_fight.get("FightDuration", "")),
+        "FightDurationSeconds": duration,
+        "TotalDamageDone": total_damage,
+        "BossHealth": boss_hp,
+        "BossRestoredHealth": boss_heal,
+        "Players": players,
+    }
+
+
+def add_fight_to_history(fight_id, detailed_fight=None, fight_data=None):
+    history = load_raid_history()
+    key = str(int(fight_id))
+    if key in history:
+        return False
+    if fight_data is None:
+        fight_data = boss_get_fight_data(fight_id)
+    if detailed_fight is None:
+        detailed_fight = find_detailed_fight_record(fight_id, max_pages=20) or {}
+    history[key] = _boss_fight_to_history_record(fight_id, detailed_fight, fight_data)
+    save_raid_history(history)
+    return True
+
+
+def initialize_posted_fights_if_needed():
+    if os.path.exists(POSTED_FIGHTS_FILE):
+        return
+    try:
+        fights = boss_get_detailed_fights(num_recs=100, page=1)
+    except Exception:
+        logger.exception("Could not seed posted fights from API; writing empty set")
+        save_posted_fights(set())
+        return
+    current = {
+        int(f.get("FightId", 0))
+        for f in fights
+        if int(f.get("BossId", 0)) in CONFIRMED_BOSS_IDS
+    }
+    save_posted_fights(current)
+    logger.info(f"Seeded posted_fights.json with {len(current)} existing fight(s)")
+
+
+# ─── Roster bridge: Winston schema -> Larry's Pilot/Toon shape ────────────
+
+def boss_get_pilot_toon_map():
+    """Returns [{Pilot, Toon Name, Class}, ...] from Winston's clan-reader sheet.
+    Mains (col C truthy): Pilot == Toon Name.
+    Alts: Pilot == col G (Main Character) if present, else fallback to Toon Name.
+    """
+    try:
+        names      = cached_col_values(bot4ws1, 1, "boss_roster_names",     ttl=120)
+        mains      = cached_col_values(bot4ws1, 3, "boss_roster_mains",     ttl=120)
+        classes    = cached_col_values(bot4ws1, 5, "boss_roster_classes",   ttl=120)
+        main_chars = cached_col_values(bot4ws1, 7, "boss_roster_mainchars", ttl=120)
+    except Exception:
+        logger.exception("Could not read roster columns for boss leaderboard")
+        return []
+    names      = names[1:]      if names      else []
+    mains      = mains[1:]      if mains      else []
+    classes    = classes[1:]    if classes    else []
+    main_chars = main_chars[1:] if main_chars else []
+    rows = []
+    for i, toon_name in enumerate(names):
+        if not toon_name or not str(toon_name).strip():
+            continue
+        toon_name = str(toon_name).strip()
+        is_main = str(mains[i] if i < len(mains) else "").strip().lower() in ("true", "1", "yes")
+        cls = str(classes[i] if i < len(classes) else "").strip()
+        if is_main:
+            pilot = toon_name
+        else:
+            cand = str(main_chars[i] if i < len(main_chars) else "").strip()
+            pilot = cand if cand else toon_name
+        rows.append({"Pilot": pilot, "Toon Name": toon_name, "Class": cls})
+    return rows
+
+
+def boss_get_roster_map():
+    return {boss_normalize_name(r["Toon Name"]): r for r in boss_get_pilot_toon_map()}
+
+
+def boss_get_roster_lookup_for_toon(roster_map, toon_name):
+    return roster_map.get(boss_normalize_name(toon_name))
+
+
+# ─── PIL chart renderer (cross-platform font fallbacks) ───────────────────
+
+def _boss_load_font(size, bold=False):
+    if bold:
+        candidates = [
+            "C:/Windows/Fonts/arialbd.ttf",
+            "C:/Windows/Fonts/segoeuib.ttf",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+            "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+            "/usr/share/fonts/TTF/DejaVuSans-Bold.ttf",
+            "/System/Library/Fonts/Supplemental/Arial Bold.ttf",
+            "/Library/Fonts/Arial Bold.ttf",
+            "arialbd.ttf",
+            "DejaVuSans-Bold.ttf",
+        ]
+    else:
+        candidates = [
+            "C:/Windows/Fonts/arial.ttf",
+            "C:/Windows/Fonts/segoeui.ttf",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+            "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+            "/usr/share/fonts/TTF/DejaVuSans.ttf",
+            "/System/Library/Fonts/Supplemental/Arial.ttf",
+            "/Library/Fonts/Arial.ttf",
+            "arial.ttf",
+            "DejaVuSans.ttf",
+        ]
+    for path in candidates:
+        try:
+            return ImageFont.truetype(path, size)
+        except Exception:
+            continue
+    return ImageFont.load_default()
+
+
+def _boss_trim_text(text, max_chars):
+    text = str(text)
+    if len(text) <= max_chars:
+        return text
+    return text[:max_chars - 3] + "..."
+
+
+def _boss_build_pilot_totals(players):
+    try:
+        roster_map = boss_get_roster_map()
+    except Exception:
+        roster_map = {}
+    pilot_totals = {}
+    missing_toons = []
+    for p in players:
+        toon_name = str(p.get("Name", "Unknown")).strip()
+        damage = int(p.get("DamageDealt", 0))
+        lookup = boss_get_roster_lookup_for_toon(roster_map, toon_name)
+        if lookup:
+            pilot = lookup["Pilot"]
+        else:
+            pilot = toon_name
+            missing_toons.append(toon_name)
+        if pilot not in pilot_totals:
+            pilot_totals[pilot] = {"Damage": 0, "Toons": []}
+        pilot_totals[pilot]["Damage"] += damage
+        if toon_name not in pilot_totals[pilot]["Toons"]:
+            pilot_totals[pilot]["Toons"].append(toon_name)
+    sorted_pilots = sorted(pilot_totals.items(), key=lambda item: item[1]["Damage"], reverse=True)
+    return sorted_pilots, sorted(set(missing_toons))
+
+
+def _boss_calc_pilot_row_heights(sorted_pilots):
+    heights = []
+    for _pilot_name, info in sorted_pilots:
+        toons = ", ".join(info["Toons"])
+        wrapped = textwrap.wrap(toons, width=42) or [""]
+        heights.append(44 + (len(wrapped) * 19))
+    return heights
+
+
+def create_boss_chart_image(fight_id, data, title):
+    duration = int(data.get("FightDurationSeconds", 0))
+    total_damage = int(data.get("TotalDamageDone", 0))
+    boss_hp = int(data.get("BossHealth", 0))
+    boss_heal = int(data.get("BossRestoredHealth", 0))
+    players = data.get("DetailsPerPlayer", [])
+    players = sorted(players, key=lambda x: int(x.get("Rank", 999)))
+    sorted_pilots, missing_toons = _boss_build_pilot_totals(players)
+
+    width = 1900
+    left_x, left_w = 25, 1160
+    right_x, right_w = 1225, 650
+    top = 30
+    row_h = 34
+    header_h = 145
+    pilot_row_heights = _boss_calc_pilot_row_heights(sorted_pilots)
+    left_table_h = row_h * (len(players) + 1)
+    right_table_h = row_h + sum(pilot_row_heights)
+    table_h = max(left_table_h, right_table_h, 8 * row_h)
+    height = header_h + table_h + 115
+
+    img = Image.new("RGB", (width, height), (10, 10, 10))
+    draw = ImageDraw.Draw(img)
+    font_title = _boss_load_font(36, bold=True)
+    font_sub = _boss_load_font(20)
+    font_header = _boss_load_font(18, bold=True)
+    font_row = _boss_load_font(17)
+    font_small = _boss_load_font(15)
+    font_tiny = _boss_load_font(14)
+
+    white = (245, 245, 245)
+    gray = (170, 170, 170)
+    dark_gray = (32, 32, 32)
+    header_bg = (45, 45, 45)
+    blue = (0, 105, 255)
+    line_color = (80, 80, 80)
+    orange_warning = (255, 190, 120)
+    toon_gray = (190, 190, 190)
+
+    draw.text((width // 2, top), title, fill=white, font=font_title, anchor="ma")
+    sub_y = top + 52
+    minutes = duration // 60
+    seconds = duration % 60
+    duration_text = f"{minutes}:{seconds:02d}"
+    draw.text((width // 2, sub_y),
+              f"Fight {fight_id}   |   Time: {duration_text}   |   Total Damage: {total_damage:,}",
+              fill=gray, font=font_sub, anchor="ma")
+    draw.text((width // 2, sub_y + 30),
+              f"Boss HP: {boss_hp:,}   |   Boss Heal/Restore: {boss_heal:,}",
+              fill=gray, font=font_small, anchor="ma")
+
+    table_y = header_h
+    draw.rectangle((left_x, table_y, left_x + left_w, table_y + row_h), fill=header_bg)
+    draw.text((left_x + 10, table_y + 8), "Rank", fill=white, font=font_header)
+    draw.text((left_x + 80, table_y + 8), "Player", fill=white, font=font_header)
+    draw.text((left_x + 300, table_y + 8), "Class", fill=white, font=font_header)
+    draw.text((left_x + 430, table_y + 8), "Damage", fill=white, font=font_header)
+    draw.text((left_x + 590, table_y + 8), "%", fill=white, font=font_header)
+    draw.text((left_x + 700, table_y + 8), "DPS", fill=white, font=font_header)
+    draw.text((left_x + 810, table_y + 8), "DPS Bar", fill=white, font=font_header)
+
+    draw.rectangle((right_x, table_y, right_x + right_w, table_y + row_h), fill=header_bg)
+    draw.text((right_x + 10, table_y + 8), "Pilot", fill=white, font=font_header)
+    draw.text((right_x + 315, table_y + 8), "Total Damage",
+              fill=white, font=font_header, anchor="ra")
+    draw.text((right_x + 430, table_y + 8), "%", fill=white, font=font_header, anchor="ra")
+
+    max_dps = 1
+    for p in players:
+        dmg = int(p.get("DamageDealt", 0))
+        dps = dmg / duration if duration else 0
+        max_dps = max(max_dps, dps)
+
+    for i, p in enumerate(players):
+        y = table_y + row_h * (i + 1)
+        if i % 2 == 0:
+            draw.rectangle((left_x, y, left_x + left_w, y + row_h), fill=(18, 18, 18))
+        rank = str(p.get("Rank", "?"))
+        name = _boss_trim_text(p.get("Name", "Unknown"), 20)
+        class_name = p.get("ClassName", "?")
+        dmg = int(p.get("DamageDealt", 0))
+        dps = dmg / duration if duration else 0
+        percent = dmg / total_damage * 100 if total_damage else 0
+        draw.text((left_x + 10, y + 8), rank, fill=white, font=font_row)
+        draw.text((left_x + 80, y + 8), name, fill=white, font=font_row)
+        draw.text((left_x + 300, y + 8), class_name, fill=white, font=font_row)
+        draw.text((left_x + 540, y + 8), f"{dmg:,}", fill=white, font=font_row, anchor="ra")
+        draw.text((left_x + 650, y + 8), f"{percent:.2f}%",
+                  fill=white, font=font_row, anchor="ra")
+        draw.text((left_x + 760, y + 8), f"{dps:.1f}",
+                  fill=white, font=font_row, anchor="ra")
+        bar_x = left_x + 810
+        bar_y = y + 8
+        bar_w_max = 315
+        bar_h = 18
+        bar_w = int((dps / max_dps) * bar_w_max) if max_dps else 0
+        draw.rectangle((bar_x, bar_y, bar_x + bar_w_max, bar_y + bar_h), fill=dark_gray)
+        draw.rectangle((bar_x, bar_y, bar_x + bar_w, bar_y + bar_h), fill=blue)
+        draw.text((bar_x + 8, bar_y + 1), f"{dps:.1f}", fill=white, font=font_small)
+
+    current_y = table_y + row_h
+    for i, (pilot_name, info) in enumerate(sorted_pilots):
+        row_height = pilot_row_heights[i]
+        if i % 2 == 0:
+            draw.rectangle((right_x, current_y, right_x + right_w, current_y + row_height),
+                           fill=(18, 18, 18))
+        dmg = info["Damage"]
+        percent = dmg / total_damage * 100 if total_damage else 0
+        toons = ", ".join(info["Toons"])
+        wrapped_toons = textwrap.wrap(toons, width=42) or [""]
+        draw.text((right_x + 10, current_y + 8),
+                  _boss_trim_text(pilot_name, 24), fill=white, font=font_row)
+        draw.text((right_x + 315, current_y + 8),
+                  f"{dmg:,}", fill=white, font=font_row, anchor="ra")
+        draw.text((right_x + 430, current_y + 8),
+                  f"{percent:.2f}%", fill=white, font=font_row, anchor="ra")
+        toon_y = current_y + 31
+        draw.text((right_x + 10, toon_y), "Toons:", fill=toon_gray, font=font_tiny)
+        for li, toon_line in enumerate(wrapped_toons):
+            draw.text((right_x + 70, toon_y + (li * 19)),
+                      toon_line, fill=toon_gray, font=font_tiny)
+        current_y += row_height
+
+    draw.rectangle((left_x, table_y, left_x + left_w, table_y + left_table_h),
+                   outline=line_color, width=2)
+    draw.rectangle((right_x, table_y, right_x + right_w, table_y + right_table_h),
+                   outline=line_color, width=2)
+
+    footer_y = height - 75
+    draw.text((25, footer_y), "Boss Leaderboard chart (via Winston)",
+              fill=gray, font=font_small)
+    if missing_toons:
+        missing_text = "Roster missing: " + ", ".join(missing_toons)
+        draw.text((25, footer_y + 28), _boss_trim_text(missing_text, 180),
+                  fill=orange_warning, font=font_small)
+
+    output_path = os.path.join(_BOSS_DIR, f"boss_damage_chart_{int(fight_id)}.png")
+    img.save(output_path)
+    return output_path
+
+
+# ─── Auto-poller ──────────────────────────────────────────────────────────
+
+async def boss_perform_auto_check():
+    """Fetches recent fights, posts any not in posted_fights.json, persists state.
+    Returns the count of fights posted this cycle."""
+    posted = load_posted_fights()
+    try:
+        fights = boss_get_detailed_fights(num_recs=100, page=1)
+    except Exception:
+        logger.exception("Boss auto-check API failed")
+        return 0
+    known = [f for f in fights if int(f.get("BossId", 0)) in CONFIRMED_BOSS_IDS]
+    new_fights = [f for f in known if int(f.get("FightId", 0)) not in posted]
+    if not new_fights:
+        return 0
+    new_fights = sorted(new_fights, key=lambda f: int(f.get("FightId", 0)))
+    if not BOSS_AUTO_POST_CHANNEL_ID:
+        logger.warning("BOSS_AUTO_POST_CHANNEL_ID is 0; configure it to enable auto-post")
+        return 0
+    channel = client.get_channel(BOSS_AUTO_POST_CHANNEL_ID)
+    if channel is None:
+        logger.warning(f"Boss auto-post channel {BOSS_AUTO_POST_CHANNEL_ID} not found")
+        return 0
+    posted_count = 0
+    for fight in new_fights:
+        fight_id = int(fight.get("FightId", 0))
+        try:
+            data = boss_get_fight_data(fight_id)
+            boss_id = get_best_boss_id_for_fight(fight_id, data)
+            title = f"{boss_display_name(boss_id)} - Damage Chart"
+            image_path = create_boss_chart_image(fight_id, data, title)
+            add_fight_to_history(fight_id, fight_data=data)
+            await channel.send(
+                f"New **{boss_display_name(boss_id)}** raid detected. Fight ID: **{fight_id}**"
+            )
+            await channel.send(file=discord.File(image_path))
+            try:
+                os.remove(image_path)
+            except Exception:
+                pass
+            posted.add(fight_id)
+            save_posted_fights(posted)
+            posted_count += 1
+            await asyncio.sleep(0.5)
+        except Exception:
+            logger.exception(f"Failed to post fight {fight_id}")
+    return posted_count
+
+
+@tasks.loop(time=BOSS_POLL_ANCHOR_TIMES)
+async def boss_poll_loop():
+    try:
+        count = await boss_perform_auto_check()
+        if count:
+            logger.info(f"Boss poll posted {count} new fight(s) at anchor tick")
+    except Exception:
+        logger.exception("Boss poll iteration failed")
+
+
+# ─── Commands ─────────────────────────────────────────────────────────────
+
+def _boss_collect_fights_for_listing():
+    """Merges traverser + local raid history + a single live API page (for fights
+    newer than what either source has). Returns a list of fight rows sorted by
+    FightId DESC. Each row has at least FightId, BossId, DateOfKill. Excluded
+    dates are filtered out."""
+    by_id = {}
+    for rec in boss_load_traverser_history().values():
+        try:
+            fid = int(rec.get("FightId", 0))
+        except Exception:
+            continue
+        if fid <= 0:
+            continue
+        by_id[fid] = {
+            "FightId": fid,
+            "BossId": int(rec.get("BossId", 0)),
+            "DateOfKill": rec.get("DateOfKill", ""),
+        }
+    for rec in load_raid_history().values():
+        try:
+            fid = int(rec.get("FightId", 0))
+        except Exception:
+            continue
+        if fid <= 0 or fid in by_id:
+            continue
+        if _boss_is_excluded_date(rec.get("DateOfKill", "")):
+            continue
+        by_id[fid] = {
+            "FightId": fid,
+            "BossId": int(rec.get("BossId", 0)),
+            "DateOfKill": rec.get("DateOfKill", ""),
+        }
+    # Best-effort: one live API page for ultra-recent fights not yet scraped.
+    try:
+        for f in boss_get_detailed_fights(num_recs=500, page=1):
+            try:
+                fid = int(f.get("FightId", 0))
+            except Exception:
+                continue
+            if fid <= 0 or fid in by_id:
+                continue
+            by_id[fid] = {
+                "FightId": fid,
+                "BossId": int(f.get("BossId", 0)),
+                "DateOfKill": f.get("DateOfKill", ""),
+            }
+    except Exception:
+        logger.exception("Live API fetch in $fights failed; serving cached sources only")
+    return sorted(by_id.values(), key=lambda r: r["FightId"], reverse=True)
+
+
+class FightsPaginator(discord.ui.View):
+    """Button-paginated embed view for the $fights command."""
+
+    def __init__(self, fights_list, per_page=20, timeout=300):
+        super().__init__(timeout=timeout)
+        self.fights = fights_list
+        self.per_page = per_page
+        self.page = 0
+        self.max_page = max(0, (len(fights_list) - 1) // per_page)
+        self.message = None
+        # Build buttons programmatically so callback signatures match across
+        # discord.py / py-cord variants.
+        self.btn_first = discord.ui.Button(label="⏮ First", style=discord.ButtonStyle.secondary)
+        self.btn_prev = discord.ui.Button(label="◀ Prev", style=discord.ButtonStyle.primary)
+        self.btn_indicator = discord.ui.Button(
+            label=self._indicator_label(), style=discord.ButtonStyle.secondary, disabled=True
+        )
+        self.btn_next = discord.ui.Button(label="Next ▶", style=discord.ButtonStyle.primary)
+        self.btn_last = discord.ui.Button(label="Last ⏭", style=discord.ButtonStyle.secondary)
+        self.btn_first.callback = self._go_first
+        self.btn_prev.callback = self._go_prev
+        self.btn_next.callback = self._go_next
+        self.btn_last.callback = self._go_last
+        for b in (self.btn_first, self.btn_prev, self.btn_indicator, self.btn_next, self.btn_last):
+            self.add_item(b)
+        self._refresh_button_states()
+
+    def _indicator_label(self):
+        return f"Page {self.page + 1} / {self.max_page + 1}"
+
+    def _refresh_button_states(self):
+        at_start = self.page <= 0
+        at_end = self.page >= self.max_page
+        self.btn_first.disabled = at_start
+        self.btn_prev.disabled = at_start
+        self.btn_next.disabled = at_end
+        self.btn_last.disabled = at_end
+        self.btn_indicator.label = self._indicator_label()
+
+    def render_embed(self):
+        start = self.page * self.per_page
+        end = start + self.per_page
+        page_rows = self.fights[start:end]
+        embed = discord.Embed(
+            title=f"Recent Gwydion Fights — Page {self.page + 1}/{self.max_page + 1}",
+            colour=discord.Color.orange(),
+        )
+        if not page_rows:
+            embed.description = "No fights to display."
+            return embed
+        for idx, fight in enumerate(page_rows, start=start + 1):
+            fid = fight.get("FightId", "?")
+            bid = int(fight.get("BossId", 0))
+            bname = BOSS_NAMES.get(bid, f"Unknown ({bid})")
+            date = fight.get("DateOfKill", "?")
+            embed.add_field(
+                name=f"{idx}. Fight {fid}",
+                value=f"{bname} — {date}",
+                inline=False,
+            )
+        embed.set_footer(
+            text=f"Total: {len(self.fights)} fights  •  use the buttons to navigate"
+        )
+        return embed
+
+    async def _update(self, interaction):
+        self._refresh_button_states()
+        await interaction.response.edit_message(embed=self.render_embed(), view=self)
+
+    async def _go_first(self, interaction):
+        self.page = 0
+        await self._update(interaction)
+
+    async def _go_prev(self, interaction):
+        if self.page > 0:
+            self.page -= 1
+        await self._update(interaction)
+
+    async def _go_next(self, interaction):
+        if self.page < self.max_page:
+            self.page += 1
+        await self._update(interaction)
+
+    async def _go_last(self, interaction):
+        self.page = self.max_page
+        await self._update(interaction)
+
+    async def on_timeout(self):
+        for child in self.children:
+            child.disabled = True
+        if self.message is not None:
+            try:
+                await self.message.edit(view=self)
+            except Exception:
+                pass
+
+
+@client.command(guild_ids=guilds, aliases=['fightlist', 'recentfights'])
+async def fights(ctx, per_page: int = 20):
+    """Lists Gwydion (World 15) fights with button pagination.
+    Optional arg: per-page size (default 20, max 25 — Discord embed field cap)."""
+    per_page = max(1, min(per_page, 25))
+    fights_list = _boss_collect_fights_for_listing()
+    if not fights_list:
+        await ctx.send("No Gwydion fights found in traverser, local history, or live API.")
+        return
+    view = FightsPaginator(fights_list, per_page=per_page, timeout=300)
+    msg = await ctx.send(embed=view.render_embed(), view=view)
+    view.message = msg
+
+
+@client.command(guild_ids=guilds, aliases=['damagechart'])
+async def sheet(ctx, *, target: str):
+    """Damage chart for a fight ID, or the latest fight of a named boss alias."""
+    try:
+        target_clean = target.strip()
+        if target_clean.isdigit():
+            fight_id = int(target_clean)
+            data = boss_get_fight_data(fight_id)
+            boss_id = get_best_boss_id_for_fight(fight_id, data)
+        else:
+            boss_id, fight_id = boss_get_latest_boss_fight_id(target_clean)
+            if not boss_id:
+                await ctx.send(f"Unknown boss `{target}`. Try `$bossaliases`.")
+                return
+            if not fight_id:
+                await ctx.send(
+                    f"No recent Gwydion fight found for {boss_display_name(boss_id)}."
+                )
+                return
+            data = boss_get_fight_data(fight_id)
+        title = f"{boss_display_name(boss_id)} - Damage Chart"
+        image_path = create_boss_chart_image(fight_id, data, title)
+        add_fight_to_history(fight_id, fight_data=data)
+        await ctx.send(
+            f"Damage chart for fight **{fight_id}**",
+            file=discord.File(image_path),
+        )
+        try:
+            os.remove(image_path)
+        except Exception:
+            pass
+    except Exception as e:
+        logger.exception("sheet command failed")
+        await ctx.send(f"Could not generate chart: {e}")
+
+
+@client.command(guild_ids=guilds)
+async def bossaliases(ctx):
+    """Lists the boss alias shortcuts usable with $sheet."""
+    lines = ["**Boss Aliases (for `$sheet <alias>`)**", "```"]
+    lines.append("prime  = Proteus Prime")
+    lines.append("bt     = Bloodthorn the Ravenous")
+    lines.append("gele   = Gelebron")
+    lines.append("base   = Proteus Base")
+    lines.append("dino   = Dhiothu")
+    lines.append("hrung  = Hrungnir")
+    lines.append("mord   = Mordris")
+    lines.append("necro  = Efnisien the Necromancer")
+    lines.append("crom   = Crom's Hellborne Manikin")
+    lines.append("```")
+    await ctx.send("\n".join(lines))
+
+
+@client.command(guild_ids=guilds)
+async def bosspollstatus(ctx):
+    """Shows auto-poller status and next scheduled fire (UTC)."""
+    posted = load_posted_fights()
+    history = load_raid_history()
+    now = dt.now(timezone.utc)
+    upcoming = []
+    for t in BOSS_POLL_ANCHOR_TIMES:
+        candidate = now.replace(hour=t.hour, minute=t.minute, second=0, microsecond=0)
+        if candidate <= now:
+            candidate = candidate + timedelta(days=1)
+        upcoming.append(candidate)
+    next_fire = min(upcoming) if upcoming else None
+    excluded = ", ".join(f"{s}→{e}" for s, e in BOSS_EXCLUDED_DATE_RANGES) or "none"
+    # Diagnose traverser availability with a specific reason if unreachable.
+    fights_dir, index_path = _boss_traverser_paths()
+    if not fights_dir:
+        tried = "\n  ".join(BOSS_TRAVERSER_DATA_DIRS) or "(none configured)"
+        traverser_status = f"NO DIR FOUND — tried:\n  {tried}"
+    elif not os.path.isdir(fights_dir):
+        traverser_status = f"UNREACHABLE — `{fights_dir}` is not a readable directory"
+    elif not os.path.exists(index_path):
+        traverser_status = (
+            f"INDEX MISSING — `{index_path}` not found "
+            f"(traverser may not have finished its first sweep)"
+        )
+    else:
+        traverser_history = boss_load_traverser_history()
+        traverser_count = _boss_traverser_cache.get("file_count", -1)
+        traverser_status = (
+            f"`{len(traverser_history)}` loaded "
+            f"(files on disk: `{traverser_count}`, path: `{fights_dir}`)"
+        )
+    lines = [
+        "**Boss Poll Status**",
+        f"Auto-post channel: `{BOSS_AUTO_POST_CHANNEL_ID}`",
+        f"Schedule (UTC): {', '.join(t.strftime('%H:%M') for t in BOSS_POLL_ANCHOR_TIMES)}",
+        f"Next fire (UTC): `{next_fire.strftime('%Y-%m-%d %H:%M') if next_fire else 'n/a'}`",
+        f"Loop running: `{boss_poll_loop.is_running()}`",
+        f"Posted fights tracked: `{len(posted)}`",
+        f"Raid history records (local): `{len(history)}`",
+        f"Traverser fights: {traverser_status}",
+        f"Excluded date ranges: {excluded}",
+    ]
+    await ctx.send("\n".join(lines))
+
+
+@client.command(guild_ids=guilds)
+@commands.has_any_role("General", "REDALiCE", "Helper")
+async def bossreloadtraverser(ctx):
+    """Admin: force-refresh the traverser history cache."""
+    try:
+        history = boss_load_traverser_history(force=True)
+        await ctx.send(
+            f"Reloaded traverser history: **{len(history)}** Gwydion fights "
+            f"({_boss_traverser_cache.get('file_count', -1)} files on disk)."
+        )
+    except Exception as e:
+        logger.exception("Manual traverser reload failed")
+        await ctx.send(f"Traverser reload failed: {e}")
+
+
+@client.command(guild_ids=guilds)
+@commands.has_any_role("General", "REDALiCE", "Helper")
+async def bossrescrape(ctx, scope: str = "2026"):
+    """Admin: re-fetch any Gwydion per-fight JSON whose DetailsPerPlayer is
+    suspiciously short vs the index's GroupScale (sign of an API truncation
+    at scrape time). Scope: a year string like '2026', '2025', or 'all'.
+    Default: 2026. Refetches with numRecs=2000 and overwrites the cached
+    file only if the new response has more players. Invalidates Winston's
+    traverser cache when done."""
+    fights_dir, index_path = _boss_traverser_paths()
+    if not fights_dir or not os.path.exists(index_path):
+        await ctx.send("Traverser data not reachable from this host. See `$bosspollstatus`.")
+        return
+    try:
+        with open(index_path, "r", encoding="utf-8") as f:
+            idx = json.load(f)
+    except Exception as e:
+        await ctx.send(f"Could not read traverser index: {e}")
+        return
+    year_prefix = "" if scope.lower() == "all" else scope.strip()
+    suspects = []
+    for r in idx:
+        try:
+            if int(r.get("WorldId", 0)) != BOSS_WORLD_ID:
+                continue
+            if year_prefix and not str(r.get("DateOfKill", "")).startswith(year_prefix):
+                continue
+            fid = int(r["FightId"])
+        except Exception:
+            continue
+        fp = os.path.join(fights_dir, f"fight_{BOSS_WORLD_ID}_{fid}.json")
+        if not os.path.exists(fp):
+            continue
+        try:
+            with open(fp, "r", encoding="utf-8") as f:
+                d = json.load(f)
+        except Exception:
+            continue
+        n = len(d.get("DetailsPerPlayer", []))
+        try:
+            gs = int(r.get("GroupScale", 0))
+        except Exception:
+            gs = 0
+        if n < gs * 0.6 and n < 6:
+            suspects.append((fid, fp, n, gs))
+    if not suspects:
+        await ctx.send(f"No truncated fights to repair in scope `{scope}`.")
+        return
+    await ctx.send(
+        f"Found **{len(suspects)}** truncated Gwydion fight(s) in scope `{scope}`. "
+        f"Refetching with `numRecs=2000`... (this will take ~{len(suspects) * 0.4:.0f}s)"
+    )
+    fixed = 0
+    unchanged = 0
+    errors = 0
+    for fid, fp, old_n, gs in suspects:
+        url = (
+            f"{BOSS_RANKING_URL}?board=fight&fightid={fid}"
+            f"&worldid={BOSS_WORLD_ID}&playerWorldId=0&charId=0"
+            f"&sortCol=1&sortDir=0&page=1&numRecs=2000"
+        )
+        try:
+            resp = requests.get(url, timeout=30)
+            resp.raise_for_status()
+            d = resp.json()
+        except Exception:
+            errors += 1
+            continue
+        new_n = len(d.get("DetailsPerPlayer", []))
+        if new_n > old_n:
+            tmp = fp + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(d, f, indent=2)
+            os.replace(tmp, fp)
+            fixed += 1
+        else:
+            unchanged += 1
+        await asyncio.sleep(0.15)
+    # Invalidate traverser cache so next $statcard / $fights sees fresh data
+    _boss_traverser_cache["loaded_at"] = 0.0
+    _boss_traverser_cache["file_count"] = -1
+    await ctx.send(
+        f"Re-scrape complete (scope `{scope}`).\n"
+        f"Repaired: **{fixed}**, unchanged: **{unchanged}**, errors: **{errors}**.\n"
+        f"Winston's traverser cache has been invalidated — next `$statcard`/`$fights` "
+        f"will see the new data."
+    )
+
+
+@client.command(guild_ids=guilds)
+@commands.has_any_role("General", "REDALiCE", "Helper")
+async def bosspollnow(ctx):
+    """Admin: force an immediate boss auto-check cycle."""
+    await ctx.send("Running boss auto-check now...")
+    try:
+        count = await boss_perform_auto_check()
+        await ctx.send(f"Auto-check complete. Posted **{count}** new fight(s).")
+    except Exception as e:
+        logger.exception("Manual boss auto-check failed")
+        await ctx.send(f"Auto-check failed: {e}")
+
+
+# ─── Player stat card ─────────────────────────────────────────────────────
+
+def _boss_resolve_pilot_identity(query):
+    """Returns (display_name, toon_keys_set, mode_text) for the player query.
+    Toon-first: if the query matches a toon name, returns just that one character.
+    Only falls back to pilot mode if no toon matches at all (covers nicknames that
+    aren't on any toon). Returns (None, None, error_message) if neither matches."""
+    roster_rows = boss_get_pilot_toon_map()
+    if not roster_rows:
+        return None, None, "Roster unreadable."
+    all_toons = [r["Toon Name"] for r in roster_rows]
+    toon_realname, _c, _s, toon_suggestions = find_name(query, all_toons)
+    if toon_realname:
+        return toon_realname, {boss_normalize_name(toon_realname)}, "Toon only"
+    pilots = sorted({r["Pilot"] for r in roster_rows})
+    pilot_realname, _caps, _spaces, pilot_suggestions = find_name(query, pilots)
+    if pilot_realname:
+        toon_keys = {
+            boss_normalize_name(r["Toon Name"])
+            for r in roster_rows
+            if r["Pilot"] == pilot_realname
+        }
+        return pilot_realname, toon_keys, "Pilot total"
+    suggestions = toon_suggestions or pilot_suggestions or []
+    return None, None, not_found_message(query, suggestions)
+
+
+def _boss_extract_statcard_args(args):
+    """Parses '$statcard' arguments — window, boss alias, and player name can
+    appear in any order. Returns (window_token, boss_id, player_name).
+    A token that's a boss alias is only treated as a boss if it doesn't also
+    match a roster name (so a player named Crom still routes correctly)."""
+    parts = args.strip().split()
+    if not parts:
+        return None, None, ""
+    try:
+        roster_rows = boss_get_pilot_toon_map()
+        roster_keys = {boss_normalize_name(r["Toon Name"]) for r in roster_rows}
+        roster_keys |= {boss_normalize_name(r["Pilot"]) for r in roster_rows}
+    except Exception:
+        roster_keys = set()
+    window_token = None
+    boss_id = None
+    remaining = []
+    for token in parts:
+        lower = token.lower()
+        if window_token is None and _BOSS_WINDOW_RE.match(lower):
+            window_token = lower
+            continue
+        if boss_id is None:
+            key = boss_normalize_name(token)
+            if key in BOSS_ALIASES and key not in roster_keys:
+                boss_id = BOSS_ALIASES[key]
+                continue
+        remaining.append(token)
+    return window_token, boss_id, " ".join(remaining)
+
+
+def _boss_collect_player_prs(toon_keys, cutoff_date=None, boss_id_filter=None):
+    """Scans the traverser output (canonical) + raid_history.json (auto-poll cache)
+    and returns {boss_id: {best_damage, best_dps, fights_counted}} for the given set
+    of normalized toon name keys. Excluded dates are skipped. Traverser records win
+    on collision. cutoff_date (date) restricts to fights on/after that date.
+    boss_id_filter (int) restricts to a single boss."""
+    merged = dict(load_raid_history())
+    merged.update(boss_load_traverser_history())
+    per_boss = {}
+    for rec in merged.values():
+        if _boss_is_excluded_date(rec.get("DateOfKill", "")):
+            continue
+        if cutoff_date is not None:
+            kd = _boss_parse_kill_date(rec.get("DateOfKill", ""))
+            if not kd or kd < cutoff_date:
+                continue
+        bid = int(rec.get("BossId", 0))
+        if bid not in CONFIRMED_BOSS_IDS:
+            continue
+        if boss_id_filter is not None and bid != boss_id_filter:
+            continue
+        duration = int(rec.get("FightDurationSeconds", 0))
+        damage = 0
+        used_toons = []
+        for p in rec.get("Players", []):
+            tk = boss_normalize_name(p.get("Name", ""))
+            if tk in toon_keys:
+                damage += int(p.get("DamageDealt", 0))
+                used_toons.append(str(p.get("Name", "")).strip())
+        if damage <= 0:
+            continue
+        dps = damage / duration if duration else 0
+        fid = int(rec.get("FightId", 0))
+        entry = {
+            "FightId": fid,
+            "Damage": damage,
+            "DPS": dps,
+            "Toons": used_toons,
+            "Date": rec.get("DateOfKill", ""),
+        }
+        if bid not in per_boss:
+            per_boss[bid] = {"best_damage": entry, "best_dps": entry, "fights_counted": 1}
+        else:
+            per_boss[bid]["fights_counted"] += 1
+            if damage > per_boss[bid]["best_damage"]["Damage"]:
+                per_boss[bid]["best_damage"] = entry
+            if dps > per_boss[bid]["best_dps"]["DPS"]:
+                per_boss[bid]["best_dps"] = entry
+    return per_boss
+
+
+def create_boss_stat_card_image(display_name, mode_text, per_boss, history_count, window_label="all time", boss_label=None):
+    """Renders a stat card PNG showing best damage / best DPS per boss for one pilot."""
+    width = 1200
+    pad = 30
+    boss_list = sorted(per_boss.keys(), key=lambda b: boss_display_name(b))
+    header_h = 130
+    table_header_h = 40
+    row_h = 95
+    footer_h = 60
+    height = header_h + table_header_h + (len(boss_list) * row_h) + footer_h + pad
+
+    img = Image.new("RGB", (width, height), (10, 10, 10))
+    draw = ImageDraw.Draw(img)
+
+    font_title = _boss_load_font(36, bold=True)
+    font_sub = _boss_load_font(20)
+    font_bossname = _boss_load_font(22, bold=True)
+    font_label = _boss_load_font(14, bold=True)
+    font_value = _boss_load_font(22, bold=True)
+    font_small = _boss_load_font(14)
+    font_meta = _boss_load_font(13)
+
+    white = (245, 245, 245)
+    gray = (170, 170, 170)
+    dim = (130, 130, 130)
+    accent = (255, 165, 0)
+    blue = (100, 180, 255)
+    header_bg = (35, 35, 35)
+    row_bg_alt = (20, 20, 20)
+    line_color = (60, 60, 60)
+
+    # Title + subtitle
+    draw.text((width // 2, pad), display_name, fill=white, font=font_title, anchor="ma")
+    subtitle = f"Boss PR Card  •  Mode: {mode_text}  •  Window: {window_label}"
+    if boss_label:
+        subtitle += f"  •  Boss: {boss_label}"
+    draw.text(
+        (width // 2, pad + 50),
+        subtitle,
+        fill=gray, font=font_sub, anchor="ma",
+    )
+
+    # Column geometry
+    col_boss_x = pad
+    col_dmg_x = 380
+    col_dps_x = 790
+    table_y = header_h
+
+    # Header strip
+    draw.rectangle((pad, table_y, width - pad, table_y + table_header_h), fill=header_bg)
+    draw.text((col_boss_x + 8, table_y + 12), "BOSS", fill=white, font=font_label)
+    draw.text((col_dmg_x + 8, table_y + 12), "BEST DAMAGE", fill=accent, font=font_label)
+    draw.text((col_dps_x + 8, table_y + 12), "BEST DPS", fill=blue, font=font_label)
+
+    # Rows
+    y = table_y + table_header_h
+    for i, bid in enumerate(boss_list):
+        info = per_boss[bid]
+        bd = info["best_damage"]
+        bp = info["best_dps"]
+        same_fight = bd["FightId"] == bp["FightId"]
+
+        if i % 2 == 0:
+            draw.rectangle((pad, y, width - pad, y + row_h), fill=row_bg_alt)
+
+        draw.text((col_boss_x + 8, y + 12), boss_display_name(bid),
+                  fill=white, font=font_bossname)
+        fights_counted = info.get("fights_counted", 0)
+        toon_summary = ", ".join(sorted(set(bd["Toons"] + bp["Toons"])))[:60]
+        draw.text((col_boss_x + 8, y + 44),
+                  f"{fights_counted} fight(s) in window",
+                  fill=dim, font=font_meta)
+        draw.text((col_boss_x + 8, y + 62), "Toons: " + (toon_summary or "—"),
+                  fill=dim, font=font_meta)
+
+        # Best Damage cell
+        draw.text((col_dmg_x + 8, y + 8), f"{bd['Damage']:,}",
+                  fill=accent, font=font_value)
+        draw.text((col_dmg_x + 8, y + 40), f"@ {bd['DPS']:,.1f} DPS",
+                  fill=white, font=font_small)
+        draw.text((col_dmg_x + 8, y + 60), f"Fight {bd['FightId']}  •  {bd['Date']}",
+                  fill=dim, font=font_meta)
+
+        # Best DPS cell
+        draw.text((col_dps_x + 8, y + 8), f"{bp['DPS']:,.1f}",
+                  fill=blue, font=font_value)
+        draw.text((col_dps_x + 8, y + 40), f"on {bp['Damage']:,} dmg",
+                  fill=white, font=font_small)
+        if same_fight:
+            draw.text((col_dps_x + 8, y + 60), "(same fight as best dmg)",
+                      fill=dim, font=font_meta)
+        else:
+            draw.text((col_dps_x + 8, y + 60), f"Fight {bp['FightId']}  •  {bp['Date']}",
+                      fill=dim, font=font_meta)
+
+        y += row_h
+
+    # Table border
+    draw.rectangle(
+        (pad, table_y, width - pad, table_y + table_header_h + len(boss_list) * row_h),
+        outline=line_color, width=2,
+    )
+
+    footer_y = height - footer_h + 10
+    draw.text(
+        (pad, footer_y),
+        f"Source: traverser + local raid history "
+        f"({history_count} fight(s) total, excluded dates skipped).",
+        fill=gray, font=font_small,
+    )
+
+    safe_name = boss_normalize_name(display_name) or "player"
+    output_path = os.path.join(_BOSS_DIR, f"boss_statcard_{safe_name}.png")
+    img.save(output_path)
+    return output_path
+
+
+@client.command(guild_ids=guilds, aliases=['playerstats', 'statcards', 'pr'])
+async def statcard(ctx, *, args: str):
+    """Player stat card: best damage and best DPS per boss from historical data.
+
+    Usage:
+      $statcard <player>                     — all time, all bosses
+      $statcard <player> 30d                 — last 30 days
+      $statcard <player> dhiothu             — Dhiothu only, all time
+      $statcard <player> dhiothu 30d         — Dhiothu, last 30 days
+      $statcard 30d redalice dhiothu         — any order works
+
+    Window tokens: Nd, Nw, Nm, Ny, or 'all'. Months=30d, years=365d (approx).
+    Boss tokens: any alias from `$bossaliases` (bt, gele, dino, etc.).
+    Player is matched as a single character first; falls back to pilot (all alts)
+    only if the name isn't a known toon."""
+    try:
+        window_token, boss_id, player_name = _boss_extract_statcard_args(args)
+        if not player_name:
+            await ctx.send(
+                "Usage: `$statcard <player> [window] [boss]` — window: `7d`/`30d`/`6m`/`all`. "
+                "Boss: any alias from `$bossaliases`. All three can appear in any order."
+            )
+            return
+        window_delta = _boss_parse_window(window_token) if window_token else None
+        cutoff_date = None
+        window_label = "all time"
+        if window_delta is not None:
+            cutoff_date = dt.now(timezone.utc).date() - window_delta
+            window_label = f"last {window_token} (since {cutoff_date.isoformat()})"
+        boss_label = boss_display_name(boss_id) if boss_id else None
+        display_name, toon_keys, mode_text_or_msg = _boss_resolve_pilot_identity(player_name)
+        if not display_name:
+            await ctx.send(mode_text_or_msg)
+            return
+        per_boss = _boss_collect_player_prs(
+            toon_keys, cutoff_date=cutoff_date, boss_id_filter=boss_id
+        )
+        if not per_boss:
+            traverser_n = len(boss_load_traverser_history())
+            local_n = len(load_raid_history())
+            scope = f"window `{window_label}`"
+            if boss_label:
+                scope += f", boss `{boss_label}`"
+            await ctx.send(
+                f"No raid records found for `{display_name}` ({scope}).\n"
+                f"Sources scanned: traverser=`{traverser_n}` fights, "
+                f"local=`{local_n}` fights. Try widening the window or check spelling."
+            )
+            return
+        merged = dict(load_raid_history())
+        merged.update(boss_load_traverser_history())
+        history_count = len(merged)
+        image_path = create_boss_stat_card_image(
+            display_name, mode_text_or_msg, per_boss, history_count,
+            window_label=window_label, boss_label=boss_label,
+        )
+        reply_bits = [
+            f"Stat card for **{display_name}**",
+            f"{len(per_boss)} boss(es)" if not boss_label else boss_label,
+            f"window: {window_label}",
+        ]
+        await ctx.send(
+            " • ".join(reply_bits),
+            file=discord.File(image_path),
+        )
+        try:
+            os.remove(image_path)
+        except Exception:
+            pass
+    except Exception as e:
+        logger.exception("statcard command failed")
+        await ctx.send(f"Could not generate stat card: {e}")
+
+
+@client.command(guild_ids=guilds, aliases=['fighthistoryinfo', 'savedfights'])
+async def historyinfo(ctx):
+    """Shows saved fight counts per boss — total (all worlds) vs Gwydion (World 15)."""
+    fights_dir, index_path = _boss_traverser_paths()
+    counts_total = {}
+    counts_gwydion = {}
+    grand_total = 0
+    grand_gwydion = 0
+
+    if index_path and os.path.exists(index_path):
+        try:
+            with open(index_path, "r", encoding="utf-8") as f:
+                index = json.load(f)
+            for row in index:
+                try:
+                    bid = int(row.get("BossId", 0))
+                    wid = int(row.get("WorldId", 0))
+                except Exception:
+                    continue
+                counts_total[bid] = counts_total.get(bid, 0) + 1
+                grand_total += 1
+                if wid == BOSS_WORLD_ID:
+                    counts_gwydion[bid] = counts_gwydion.get(bid, 0) + 1
+                    grand_gwydion += 1
+        except Exception as e:
+            await ctx.send(f"Could not read traverser index: {e}")
+            return
+
+    local_count = len(load_raid_history())
+
+    gwydion_detail_count = 0
+    if fights_dir and os.path.isdir(fights_dir):
+        try:
+            prefix = f"fight_{BOSS_WORLD_ID}_"
+            gwydion_detail_count = sum(
+                1 for fn in os.listdir(fights_dir)
+                if fn.startswith(prefix) and fn.endswith(".json")
+            )
+        except Exception:
+            gwydion_detail_count = -1
+
+    if not counts_total and local_count == 0:
+        await ctx.send(
+            "No saved fight history available. Traverser index missing AND no local "
+            "`raid_history.json`. Check `$bosspollstatus` for diagnostics."
+        )
+        return
+
+    lines = ["**Saved Fight History per Boss**", "```"]
+    lines.append(f"{'Boss':<30} {'Total':>8} {'Gwydion':>8}")
+    lines.append(f"{'-' * 30} {'-' * 8} {'-' * 8}")
+    for bid in sorted(BOSS_NAMES.keys(), key=lambda b: BOSS_NAMES[b]):
+        lines.append(
+            f"{BOSS_NAMES[bid]:<30} "
+            f"{counts_total.get(bid, 0):>8} {counts_gwydion.get(bid, 0):>8}"
+        )
+    unknown_total = sum(c for bid, c in counts_total.items() if bid not in BOSS_NAMES)
+    unknown_gwydion = sum(c for bid, c in counts_gwydion.items() if bid not in BOSS_NAMES)
+    if unknown_total or unknown_gwydion:
+        lines.append(f"{'(unknown bosses)':<30} {unknown_total:>8} {unknown_gwydion:>8}")
+    lines.append(f"{'-' * 30} {'-' * 8} {'-' * 8}")
+    lines.append(f"{'TOTAL':<30} {grand_total:>8} {grand_gwydion:>8}")
+    lines.append("```")
+
+    footer_bits = [
+        f"Gwydion detail JSONs on disk: **{gwydion_detail_count}**",
+        f"Local raid_history.json cache: **{local_count}**",
+    ]
+    lines.append(" • ".join(footer_bits))
+
+    if not counts_total:
+        lines.append(
+            "\n*Note: traverser index unavailable — Total/Gwydion columns are 0. "
+            "See `$bosspollstatus` for the diagnostic.*"
+        )
+
+    await ctx.send("\n".join(lines))
 
 
 print("Starting bot")
