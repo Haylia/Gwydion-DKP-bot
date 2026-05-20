@@ -1606,25 +1606,46 @@ async def characters(ctx, *name):
     mains_to_chars = sorted(mains_to_chars, key=lambda x: (x[0] != x[1], -int(x[2])))
     realname, caps, spaces, suggestions = find_name(name, mains_list)
     if realname != None:
-        embed = discord.Embed(title = realname + "'s Characters", colour=discord.Color.orange())
-        #find all instances of main name in the character list, add to the embed and return
-        for main, character, level, cclass in mains_to_chars:
-            if main == realname:
-                embed.add_field(name = character, value = "Level " + str(level) + " " + cclass, inline = False)
-        await ctx.send(embed=embed)
+        #find all instances of main name in the character list, paginate every 20 and send
+        user_characters = [(character, level, cclass) for main, character, level, cclass in mains_to_chars if main == realname]
+        total = len(user_characters)
+        pagecounter = 0
+        for i in range(total):
+            if i % 20 == 0:
+                if i != 0:
+                    await ctx.send(embed=embed)
+                pagecounter += 1
+                title = realname + "'s Characters"
+                if total > 20:
+                    title += " Page " + str(pagecounter)
+                embed = discord.Embed(title=title, colour=discord.Color.orange())
+            character, level, cclass = user_characters[i]
+            embed.add_field(name=character, value="Level " + str(level) + " " + cclass, inline=False)
+        if total > 0:
+            await ctx.send(embed=embed)
         return
     altrealname, caps, spaces, alt_suggestions = find_name(name, characters_list)
     if altrealname != None:
-        #pull the main first, then find all instances of the main in the character list, add to the embed and return
+        #pull the main first, then find all instances of the main in the character list, paginate every 20 and send
         cell = bot4ws1.find(altrealname, in_column=1)
         row_num = cell.row
         main_name = bot4ws1.cell(row_num, 7).value
-        embed = discord.Embed(title = main_name + "'s Characters", colour=discord.Color.orange())
-        for main, character, level, cclass in mains_to_chars:
-            if main == main_name:
-                embed.add_field(name = character, value = "Level " + str(level) + " " + cclass, inline = False)
-
-        await ctx.send(embed=embed)
+        user_characters = [(character, level, cclass) for main, character, level, cclass in mains_to_chars if main == main_name]
+        total = len(user_characters)
+        pagecounter = 0
+        for i in range(total):
+            if i % 20 == 0:
+                if i != 0:
+                    await ctx.send(embed=embed)
+                pagecounter += 1
+                title = main_name + "'s Characters"
+                if total > 20:
+                    title += " Page " + str(pagecounter)
+                embed = discord.Embed(title=title, colour=discord.Color.orange())
+            character, level, cclass = user_characters[i]
+            embed.add_field(name=character, value="Level " + str(level) + " " + cclass, inline=False)
+        if total > 0:
+            await ctx.send(embed=embed)
     else:
         await ctx.send(not_found_message(name, suggestions or alt_suggestions))
         
@@ -4151,7 +4172,7 @@ def save_raid_history(history):
 
 # ─── Traverser data source (chscripts/bossranking_data) ───────────────────
 
-_boss_traverser_cache = {"loaded_at": 0.0, "file_count": -1, "history": {}}
+_boss_traverser_cache = {"loaded_at": 0.0, "file_count": -1, "history": {}, "mismatched": 0}
 
 
 def _boss_traverser_paths():
@@ -4198,6 +4219,7 @@ def boss_load_traverser_history(force=False):
         except Exception:
             continue
     history = {}
+    mismatched = 0
     file_prefix = f"fight_{BOSS_WORLD_ID}_"
     for filename in os.listdir(fights_dir):
         if not filename.startswith(file_prefix) or not filename.endswith(".json"):
@@ -4223,6 +4245,19 @@ def boss_load_traverser_history(force=False):
                 detail = json.load(f)
         except Exception:
             continue
+        # Per-world validation: BossRanking sometimes ignores worldid for board=fight
+        # and returns the wrong world's fight. Index TotalDamage is the authoritative
+        # value for THIS (FightId, WorldId) pair — if the cached per-fight file's
+        # TotalDamageDone doesn't match, the file is for a different world. Skip it
+        # to avoid attributing other servers' damage to Gwydion players.
+        try:
+            idx_dmg = int(idx_row.get("TotalDamage", 0) or 0)
+            pf_dmg = int(detail.get("TotalDamageDone", 0) or 0)
+            if idx_dmg > 0 and pf_dmg != idx_dmg:
+                mismatched += 1
+                continue
+        except Exception:
+            pass
         players = []
         for p in detail.get("DetailsPerPlayer", []):
             try:
@@ -4268,9 +4303,10 @@ def boss_load_traverser_history(force=False):
     _boss_traverser_cache["loaded_at"] = now
     _boss_traverser_cache["file_count"] = current_count
     _boss_traverser_cache["history"] = history
+    _boss_traverser_cache["mismatched"] = mismatched
     logger.info(
         f"Loaded traverser Gwydion history: {len(history)} fights "
-        f"({current_count} files on disk)"
+        f"({current_count} files on disk, {mismatched} skipped as wrong-world data)"
     )
     return history
 
@@ -4689,11 +4725,42 @@ async def boss_perform_auto_check():
             await channel.send(
                 f"New **{boss_display_name(boss_id)}** raid detected. Fight ID: **{fight_id}**"
             )
-            await channel.send(file=discord.File(image_path))
+            chart_msg = await channel.send(file=discord.File(image_path))
             try:
                 os.remove(image_path)
             except Exception:
                 pass
+            # Create a discussion thread on the chart and ping the "LB damage" role.
+            # Role lookup is case-insensitive against the channel's guild. If the
+            # role is missing the message still sends as plain text — no ping.
+            try:
+                thread = await chart_msg.create_thread(
+                    name=f"{boss_display_name(boss_id)} - Fight {fight_id}",
+                    auto_archive_duration=1440,  # 24h
+                )
+                lb_role = None
+                if channel.guild:
+                    for r in channel.guild.roles:
+                        if r.name.lower() == "lb damage":
+                            lb_role = r
+                            break
+                mention = lb_role.mention if lb_role else "@LB damage"
+                allowed = (
+                    discord.AllowedMentions(roles=[lb_role])
+                    if lb_role else discord.AllowedMentions.none()
+                )
+                await thread.send(
+                    f"{mention} new **{boss_display_name(boss_id)}** run — Fight "
+                    f"`{fight_id}`.",
+                    allowed_mentions=allowed,
+                )
+            except discord.Forbidden:
+                logger.warning(
+                    "Bot lacks permission to create threads or mention roles in "
+                    f"channel {BOSS_AUTO_POST_CHANNEL_ID}"
+                )
+            except Exception:
+                logger.exception(f"Failed to create thread for fight {fight_id}")
             posted.add(fight_id)
             save_posted_fights(posted)
             posted_count += 1
@@ -4959,9 +5026,12 @@ async def bosspollstatus(ctx):
     else:
         traverser_history = boss_load_traverser_history()
         traverser_count = _boss_traverser_cache.get("file_count", -1)
+        mismatched = _boss_traverser_cache.get("mismatched", 0)
         traverser_status = (
             f"`{len(traverser_history)}` loaded "
-            f"(files on disk: `{traverser_count}`, path: `{fights_dir}`)"
+            f"(files on disk: `{traverser_count}`, "
+            f"skipped as wrong-world: `{mismatched}`, "
+            f"path: `{fights_dir}`)"
         )
     lines = [
         "**Boss Poll Status**",
@@ -5035,19 +5105,31 @@ async def bossrescrape(ctx, scope: str = "2026"):
             gs = int(r.get("GroupScale", 0))
         except Exception:
             gs = 0
-        if n < gs * 0.6 and n < 6:
-            suspects.append((fid, fp, n, gs))
+        # Truncation signal: too few player rows vs the group size
+        truncated = (n < gs * 0.6 and n < 6)
+        # Wrong-world signal: per-fight TotalDamageDone disagrees with index TotalDamage
+        wrong_world = False
+        try:
+            idx_dmg = int(r.get("TotalDamage", 0) or 0)
+            pf_dmg = int(d.get("TotalDamageDone", 0) or 0)
+            if idx_dmg > 0 and pf_dmg != idx_dmg:
+                wrong_world = True
+        except Exception:
+            pass
+        if truncated or wrong_world:
+            suspects.append((fid, fp, n, gs, int(r.get("TotalDamage", 0) or 0)))
     if not suspects:
-        await ctx.send(f"No truncated fights to repair in scope `{scope}`.")
+        await ctx.send(f"No truncated or wrong-world fights to repair in scope `{scope}`.")
         return
     await ctx.send(
-        f"Found **{len(suspects)}** truncated Gwydion fight(s) in scope `{scope}`. "
-        f"Refetching with `numRecs=2000`... (this will take ~{len(suspects) * 0.4:.0f}s)"
+        f"Found **{len(suspects)}** suspect Gwydion fight(s) in scope `{scope}` "
+        f"(truncated or wrong-world data). Refetching with `numRecs=2000`, validating "
+        f"against the index... (~{len(suspects) * 0.3:.0f}s)"
     )
     fixed = 0
-    unchanged = 0
+    still_wrong = 0
     errors = 0
-    for fid, fp, old_n, gs in suspects:
+    for fid, fp, old_n, gs, expected_dmg in suspects:
         url = (
             f"{BOSS_RANKING_URL}?board=fight&fightid={fid}"
             f"&worldid={BOSS_WORLD_ID}&playerWorldId=0&charId=0"
@@ -5060,24 +5142,27 @@ async def bossrescrape(ctx, scope: str = "2026"):
         except Exception:
             errors += 1
             continue
-        new_n = len(d.get("DetailsPerPlayer", []))
-        if new_n > old_n:
-            tmp = fp + ".tmp"
-            with open(tmp, "w", encoding="utf-8") as f:
-                json.dump(d, f, indent=2)
-            os.replace(tmp, fp)
-            fixed += 1
-        else:
-            unchanged += 1
+        # Validate: API may still return wrong-world data for some fights. Only
+        # save if TotalDamageDone matches the index's TotalDamage (= same fight).
+        api_dmg = int(d.get("TotalDamageDone", 0) or 0)
+        if expected_dmg > 0 and api_dmg != expected_dmg:
+            still_wrong += 1
+            await asyncio.sleep(0.15)
+            continue
+        tmp = fp + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(d, f, indent=2)
+        os.replace(tmp, fp)
+        fixed += 1
         await asyncio.sleep(0.15)
-    # Invalidate traverser cache so next $statcard / $fights sees fresh data
     _boss_traverser_cache["loaded_at"] = 0.0
     _boss_traverser_cache["file_count"] = -1
     await ctx.send(
         f"Re-scrape complete (scope `{scope}`).\n"
-        f"Repaired: **{fixed}**, unchanged: **{unchanged}**, errors: **{errors}**.\n"
+        f"Repaired: **{fixed}**, still wrong-world after retry: **{still_wrong}**, "
+        f"errors: **{errors}**.\n"
         f"Winston's traverser cache has been invalidated — next `$statcard`/`$fights` "
-        f"will see the new data."
+        f"will see the corrected data."
     )
 
 
@@ -5392,6 +5477,325 @@ async def statcard(ctx, *, args: str):
     except Exception as e:
         logger.exception("statcard command failed")
         await ctx.send(f"Could not generate stat card: {e}")
+
+
+def _boss_extract_last_args(args):
+    """Parses '$fighthistory' args. Returns (count, boss_id, player_name, leftover).
+    Position-independent. First integer in [1, 100] wins as count (default 10).
+    Boss alias is required. Player name = whatever remains. Collisions between
+    boss aliases and roster names are resolved in favor of the roster."""
+    parts = args.strip().split()
+    count = 10
+    count_seen = False
+    boss_id = None
+    try:
+        roster_rows = boss_get_pilot_toon_map()
+        roster_keys = {boss_normalize_name(r["Toon Name"]) for r in roster_rows}
+        roster_keys |= {boss_normalize_name(r["Pilot"]) for r in roster_rows}
+    except Exception:
+        roster_keys = set()
+    leftover = []
+    for token in parts:
+        if not count_seen:
+            try:
+                v = int(token)
+                if 1 <= v <= 100:
+                    count = v
+                    count_seen = True
+                    continue
+            except ValueError:
+                pass
+        if boss_id is None:
+            key = boss_normalize_name(token)
+            if key in BOSS_ALIASES and key not in roster_keys:
+                boss_id = BOSS_ALIASES[key]
+                continue
+        leftover.append(token)
+    return count, boss_id, " ".join(leftover)
+
+
+def _boss_collect_player_boss_history(toon_keys, boss_id, limit):
+    """Returns a list of run dicts for the player's most recent `limit` fights
+    against this boss. Each dict: {FightId, Date, Damage, DPS, Toons, Duration}.
+    Sorted newest first by FightId DESC. Excluded dates skipped."""
+    merged = dict(load_raid_history())
+    merged.update(boss_load_traverser_history())
+    runs = []
+    for rec in merged.values():
+        if _boss_is_excluded_date(rec.get("DateOfKill", "")):
+            continue
+        try:
+            if int(rec.get("BossId", 0)) != boss_id:
+                continue
+        except Exception:
+            continue
+        try:
+            duration = int(rec.get("FightDurationSeconds", 0))
+        except Exception:
+            duration = 0
+        damage = 0
+        used_toons = []
+        for p in rec.get("Players", []):
+            tk = boss_normalize_name(p.get("Name", ""))
+            if tk in toon_keys:
+                try:
+                    damage += int(p.get("DamageDealt", 0))
+                except Exception:
+                    pass
+                used_toons.append(str(p.get("Name", "")).strip())
+        if damage <= 0:
+            continue
+        dps = damage / duration if duration else 0
+        runs.append({
+            "FightId": int(rec.get("FightId", 0)),
+            "Date": rec.get("DateOfKill", ""),
+            "Damage": damage,
+            "DPS": dps,
+            "Toons": used_toons,
+            "Duration": duration,
+        })
+    return sorted(runs, key=lambda r: r["FightId"], reverse=True)[:limit]
+
+
+@client.command(guild_ids=guilds, aliases=['lastfights', 'recentfightsfor', 'lh'])
+async def fighthistory(ctx, *, args: str):
+    """Last N fights at a specific boss for a player, with damage/DPS summary stats.
+
+    Usage:
+      $fighthistory <player> <boss>            — last 10 (default)
+      $fighthistory 5 <player> <boss>          — last 5
+      $fighthistory 20 redalice BT             — last 20 Bloodthorn for REDALiCE
+      $fighthistory redalice 10 dhiothu        — any order works
+
+    Boss aliases via `$bossaliases`. Toon-name match first, pilot fallback."""
+    try:
+        count, boss_id, player_name = _boss_extract_last_args(args)
+        if not boss_id:
+            await ctx.send(
+                "Usage: `$fighthistory [N] <player> <boss>` — boss alias required. "
+                "Run `$bossaliases`."
+            )
+            return
+        if not player_name:
+            await ctx.send(
+                "Usage: `$fighthistory [N] <player> <boss>` — player name required."
+            )
+            return
+        display_name, toon_keys, mode_text = _boss_resolve_pilot_identity(player_name)
+        if not display_name:
+            await ctx.send(mode_text)
+            return
+        runs = _boss_collect_player_boss_history(toon_keys, boss_id, count)
+        if not runs:
+            await ctx.send(
+                f"No saved fights for `{display_name}` at "
+                f"**{boss_display_name(boss_id)}**."
+            )
+            return
+        damages = [r["Damage"] for r in runs]
+        dpses = [r["DPS"] for r in runs]
+        avg_dmg = sum(damages) / len(damages)
+        avg_dps = sum(dpses) / len(dpses)
+        embed = discord.Embed(
+            title=f"{display_name} — Last {len(runs)} {boss_display_name(boss_id)} run(s)",
+            description=f"Mode: {mode_text}",
+            colour=discord.Color.orange(),
+        )
+        summary_lines = [
+            "**Damage**",
+            f"  avg `{avg_dmg:,.0f}`  •  best `{max(damages):,}`  •  low `{min(damages):,}`",
+            "**DPS**",
+            f"  avg `{avg_dps:,.1f}`  •  best `{max(dpses):,.1f}`  •  low `{min(dpses):,.1f}`",
+        ]
+        embed.add_field(name="Summary", value="\n".join(summary_lines), inline=False)
+        run_lines = []
+        for i, r in enumerate(runs, 1):
+            toons_str = ", ".join(r["Toons"]) or "—"
+            run_lines.append(
+                f"**{i}.** Fight `{r['FightId']}` • {r['Date']} — "
+                f"`{r['Damage']:,}` dmg • `{r['DPS']:,.1f}` DPS\n"
+                f" └ {toons_str}"
+            )
+        # Split into multiple fields if the joined text exceeds Discord's 1024-char
+        # per-field limit (10 runs at ~100 chars per line is right at the edge).
+        chunks = []
+        current = []
+        current_len = 0
+        for line in run_lines:
+            if current_len + len(line) + 1 > 950:
+                chunks.append("\n".join(current))
+                current = []
+                current_len = 0
+            current.append(line)
+            current_len += len(line) + 1
+        if current:
+            chunks.append("\n".join(current))
+        if len(chunks) == 1:
+            embed.add_field(name="Recent runs (newest first)", value=chunks[0], inline=False)
+        else:
+            for i, chunk in enumerate(chunks, 1):
+                embed.add_field(
+                    name=f"Recent runs (newest first) — pt {i}/{len(chunks)}",
+                    value=chunk, inline=False,
+                )
+        await ctx.send(embed=embed)
+    except Exception as e:
+        logger.exception("fighthistory command failed")
+        await ctx.send(f"Could not fetch fight history: {e}")
+
+
+def _boss_extract_bests_args(args):
+    """Parses '$bests' args. Returns (boss_id, window_token, unique_flag, leftover).
+    Boss alias is required (first match wins). Window and 'unique' flag are
+    optional and order-independent."""
+    parts = args.strip().split()
+    window_token = None
+    boss_id = None
+    unique = False
+    leftover = []
+    for token in parts:
+        lower = token.lower()
+        if lower in ("unique", "u", "uniqueplayers"):
+            unique = True
+            continue
+        if window_token is None and _BOSS_WINDOW_RE.match(lower):
+            window_token = lower
+            continue
+        if boss_id is None:
+            key = boss_normalize_name(token)
+            if key in BOSS_ALIASES:
+                boss_id = BOSS_ALIASES[key]
+                continue
+        leftover.append(token)
+    return boss_id, window_token, unique, leftover
+
+
+def _boss_collect_top_performances(boss_id, cutoff_date=None, unique_only=False, limit=5):
+    """Scans traverser + local raid history for the given boss. Returns
+    (top_by_damage, top_by_dps) — each a list of up to `limit` performance dicts:
+    {Name, Class, Damage, DPS, FightId, Date}. Excluded dates are skipped.
+    If unique_only=True, keeps each toon's single best run per metric."""
+    merged = dict(load_raid_history())
+    merged.update(boss_load_traverser_history())
+    entries = []
+    for rec in merged.values():
+        if _boss_is_excluded_date(rec.get("DateOfKill", "")):
+            continue
+        if cutoff_date is not None:
+            kd = _boss_parse_kill_date(rec.get("DateOfKill", ""))
+            if not kd or kd < cutoff_date:
+                continue
+        try:
+            if int(rec.get("BossId", 0)) != boss_id:
+                continue
+        except Exception:
+            continue
+        try:
+            duration = int(rec.get("FightDurationSeconds", 0))
+        except Exception:
+            duration = 0
+        for p in rec.get("Players", []):
+            name = str(p.get("Name", "")).strip()
+            if not name:
+                continue
+            try:
+                damage = int(p.get("DamageDealt", 0))
+            except Exception:
+                damage = 0
+            if damage <= 0:
+                continue
+            dps = damage / duration if duration else 0
+            entries.append({
+                "Name": name,
+                "Class": str(p.get("ClassName", "")).strip(),
+                "Damage": damage,
+                "DPS": dps,
+                "FightId": int(rec.get("FightId", 0)),
+                "Date": rec.get("DateOfKill", ""),
+            })
+    if unique_only:
+        best_dmg = {}
+        best_dps = {}
+        for e in entries:
+            n = e["Name"]
+            if n not in best_dmg or e["Damage"] > best_dmg[n]["Damage"]:
+                best_dmg[n] = e
+            if n not in best_dps or e["DPS"] > best_dps[n]["DPS"]:
+                best_dps[n] = e
+        top_dmg = sorted(best_dmg.values(), key=lambda x: -x["Damage"])[:limit]
+        top_dps = sorted(best_dps.values(), key=lambda x: -x["DPS"])[:limit]
+    else:
+        top_dmg = sorted(entries, key=lambda x: -x["Damage"])[:limit]
+        top_dps = sorted(entries, key=lambda x: -x["DPS"])[:limit]
+    return top_dmg, top_dps
+
+
+@client.command(guild_ids=guilds, aliases=['top', 'topperformances', 'leaderboard'])
+async def bests(ctx, *, args: str):
+    """Top performances at a specific boss (top 5 by damage + top 5 by DPS).
+
+    Usage:
+      $bests <boss>                   — top 5, all time, all entries
+      $bests <boss> 30d               — last 30 days only
+      $bests <boss> unique            — one entry per toon (their best)
+      $bests <boss> 30d unique        — both filters; any order
+
+    Window tokens: Nd, Nw, Nm, Ny, all. Boss is required — try `$bossaliases`."""
+    try:
+        boss_id, window_token, unique_only, leftover = _boss_extract_bests_args(args)
+        if not boss_id:
+            await ctx.send(
+                "Usage: `$bests <boss> [window] [unique]` — boss alias is required. "
+                "Run `$bossaliases` for the list."
+            )
+            return
+        window_delta = _boss_parse_window(window_token) if window_token else None
+        cutoff_date = None
+        window_label = "all time"
+        if window_delta is not None:
+            cutoff_date = dt.now(timezone.utc).date() - window_delta
+            window_label = f"last {window_token}"
+        top_dmg, top_dps = _boss_collect_top_performances(
+            boss_id, cutoff_date=cutoff_date, unique_only=unique_only, limit=5
+        )
+        if not top_dmg:
+            await ctx.send(
+                f"No fights found for **{boss_display_name(boss_id)}** in window `{window_label}`."
+            )
+            return
+        scope = (
+            f"Window: {window_label}  •  "
+            f"{'Unique toons only' if unique_only else 'All entries (a toon may appear multiple times)'}"
+        )
+        embed = discord.Embed(
+            title=f"{boss_display_name(boss_id)} — Top Performances",
+            description=scope,
+            colour=discord.Color.orange(),
+        )
+
+        def _fmt_class(cls):
+            return f" *({cls})*" if cls else ""
+
+        dmg_lines = [
+            f"**{i}.** {e['Name']}{_fmt_class(e['Class'])} — "
+            f"**{e['Damage']:,}** dmg ({e['DPS']:,.1f} DPS)\n"
+            f" └ Fight {e['FightId']} • {e['Date']}"
+            for i, e in enumerate(top_dmg, 1)
+        ]
+        dps_lines = [
+            f"**{i}.** {e['Name']}{_fmt_class(e['Class'])} — "
+            f"**{e['DPS']:,.1f}** DPS ({e['Damage']:,} dmg)\n"
+            f" └ Fight {e['FightId']} • {e['Date']}"
+            for i, e in enumerate(top_dps, 1)
+        ]
+        embed.add_field(name="Top 5 by Damage", value="\n".join(dmg_lines), inline=False)
+        embed.add_field(name="Top 5 by DPS", value="\n".join(dps_lines), inline=False)
+        if leftover:
+            embed.set_footer(text=f"Ignored extra args: {' '.join(leftover)}")
+        await ctx.send(embed=embed)
+    except Exception as e:
+        logger.exception("bests command failed")
+        await ctx.send(f"Could not compute top performances: {e}")
 
 
 @client.command(guild_ids=guilds, aliases=['fighthistoryinfo', 'savedfights'])
