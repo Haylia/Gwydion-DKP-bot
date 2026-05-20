@@ -477,6 +477,37 @@ _bids_dirty = True
 
 guilds=[814048353603813376,1116453904922726544,1215443011400376391,920411637297598484]
 
+# ─── Early-loaded multi-server gates ──────────────────────────────────────
+# Defined this high in the file because every DKP / roster command below uses
+# @dkp_only as a decorator, which evaluates at import time. The richer helpers
+# (is_server_setup_authorized, _require_world_for_ctx, etc.) live further down
+# with the rest of the boss-leaderboard subsystem — they're only called from
+# inside async command bodies, so import-order doesn't matter for them.
+
+GWYDION_GUILD_IDS = set(guilds)
+
+
+def is_gwydion_guild(guild_id):
+    """True if the Discord guild is one of the four legacy Relentless guilds."""
+    if guild_id is None:
+        return False
+    try:
+        return int(guild_id) in GWYDION_GUILD_IDS
+    except Exception:
+        return False
+
+
+def dkp_only():
+    """Check decorator: command may only run in the four legacy Relentless guilds.
+    Failure surfaces as commands.CheckFailure('dkp_wrong_server') so the global
+    on_command_error can produce a friendly redirect to $lbhelp."""
+    async def predicate(ctx):
+        if is_gwydion_guild(getattr(getattr(ctx, "guild", None), "id", None)):
+            return True
+        raise commands.CheckFailure("dkp_wrong_server")
+    return commands.check(predicate)
+
+
 print("setup done")
 
 def cached_col_values(worksheet, col, cache_key=None, ttl=None):
@@ -700,11 +731,33 @@ async def bidloop():
 @client.event
 async def on_ready():
     print(f'{client.user} has connected to Discord!')
+    # Report which of the four legacy Relentless guilds are reachable. Has to
+    # run here (not at module top level) because client.get_guild() returns
+    # None until the bot is connected.
+    for g in guilds:
+        guild = client.get_guild(g)
+        if guild:
+            print(f"Connected to guild: {guild.name} (ID: {guild.id})")
+        else:
+            print(f"Warning: Could not find guild with ID {g}")
     bidloop.start()
     # --- Boss Leaderboard auto-poller (UTC-anchored) ---
     try:
-        had_state = os.path.exists(POSTED_FIGHTS_FILE)
-        initialize_posted_fights_if_needed()
+        _migrate_state_files_if_needed()
+        # Seed any world that's configured (Gwydion + every world referenced in
+        # server_config.json) so a brand-new world doesn't replay every fight
+        # it's ever seen on first auto-poll.
+        worlds_to_seed = {GWYDION_WORLD_ID}
+        for _gid, _entry in get_all_configured_guilds():
+            try:
+                worlds_to_seed.add(int(_entry.get("world_id", 0)))
+            except Exception:
+                continue
+        existing_world_keys = _world_keys_in_posted_file()
+        had_state = bool(existing_world_keys)
+        for _wid in worlds_to_seed:
+            if _wid > 0:
+                initialize_posted_fights_if_needed(world_id=_wid)
         if had_state:
             try:
                 count = await boss_perform_auto_check()
@@ -720,6 +773,58 @@ async def on_ready():
             "Boss poll anchored to UTC: "
             + ", ".join(t.strftime("%H:%M") for t in BOSS_POLL_ANCHOR_TIMES)
         )
+
+
+@client.event
+async def on_guild_join(guild):
+    """Sends a setup-instructions message to new servers (skipping Gwydion legacy guilds)."""
+    try:
+        logger.info(f"Joined guild {guild.name} ({guild.id})")
+        if is_gwydion_guild(guild.id):
+            return
+        msg = (
+            "Thanks for adding Winston!\n\n"
+            "Winston is primarily a DKP bot for the Gwydion-Relentless community, but "
+            "the **boss leaderboard** features work for any Celtic Heroes server.\n\n"
+            "**To get started** (Discord admin required):\n"
+            "1. `$setworld <world_id_or_name>` — e.g. `$setworld 15` or `$setworld gwydion`. "
+            "Run `$listworlds` for known names.\n"
+            "2. `$setchannel #your-channel` — enable auto-posting of boss kills.\n"
+            "3. Try `$fights`, `$sheet <boss>`, `$bossaliases`, `$bests <boss>`, "
+            "`$fighthistory <player> <boss>`.\n\n"
+            "Run `$lbhelp` for the full command list or `$serverinfo` to check your "
+            "current configuration."
+        )
+        # Best-effort delivery: system channel > owner DM > silent.
+        target = guild.system_channel
+        if target:
+            try:
+                me = guild.me
+                if me and target.permissions_for(me).send_messages:
+                    await target.send(msg)
+                    return
+            except Exception:
+                pass
+        try:
+            if guild.owner:
+                await guild.owner.send(msg)
+        except Exception:
+            pass
+    except Exception:
+        logger.exception("on_guild_join handler failed")
+
+
+@client.event
+async def on_guild_remove(guild):
+    """Auto-prunes a non-Gwydion guild's config on bot kick/leave."""
+    try:
+        logger.info(f"Removed from guild {guild.name} ({guild.id})")
+        if is_gwydion_guild(guild.id):
+            return
+        if remove_server_entry(guild.id):
+            logger.info(f"Cleared server_config entry for departed guild {guild.id}")
+    except Exception:
+        logger.exception("on_guild_remove handler failed")
 
 
 @client.event
@@ -858,6 +963,17 @@ Your boy going crazy""")
 
 @client.event
 async def on_command_error(ctx, error):
+    if isinstance(error, commands.CheckFailure) and str(error) == "dkp_wrong_server":
+        # @dkp_only fired in a non-Gwydion server. Friendly redirect to lbhelp
+        # rather than the generic "you don't have permission" message.
+        try:
+            await ctx.send(
+                "That command is only available in the Gwydion (Relentless) servers. "
+                "Run `$lbhelp` to see the leaderboard commands available here."
+            )
+        except Exception:
+            pass
+        return
     if isinstance(error, commands.BadArgument):
         await ctx.send("you made an error in the command arguments")
         print(error)
@@ -875,7 +991,8 @@ async def on_command_error(ctx, error):
         await ctx.send("Winston got confused")
         raise error
 
-@client.command(guild_ids = guilds)
+@client.command()
+@dkp_only()
 async def makeleaderboard(ctx):
     """Generates a leaderboard from attached screenshots (supports attachments, replied messages, and embed images)"""
     temp_files = []
@@ -966,7 +1083,8 @@ async def makeleaderboard(ctx):
                     print(f"ERROR: Failed to remove temp file {f}")
                     traceback.print_exc()
 
-@client.command(guild_ids = guilds)
+@client.command()
+@dkp_only()
 async def startbid(ctx, item, startprice, kp, startbidder):
     """Starts a bid for a new item"""
     global _bids_dirty
@@ -985,7 +1103,8 @@ async def startbid(ctx, item, startprice, kp, startbidder):
     await ctx.send("Bid for " + item + " has started at " + str(startprice) + " " + kp + " by " + startbidder)
     await ctx.send("The ID for this bid is " + str(id) + ". Please use this number to bid on the item!")
 
-@client.command(guild_ids = guilds)
+@client.command()
+@dkp_only()
 async def getitemname(ctx):
     """gets the item name from an image"""
     image = ctx.message.attachments[0]
@@ -1016,7 +1135,8 @@ def preprocessforgreen(img):
     return final_img
 
 
-@client.command(guild_ids = guilds)
+@client.command()
+@dkp_only()
 async def sendbid(ctx, id, price, bidder):
     """command for sending a bid to the bid sheet"""
     global _bids_dirty
@@ -1036,7 +1156,8 @@ async def sendbid(ctx, id, price, bidder):
     else:
         await ctx.send("This bid is closed!")
 
-@client.command(guild_ids = guilds)
+@client.command()
+@dkp_only()
 async def cancelbid(ctx, id, price, bidder):
     """command for cancelling a bid"""
     global _bids_dirty
@@ -1079,14 +1200,16 @@ async def cancelbid(ctx, id, price, bidder):
     
 
 
-@client.command(guild_ids = guilds)
+@client.command()
+@dkp_only()
 async def bidtimeinfo(ctx):
     global bidslastupdate
     currenttime = time.time()
     timepassed = currenttime - bidslastupdate
     await ctx.send("The last bid update was " + str(round(timepassed, 2)) + " seconds ago")
 
-@client.command(guild_ids = guilds)
+@client.command()
+@dkp_only()
 async def mybids(ctx):
     """Shows the bids you have placed"""
     user = ctx.author.id
@@ -1102,7 +1225,8 @@ async def mybids(ctx):
             await ctx.send("You have bid " + str(userbids[i][4]) + " " + userbids[i][5] + " on " + userbids[i][3] + ", Auction ID: " + str(userbids[i][2]) + ", Bidder: " + userbids[i][7] + ", Status: " + userbids[i][6])
 
 
-@client.command(guild_ids = guilds)
+@client.command()
+@dkp_only()
 async def bidinfo(ctx, id):
     """Shows the info for a bid"""
     try:
@@ -1130,7 +1254,8 @@ async def bidinfo(ctx, id):
         await ctx.send(e)
 
 
-@client.command(guild_ids = guilds)
+@client.command()
+@dkp_only()
 @commands.has_any_role("General", "REDALiCE")
 async def addpoints(ctx, playername, pointtype, earned, spent, adjusted):
     """setup command for initializing points on the sheet. only to be used in setup"""
@@ -1154,7 +1279,8 @@ async def addpoints(ctx, playername, pointtype, earned, spent, adjusted):
     ws.update_cell(rownum, 6, adjusted)
     await ctx.send(pointtype + " for " + playername + " has been updated")
 
-@client.command(guild_ids = guilds)
+@client.command()
+@dkp_only()
 @commands.has_any_role("General", "REDALiCE")
 async def addallearned(ctx, playername, VKP, GKP, PKP, AKP, RBPPUNOX, DPKP, RBPP):
     """Adds all the points earned to the player in the order VKP, GKP, PKP, AKP, RBPPUNOX, DPKP, RBPP"""
@@ -1182,7 +1308,8 @@ async def addallearned(ctx, playername, VKP, GKP, PKP, AKP, RBPPUNOX, DPKP, RBPP
     await ctx.send("All points for " + playername + " have been updated")
 
 
-@client.command(guild_ids = guilds, aliases=["pointinputterinfo", "ii"])
+@client.command(aliases=["pointinputterinfo", "ii"])
+@dkp_only()
 async def inputterinfo(ctx):
      """Displays the help for point inputters"""
      embed = discord.Embed(title = "Info Dump", colour=discord.Color.orange())
@@ -1212,7 +1339,8 @@ async def inputterinfo(ctx):
      embed.add_field(name = "Command usage for adding half points", value = "$bosshalf <bossname> <list of characters> \n remember to put the list of characters in quotes", inline=False)
      await ctx.send(embed=embed)
 
-@client.command(guild_ids = guilds, aliases=["addmember", "registermember", "registermem", "am"])
+@client.command(aliases=["addmember", "registermember", "registermem", "am"])
+@dkp_only()
 @commands.has_any_role("General", "Guardian", "REDALiCE", "Helper")
 async def addmem(ctx, name, rank, main, level, cclass):
     """Adds a member to the Roster, KP Lists and loot list"""
@@ -1273,7 +1401,8 @@ async def addmem(ctx, name, rank, main, level, cclass):
     else:
         await ctx.send(name + " is already in the list!")
 
-@client.command(guild_ids = guilds, aliases=["rosteradministrator", "ra"])
+@client.command(aliases=["rosteradministrator", "ra"])
+@dkp_only()
 @commands.has_any_role("General", "Guardian", "REDALiCE", "Helper")
 async def rosteradmin(ctx, subcommand, name, params):
     """roster management for admins
@@ -1304,7 +1433,8 @@ async def rosteradmin(ctx, subcommand, name, params):
         else:
             await ctx.send("invalid subcommand")
 
-@client.command(guild_ids = guilds, aliases=["r"])
+@client.command(aliases=["r"])
+@dkp_only()
 async def roster(ctx, subcommand, name, params):
     """Roster Management Command
     subcommands: dg, subclass, cgoffhand, dl, dlmain, dloffhand, edl, edlmain, edloffhand, setall, level, setmain, bulksetmain, faction"""
@@ -1448,7 +1578,8 @@ async def roster(ctx, subcommand, name, params):
     else:
         await ctx.send(not_found_message(name, suggestions))
 
-@client.command(guild_ids = guilds, aliases=["p", "toon", "char", "character"])
+@client.command(aliases=["p", "toon", "char", "character"])
+@dkp_only()
 async def player(ctx, *name):
     """Displays a player's information"""
     name = " ".join(name)
@@ -1502,7 +1633,8 @@ async def player(ctx, *name):
     else:
         await ctx.send(not_found_message(name, suggestions))
 
-@client.command(guild_ids = guilds, aliases=["pf", "playerfullinfo", "playerfullinformation"])
+@client.command(aliases=["pf", "playerfullinfo", "playerfullinformation"])
+@dkp_only()
 async def playerfull(ctx, *name):
     """Displays a player's information"""
     name = " ".join(name)
@@ -1555,7 +1687,8 @@ async def playerfull(ctx, *name):
     else:
         await ctx.send(not_found_message(name, suggestions))
 
-@client.command(guild_ids = guilds, aliases=["pkp"])
+@client.command(aliases=["pkp"])
+@dkp_only()
 async def playerkp(ctx, *name):
     """Displays a player's KP information"""
     name = " ".join(name)
@@ -1591,7 +1724,8 @@ async def playerkp(ctx, *name):
     else:
         await ctx.send(not_found_message(name, suggestions))
 
-@client.command(guild_ids = guilds, aliases=["toons", "chars", "characterlist"])
+@client.command(aliases=["toons", "chars", "characterlist"])
+@dkp_only()
 async def characters(ctx, *name):
     """shows all characters a player has"""
     name = " ".join(name)
@@ -1650,7 +1784,8 @@ async def characters(ctx, *name):
         await ctx.send(not_found_message(name, suggestions or alt_suggestions))
         
 
-@client.command(guild_ids = guilds)
+@client.command()
+@dkp_only()
 @commands.has_any_role("General", "REDALiCE")
 async def fullpointwipe(ctx, name, verification):
     """fully wipes someones points, including earned points"""
@@ -1912,7 +2047,8 @@ def internal_deduct(args_str):
     else:
         return("Invalid KP type: " + kp)
 
-@client.command(guild_ids = guilds)
+@client.command()
+@dkp_only()
 @commands.has_any_role("General", "Guardian", "REDALiCE", "Helper")
 async def deduct(ctx, name, item, number, kp):
     """Deducts points from a player and adds the item to their loot list"""
@@ -2043,7 +2179,8 @@ async def deduct(ctx, name, item, number, kp):
         await ctx.send("Invalid pointpool! Use VKP, GKP, PKP, AKP, RBPPUNOX, or DPKP.")
         
 
-@client.command(guild_ids = guilds, aliases=["bidgenerator", "bg"])
+@client.command(aliases=["bidgenerator", "bg"])
+@dkp_only()
 @commands.has_any_role("General", "Guardian", "REDALiCE", "Helper")
 async def bidgen(ctx, *message):
     """Parses a loot message and generates deduct commands
@@ -2106,7 +2243,8 @@ async def bidgen(ctx, *message):
     else:
         await ctx.send("No valid loot entries found. Please check the format:\n```\nPlayer Name - Item Name\n(amount pointpool)\n```")
 
-@client.command(guild_ids = guilds, aliases=["loot", "wonitems"])
+@client.command(aliases=["loot", "wonitems"])
+@dkp_only()
 async def winnings(ctx, name, kp = None):
     """Displays a player's loot winnings"""
     if kp != None:
@@ -2181,7 +2319,8 @@ async def winnings(ctx, name, kp = None):
         else:
             await ctx.send(not_found_message(name, suggestions))
 
-@client.command(guild_ids = guilds)
+@client.command()
+@dkp_only()
 @commands.has_any_role("General", "Guardian", "REDALiCE", "Helper")
 async def refunditem(ctx, name, itemnum):
     """Refunds an item and returns the points to the player"""
@@ -2259,7 +2398,8 @@ async def refunditem(ctx, name, itemnum):
                 await ctx.send("Invalid KP type. somehow?")
 
 
-@client.command(guild_ids = guilds, aliases=["refundold"])
+@client.command(aliases=["refundold"])
+@dkp_only()
 @commands.has_any_role("General", "Guardian", "REDALiCE", "Helper")
 async def refundolditem(ctx, name, amount, kp):
     """Processes a refund for an item that was not added to the loot list"""
@@ -2284,7 +2424,8 @@ async def refundolditem(ctx, name, amount, kp):
         await ctx.send(not_found_message(name, suggestions))
 
 
-@client.command(guild_ids = guilds)
+@client.command()
+@dkp_only()
 @commands.has_any_role("General", "Guardian", "REDALiCE")
 async def compactloot(ctx, name):
     """Repacks a player's loot row so items sit contiguously from column B."""
@@ -2329,7 +2470,8 @@ async def compactloot(ctx, name):
     await ctx.send(f"Compacted {len(pairs)} item(s) for {realname}.")
 
 
-@client.command(guild_ids = guilds)
+@client.command()
+@dkp_only()
 @commands.has_any_role("General", "Guardian", "REDALiCE", "Helper")
 async def adjust(ctx, name, number, kp):
     """adjusts a players kp by a certain amount"""
@@ -2352,7 +2494,8 @@ async def adjust(ctx, name, number, kp):
     else:
         await ctx.send(not_found_message(name, suggestions))
 
-@client.command(guild_ids=guilds, aliases=["bc"])
+@client.command(aliases=["bc"])
+@dkp_only()
 @commands.has_any_role("General", "REDALiCE")
 async def bossconfig(ctx, action, pool = None, bossname = None, points = None):
     """Manage boss-to-KP-pool mappings. Subcommands: list, add, remove, update"""
@@ -2416,7 +2559,8 @@ async def bossconfig(ctx, action, pool = None, bossname = None, points = None):
     else:
         await ctx.send("Unknown action! Use: `list`, `add`, `remove`, or `update`")
 
-@client.command(guild_ids = guilds)
+@client.command()
+@dkp_only()
 @commands.has_any_role("General", "Guardian", "REDALiCE", "Helper")
 async def boss(ctx, bossname, toonlist):
     """attendance command"""
@@ -2652,7 +2796,8 @@ async def boss(ctx, bossname, toonlist):
     logbody = ["boss", str(ctx.author.name), dt.now().strftime("%d/%m/%Y %H:%M:%S"), str([bossname, toonlist])]
     bot3ws11.append_row(logbody)
     
-@client.command(guild_ids = guilds)
+@client.command()
+@dkp_only()
 @commands.has_any_role("General", "Guardian", "REDALiCE", "Helper")
 async def bosshalf(ctx, bossname, toonlist):
     """attendance command that grants half points for the boss"""
@@ -2779,7 +2924,8 @@ async def bosshalf(ctx, bossname, toonlist):
 
 
 
-@client.command(guild_ids = guilds, aliases=['plb', 'pointsleaderboard', 'pointslb', 'pointlb'])
+@client.command(aliases=['plb', 'pointsleaderboard', 'pointslb', 'pointlb'])
+@dkp_only()
 async def pointleaderboard(ctx, kp, maxkp = 99999, number = 10):
     """displays the leaderboard for current points in a certain KP pool"""
     kp = kp.upper()
@@ -2812,7 +2958,8 @@ async def pointleaderboard(ctx, kp, maxkp = 99999, number = 10):
         await ctx.send(embed=embed)
 
 
-@client.command(guild_ids = guilds, aliases=['plb30', 'pointsleaderboardlast30', 'pointslb30', 'pointlb30'])
+@client.command(aliases=['plb30', 'pointsleaderboardlast30', 'pointslb30', 'pointlb30'])
+@dkp_only()
 async def pointleaderboardlast30(ctx, kp, maxatt = 100, number = 10):
     """darkhealz last 30 command"""
     kp = kp.upper()
@@ -2850,7 +2997,8 @@ async def pointleaderboardlast30(ctx, kp, maxatt = 100, number = 10):
         await ctx.send(embed=embed)
 
 
-@client.command(guild_ids = guilds)
+@client.command()
+@dkp_only()
 @commands.has_any_role("General", "REDALiCE")
 async def mainswap(ctx, oldname, newname):
     """Swaps the main of a player"""
@@ -2932,7 +3080,8 @@ async def mainswap(ctx, oldname, newname):
 
     await ctx.send(f"Swapped main from {findoldname} to {findnewname}. {findnewname} now has {oldrbppe} RBPP, {olddpkpe} DPKP, and {oldvkpe} VKP")
 
-@client.command(guild_ids = guilds)
+@client.command()
+@dkp_only()
 @commands.has_any_role("General", "REDALiCE")
 async def newowner(ctx, *charnames):
     """wipes the points on a character by adjusting them to zero, sets all the wins to [OLD] prefix, and sets the main to Blank"""
@@ -3000,7 +3149,8 @@ async def newowner(ctx, *charnames):
             await ctx.send(not_found_message(c, suggestions))
     await ctx.send("Processed the following characters: " + ', '.join(sendlist))
 
-@client.command(guild_ids = guilds, aliases=['cplb', 'classpointsleaderboard', 'classpointslb', 'classpointlb'])
+@client.command(aliases=['cplb', 'classpointsleaderboard', 'classpointslb', 'classpointlb'])
+@dkp_only()
 async def classpointleaderboard(ctx, kp, classname, maxkp = 99999, number = 10):
     """displays the leaderboard for current points in a certain KP pool for a certain class"""
     kp = kp.upper()
@@ -3039,7 +3189,8 @@ async def classpointleaderboard(ctx, kp, classname, maxkp = 99999, number = 10):
         await ctx.send(embed=embed)
 
 
-@client.command(guild_ids = guilds, aliases=['elb', 'earnedpointsleaderboard', 'earnedpointslb', 'earnedpointlb'])
+@client.command(aliases=['elb', 'earnedpointsleaderboard', 'earnedpointslb', 'earnedpointlb'])
+@dkp_only()
 async def earnedleaderboard(ctx, kp, number = 10):
     """displays the leaderboard for total points earned in a certain KP pool"""
     kp = kp.upper()
@@ -3067,7 +3218,8 @@ async def earnedleaderboard(ctx, kp, number = 10):
     if total > 0:
         await ctx.send(embed=embed)
 
-@client.command(guild_ids = guilds, aliases=["generate"])
+@client.command(aliases=["generate"])
+@dkp_only()
 async def gen(ctx):
     """Generates boss and bosshalf commands based on the channel content before the gen command"""
     channel = ctx.channel
@@ -3159,7 +3311,8 @@ async def gen(ctx):
         await ctx.send("Could not find the following names: " + ', '.join(missingnames))
 
 
-@client.command(guild_ids = guilds)
+@client.command()
+@dkp_only()
 async def dg(ctx):
     """displays the currently eligible players for dg armour"""
     print("[DG] Starting DG eligibility check")
@@ -3434,7 +3587,8 @@ async def dg(ctx):
     await ctx.send(embed=embed)
     print("[DG] DG eligibility check complete")
 
-@client.command(guild_ids = guilds)
+@client.command()
+@dkp_only()
 async def massdeduct(ctx, *message):
     """mass deduct command to be used in conjunction with bidgen. reply to the bidgen message or copy paste it in"""
     if ctx.message.reference is not None:
@@ -3451,7 +3605,8 @@ async def massdeduct(ctx, *message):
             await asyncio.sleep(15)  # Rate limit to 4 calls per minute (60s / 4 = 15s between calls)
     
 
-@client.command(guild_ids = guilds)
+@client.command()
+@dkp_only()
 async def apply(ctx):
     """allows new members to apply for the clan"""
     await ctx.send("Please fill out the application form here: https://forms.gle/zDD3mr56xELXUG4n6")
@@ -3460,7 +3615,8 @@ async def apply(ctx):
     await leaderchannel.send("New application started by " + str(ctx.author.name))
 
 
-@client.command(guild_ids = guilds)
+@client.command()
+@dkp_only()
 async def new(ctx):
     """Displays the help for new players"""
     await ctx.send("""Welcome to Relentless! Please start by sending your toon names and levels to the character-declaration channel, along with which is your main.
@@ -3483,7 +3639,8 @@ RBPP - Relentless Boss Participation Points (earned for attending raids that giv
                    
 send \"$new2\" for the next steps!""")
     
-@client.command(guild_ids = guilds)
+@client.command()
+@dkp_only()
 async def new2(ctx):
     """displays the second set of help for new players"""
     await ctx.send("""You are setup and ready to start earning some points! Your Recruitment period will be 1 month, and you are required to get 50 RBPP (attendance points) through this period to be promoted. 
@@ -3494,7 +3651,8 @@ Once you read this, you may have some questions! Feel free to ask for clarificat
                    
 As this is a lot of information to take in, please allow yourself to review this content over the course of a few days. And of course if you have any further questions please reach out to a fellow clannie or a leader. The Winston bot is also a valuable resource created by REDALiCE (and largely plagiarised from Magister22's bot Magi Jr), you can type “$information” and get a wide assortment of answers. Once you finish and fully understand the rules, please type $new3.""")
     
-@client.command(guild_ids = guilds)
+@client.command()
+@dkp_only()
 async def new3(ctx):
     """displays the third set of help for new players"""
     await ctx.send("""So you are now setup to earn points and know the rules. You are ready to start grinding points. It is important to note, each toon is considered its separate toon. It earns its own points, and spends its own points. You are allowed to transfer points from one toon to another only up to 4 hours after the attend has been posted in KP chat. After that you can no longer transfer those points.
@@ -3506,14 +3664,16 @@ CAMPING! Camping is the easiest way to earn points! If you are camping a raid wh
 Congratulations you have completed the Relentless Orientation. Again, if you have any questions at all please reach out to a fellow clannie or leader and we will be happy to help you out. You can type “$leadership” for a list of the current leaders. We strive to see everyone succeed and thrive here in Relentless, Have Fun!""")
     
 
-@client.command(guild_ids = guilds)
+@client.command()
+@dkp_only()
 async def clanrules(ctx):
     """Displays the clan rules"""
     await ctx.send("""Here is the link to the Relentless Clan rules:
 https://docs.google.com/document/d/1WT0nh2NzUh2XQpnODY3zPMe_35KwQImsznA7dXqGxds/mobilebasic""")
 
 
-@client.command(guild_ids = guilds)
+@client.command()
+@dkp_only()
 async def kpinfo(ctx):
     """Displays the KP information"""
     await ctx.send("""Here is the breakdown of the KP pools:
@@ -3531,7 +3691,8 @@ RBPP (attendance points); earned from all bosses listed above except Weekly boss
 RBPP only used to keep track of attendance and activity, not used to bid on items""")
     
 
-@client.command(guild_ids = guilds)
+@client.command()
+@dkp_only()
 async def dinoreq(ctx):
     """Displays the Dino requirements"""
     await ctx.send("""Dino Requirements:
@@ -3541,7 +3702,8 @@ Dino Requirement Update:
 
 All Dino’s starting from December 22nd 2021 will now require every class to have Dino Ready gear + Skills to participate for points and raid. You will also be required to know Dino mechanics. IF you have no idea what this boss does but reach all requirements you will still not be eligible for points.""")
     
-@client.command(guild_ids = guilds)
+@client.command()
+@dkp_only()
 async def dinoclassreq(ctx, cclass):
     """Displays the Dino class requirements"""
     cclass = cclass.lower()
@@ -3578,7 +3740,8 @@ Mages: Bloodthorn or Dino Amulet - Bloodthorn Charm - 42 Points in freeze - Abil
 *Mages will now be required to Time dino heal, and added a sub category for troll freezing where they are required to have a freeze skull to freeze.""")
     
 
-@client.command(guild_ids = guilds)
+@client.command()
+@dkp_only()
 async def dinoweps(ctx):
     await ctx.send("""Dino Weapons:
 *Dino Weapon Rule Change Rev. 3.0*
@@ -3593,7 +3756,8 @@ async def dinoweps(ctx):
 🗡Daggers:
 - if you win a Dino dagger, you must refund your Gele dagger(s) and can’t win future Gele dags""")
     
-@client.command(guild_ids = guilds)
+@client.command()
+@dkp_only()
 async def leadership(ctx):
     """Displays the current leadership"""
     await ctx.send("""07/05/2024 - Leadership
@@ -3630,7 +3794,8 @@ REDALiCE:
 Discord ID: @yukarip3""")
                    
 
-@client.command(guild_ids = guilds)
+@client.command()
+@dkp_only()
 async def itemlimit(ctx):
     """Displays the current item limits"""
     await ctx.send("""Item Limitations:
@@ -3641,14 +3806,16 @@ Bloodthorn Bands:It’s now Alt toons of a different class are allowed 3 bloodle
 You are only able to earn bands on 3 toons. With main toons able to win up to 4 bands and alts toons winning a maximum of 3 bands. 
 Main change: if your main currently has 4 bands and you change your main to another account one band is required to be refunded""")
 
-@client.command(guild_ids = guilds)
+@client.command()
+@dkp_only()
 async def multibidding(ctx):
     """Displays the rules for bidding on multiple items"""
     await ctx.send("""When bidding on items where there are multiple of the specific item available a note will be created and bidding will occurs for these items though a single note.This applies for AKP/PKP/GKP/DPKP  (Closed) Bidding. In the comments of the note state how many of the item you are interested in then send your bids ingame to "mcbidders" stating Bid #1 and Bid#2 on the same mail with the subject as the item name (since you are not able to win more than 2 items per KP above base per week).
 common misconceptions are that you are able to select and bid on Item #1, Item #2, Item #3, etc… which is incorrect, you are placing one or two separate bids against all items available, the top X (amount of items available) bids win the items.""")
     
 
-@client.command(guild_ids = guilds)
+@client.command()
+@dkp_only()
 async def altbidding(ctx):
     """Displays the rules for bidding on items for alts"""
     await ctx.send("""Alt Bidding:
@@ -3658,13 +3825,15 @@ Any bidding that is made using a toons OWN earned points (Alt or Main) takes pri
 What if someone else is interested in the same item that I had bid on using “alt bid”? if the other person interested had done an “Alt Bid” you may continue to “Alt bid” back and forth until the bidding is over.
 If the other person interested places a bid using a toons OWN points (alt or main) this will cancel ALL previously made “Alt bids” made from all who had bid using this method.""")
 
-@client.command(guild_ids = guilds)
+@client.command()
+@dkp_only()
 async def minimumbids(ctx):
     """Displays the minimum bids for each item type"""
     await ctx.send("""Minimum Bids:""")
     await ctx.send("https://imgur.com/WDQUBaW")
 
-@client.command(guild_ids = guilds)
+@client.command()
+@dkp_only()
 async def bidtemplate(ctx):
     """Displays the bidding template"""
     await ctx.send("""Bidding Template:
@@ -3678,7 +3847,8 @@ This item is being purchased for (insert cost of item) (insert KP type) minimum 
 Mail in your bid to McBidders with your name and the name of the item you are bidding on within the next 13 hours.  
 Bidder: (insert your character name)""")
 
-@client.command(guild_ids = guilds)
+@client.command()
+@dkp_only()
 async def refundsinfo(ctx):
     """Displays the refund policy"""
     await ctx.send("""*rule clarification*
@@ -3696,13 +3866,15 @@ Because Dino refunds are the hardest to track, we will refund the chronological 
 Example: If you built your own imperial brace, but also won an imperial brace, we will refund the points spent on the one that you did not build.""")
     
 
-@client.command(guild_ids = guilds)
+@client.command()
+@dkp_only()
 async def halfpoints(ctx):
     """Displays the half points policy"""
     await ctx.send("""Are you multi-loging at raids? If you log two accounts for raids you will be able to receive full points for both accounts! If you are capable and decide to log a 3rd account one if those accounts will get half points and the other two will get full points!
 Bonus: on resets you can get half points for a 4th account!""")
     
-@client.command(guild_ids = guilds)
+@client.command()
+@dkp_only()
 async def mainprio(ctx):
     """Displays the main priority information"""
     await ctx.send("""Main Priority gives those with a main toon of the desired drop to have priority over inactive/alternate toons.
@@ -3719,7 +3891,8 @@ Mid Game Priority Raids: This encompasses UNOX, HRUNG, MORD, and NECRO. This mea
 Specific Requirements for BT Helms and Dino Weapons:
 The requirements for BT Helms and Dino Weapons have been adjusted to align with the End Game Priority Raids. Additionally, a minimum RBPP of 250 is now necessary to bid on these items.""")
 
-@client.command(guild_ids = guilds)
+@client.command()
+@dkp_only()
 async def questupgrades(ctx):
     """Displays the quest upgrade information"""
     await ctx.send("""Warden, Meteoric, Frozen, DL armor are available upon request. Weapons for Warden, Meteoric, and Frozen are also provided, these are available to Recruits upon request from clan Guardians.
@@ -3740,29 +3913,34 @@ Exception to Doch voting, when leaders seem fit and all leaders agree, there is 
 Echos and Seeds, weeklies are scheduled by leaders at a clannies request, reach out to any guardian to schedule a weekly to get 7 echos to upgrade your EDL OH to T8, reminder weeklies award GKP so help out your fellow clannies. Once you reach a T8 OH reach out to a General to receive 2 Bloodthorn seeds, to upgrade your offhand to T10.""")
 
 
-@client.command(guild_ids = guilds)
+@client.command()
+@dkp_only()
 async def esttime(ctx):
     """Displays the EST time"""
     await ctx.send("""Curious on the current EST time? Click this link to find out : https://time.is/ET/
 A lot of the clan is US based and EST is the most common timezone used to time raids and events.
 If you are using the discord timer bot, the time is automatically converted to your local timezone""")
 
-@client.command(guild_ids = guilds)
+@client.command()
+@dkp_only()
 async def spawntimes(ctx):
     """Displays the spawn times for various bosses"""
     await ctx.send("type \"refresh\" in #dead-timers to get the latest spawn times")
 
-@client.command(guild_ids = guilds)
+@client.command()
+@dkp_only()
 async def spreadsheet(ctx):
     """Links Winston's master point spreadsheet"""
     await ctx.send("https://docs.google.com/spreadsheets/d/1Izu2wSmi0aEQCWTvfLAXX0ucXR2223ILzFxTiQXcl80/edit#gid=393681553")
 
-@client.command(guild_ids=guilds)
+@client.command()
+@dkp_only()
 async def oldwins(ctx):
     """Links Alice's old wins spreadsheet"""
     await ctx.send("https://docs.google.com/spreadsheets/d/1FbfNkF9SkD0A8a61ChoKvcG88yC2vpaHL8ffm37TSb8/edit?gid=1217357805#gid=1217357805")
 
-@client.command(guild_ids=guilds, aliases=["oldloot"])
+@client.command(aliases=["oldloot"])
+@dkp_only()
 async def oldwinnings(ctx, name, kp = None):
     """Displays a player's old loot winnings from Alice's spreadsheet"""
     if kp != None:
@@ -3805,13 +3983,15 @@ async def oldwinnings(ctx, name, kp = None):
         embed.add_field(name=str(i + 1) + ". " + item, value=price + " " + pool + " (" + date + ")", inline=False)
     await ctx.send(embed=embed)
 
-@client.command(guild_ids = guilds)
+@client.command()
+@dkp_only()
 async def kpsite(ctx):
     """Links the KP site"""
     await ctx.send("http://www.relentless.dkpsystem.com/news.php")
 
 
-@client.command(guild_ids = guilds)
+@client.command()
+@dkp_only()
 async def information(ctx):
     """Displays the information dump commands"""
     await ctx.send("""to get started, type one of these commands:
@@ -3836,29 +4016,35 @@ $mainprio - displays information about main priority
 $questupgrades - displays information about acquiring various quest items
 $esttime - displays info about EST time
 $spawntimes - tells you where to find the spawn times
-$kpsite - links the KP site""")
+$kpsite - links the KP site
+$lbhelp - boss leaderboard commands (also available in other servers)""")
     
-@client.command(guild_ids = guilds)
+@client.command()
+@dkp_only()
 async def ban(ctx, name):
     """Bans a player"""
     await ctx.send(name + " has been banned")
 
-@client.command(guild_ids = guilds)
+@client.command()
+@dkp_only()
 async def kick(ctx, name):
     """Kicks a player"""
     await ctx.send(name + " has been kicked")
 
-@client.command(guild_ids = guilds)
+@client.command()
+@dkp_only()
 async def demote(ctx, name):
     """Demotes a player"""
     await ctx.send(name + " has been demoted")
 
-@client.command(guild_ids = guilds)
+@client.command()
+@dkp_only()
 async def promote(ctx, name):
     """Promotes a player"""
     await ctx.send(name + " has been promoted")
 
-@client.command(guild_ids = guilds)
+@client.command()
+@dkp_only()
 async def sudo(ctx):
     """pretends to break"""
     await ctx.send("Logging in as Super Admin")
@@ -3868,27 +4054,32 @@ async def sudo(ctx):
         await asyncio.sleep(5)
         await ctx.send("Error: you're a silly goose")
 
-@client.command(guild_ids = guilds)
+@client.command()
+@dkp_only()
 async def unban(ctx, name):
     """Unbans a player"""
     await ctx.send(name + " has been unbanned")
 
-@client.command(guild_ids = guilds)
+@client.command()
+@dkp_only()
 async def delete(ctx, *args):
     """Deletes something"""
     await ctx.send("Deleting " + " ".join(args))
 
-@client.command(guild_ids = guilds)
+@client.command()
+@dkp_only()
 async def source(ctx):
     """posts the link for the source code"""
     await ctx.send("https://github.com/Haylia/Gwydion-DKP-bot")
 
-@client.command(guild_ids = guilds)
+@client.command()
+@dkp_only()
 async def donate(ctx):
     """posts the link for donations"""
     await ctx.send("https://www.paypal.me/liastarrrr")
 
-@client.command(guild_ids = guilds)
+@client.command()
+@dkp_only()
 @commands.has_any_role("General", "REDALiCE")
 async def reload(ctx):
     """Force-refresh all worksheet caches (use after manual sheet edits)"""
@@ -3910,7 +4101,6 @@ import json
 import textwrap
 from PIL import ImageDraw, ImageFont  # PIL.Image already imported above
 
-BOSS_WORLD_ID = 15
 BOSS_CHAR_ID = "123456"
 BOSS_RANKING_URL = "https://production.ch.decagames.com/gamestats_global/BossRanking.ashx"
 
@@ -3947,8 +4137,38 @@ _BOSS_DIR = os.path.dirname(os.path.abspath(__file__))
 POSTED_FIGHTS_FILE = os.path.join(_BOSS_DIR, "posted_fights.json")
 RAID_HISTORY_FILE = os.path.join(_BOSS_DIR, "raid_history.json")
 
-# Discord channel ID for auto-posted raid charts.
-BOSS_AUTO_POST_CHANNEL_ID = 1232432110699282493
+# ─── Multi-server config ──────────────────────────────────────────────────
+# The bot was originally Gwydion-only. These constants encode the canonical
+# Gwydion defaults; every other server provides its own values via
+# server_config.json (see load_server_config / set_server_entry below).
+# (GWYDION_GUILD_IDS and is_gwydion_guild are defined much earlier in the file
+# because they're needed by @dkp_only at import time.)
+GWYDION_WORLD_ID = 15
+GWYDION_AUTO_POST_CHANNEL_ID = 1232432110699282493
+SERVER_CONFIG_FILE = os.path.join(_BOSS_DIR, "server_config.json")
+SERVER_CONFIG_VERSION = 1
+
+# Celtic Heroes world name → world_id. Matched case-insensitively, ignoring
+# spaces/apostrophes (so "Crom's" and "crom" both work). Used by $setworld so
+# admins can type a name instead of an ID.
+# Source: https://production.ch.decagames.com/patchserver/worldlist.aspx
+CH_WORLDS = {
+    "arawn":     7,
+    "crom":      8,
+    "danu":      9,
+    "morrigan":  10,
+    "mabon":     11,
+    "sulis":     12,
+    "epona":     13,
+    "rosmerta":  14,
+    "gwydion":   15,
+    "fingal":    53,
+    "nuada":     56,
+    "tethra":    101,
+    "rigantona": 102,
+    "llyr":      103,
+    "belenor":   104,
+}
 
 # UTC-anchored fire times. Bot is hosted on non-local servers, so this
 # MUST be UTC (== GMT) — not local time.
@@ -3989,6 +4209,163 @@ for _start, _end in BOSS_EXCLUDED_DATE_RANGES:
         ))
     except Exception:
         pass
+
+
+# ─── World-name helpers ───────────────────────────────────────────────────
+
+def normalize_world_name(s):
+    """Lowercases and strips non-alphanumeric chars so 'Crom's' and 'crom' both match."""
+    if not s:
+        return ""
+    return "".join(c for c in str(s).lower() if c.isalnum())
+
+
+def resolve_world(token):
+    """Accepts an int-as-string OR a Celtic Heroes world name (e.g. 'gwydion').
+    Returns (world_id, canonical_name_or_None) or (None, None) on failure.
+    canonical_name is the CH_WORLDS key when matched by name; None for raw ints
+    (the caller can render `f"World {world_id}"` instead)."""
+    if token is None:
+        return None, None
+    raw = str(token).strip()
+    if not raw:
+        return None, None
+    if raw.lstrip("-").isdigit():
+        try:
+            return int(raw), None
+        except Exception:
+            return None, None
+    key = normalize_world_name(raw)
+    if key in CH_WORLDS:
+        return CH_WORLDS[key], key
+    return None, None
+
+
+def display_world(world_id):
+    """Returns the canonical CH_WORLDS name (capitalised) if known, else 'World {id}'.
+    Used for chart titles, embed headers, and confirmation messages."""
+    try:
+        wid = int(world_id)
+    except Exception:
+        return f"World {world_id}"
+    for name, mapped_id in CH_WORLDS.items():
+        if mapped_id == wid:
+            return name.capitalize()
+    return f"World {wid}"
+
+
+# ─── server_config.json I/O ───────────────────────────────────────────────
+# Per-Discord-guild configuration: which CH world the guild tracks, where to
+# auto-post boss kills, and an optional setup role. Stored as a JSON dict
+# keyed by Discord guild_id (as a string). The "_meta" key holds schema metadata
+# and is never treated as a guild entry by the lookup helpers.
+
+def load_server_config():
+    """Returns the full server_config.json contents, or a freshly seeded dict if
+    the file doesn't exist or is unreadable. Always contains a '_meta' key."""
+    default = {"_meta": {"version": SERVER_CONFIG_VERSION}}
+    if not os.path.exists(SERVER_CONFIG_FILE):
+        return default
+    try:
+        with open(SERVER_CONFIG_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            return default
+        data.setdefault("_meta", {"version": SERVER_CONFIG_VERSION})
+        return data
+    except Exception:
+        logger.exception("Could not read server_config.json; using defaults")
+        return default
+
+
+def save_server_config(cfg):
+    """Atomic write (tmp file + os.replace). Mirrors save_posted_fights."""
+    if not isinstance(cfg, dict):
+        raise ValueError("server config must be a dict")
+    cfg.setdefault("_meta", {"version": SERVER_CONFIG_VERSION})
+    tmp = SERVER_CONFIG_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(cfg, f, indent=2)
+    os.replace(tmp, SERVER_CONFIG_FILE)
+
+
+def get_server_entry(guild_id):
+    """Returns the per-guild config entry, or None if not configured. Ignores '_meta'."""
+    if guild_id is None:
+        return None
+    cfg = load_server_config()
+    return cfg.get(str(int(guild_id)))
+
+
+def set_server_entry(guild_id, *, world_id=None, channel_id=None, setup_role=None):
+    """Upserts a guild's entry. None args preserve existing values. Stamps
+    added_at on first creation. Returns the merged entry."""
+    if guild_id is None:
+        raise ValueError("guild_id is required")
+    cfg = load_server_config()
+    key = str(int(guild_id))
+    entry = dict(cfg.get(key) or {})
+    is_new = not entry
+    if world_id is not None:
+        entry["world_id"] = int(world_id)
+    if channel_id is not None:
+        entry["channel_id"] = int(channel_id) if channel_id else None
+    if setup_role is not None:
+        # Empty string clears the role
+        entry["setup_role"] = setup_role if setup_role else None
+    if is_new:
+        entry["added_at"] = dt.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    cfg[key] = entry
+    save_server_config(cfg)
+    return entry
+
+
+def remove_server_entry(guild_id):
+    """Deletes a guild's entry. Returns True if it existed."""
+    if guild_id is None:
+        return False
+    cfg = load_server_config()
+    key = str(int(guild_id))
+    if key in cfg:
+        del cfg[key]
+        save_server_config(cfg)
+        return True
+    return False
+
+
+def get_world_id_for_guild(guild_id):
+    """Returns the configured world_id for guild_id, or None if unset."""
+    entry = get_server_entry(guild_id)
+    if not entry:
+        return None
+    wid = entry.get("world_id")
+    return int(wid) if wid is not None else None
+
+
+def get_channel_id_for_guild(guild_id):
+    """Returns the configured auto-post channel_id, or None if unset."""
+    entry = get_server_entry(guild_id)
+    if not entry:
+        return None
+    cid = entry.get("channel_id")
+    return int(cid) if cid else None
+
+
+def get_all_configured_guilds():
+    """Returns [(guild_id, entry), ...] for every guild with a valid world_id.
+    Used by the auto-poller to iterate every server that should be checked."""
+    cfg = load_server_config()
+    out = []
+    for key, entry in cfg.items():
+        if key == "_meta" or not isinstance(entry, dict):
+            continue
+        try:
+            gid = int(key)
+        except Exception:
+            continue
+        if entry.get("world_id"):
+            out.append((gid, entry))
+    return out
 
 
 def _boss_parse_kill_date(date_text):
@@ -4071,14 +4448,85 @@ def parse_boss_input(boss_text):
         return None
 
 
+# ─── Multi-server gating helpers ──────────────────────────────────────────
+
+def _member_has_role_named(member, role_name):
+    """Case-insensitive role-name check that survives missing attrs."""
+    if member is None or not role_name:
+        return False
+    target = str(role_name).lower().strip()
+    try:
+        for r in getattr(member, "roles", []) or []:
+            if str(getattr(r, "name", "")).lower() == target:
+                return True
+    except Exception:
+        pass
+    return False
+
+
+def is_server_setup_authorized(member, entry):
+    """True if `member` may run setup / admin commands for their guild.
+    Authorized if ANY of:
+      - member has Discord administrator permission
+      - member has a role named 'Winston Admin' (case-insensitive)
+      - member has a role named 'REDALiCE' (case-insensitive)
+      - entry has setup_role set AND member has that role
+    """
+    if member is None:
+        return False
+    try:
+        if getattr(member.guild_permissions, "administrator", False):
+            return True
+    except Exception:
+        pass
+    if _member_has_role_named(member, "Winston Admin"):
+        return True
+    if _member_has_role_named(member, "REDALiCE"):
+        return True
+    if entry and entry.get("setup_role"):
+        if _member_has_role_named(member, entry["setup_role"]):
+            return True
+    return False
+
+
+async def _require_world_for_ctx(ctx):
+    """Resolves the Celtic Heroes world_id for the guild running this command,
+    or sends an error message and returns None.
+
+    - DMs are rejected.
+    - Gwydion guilds always resolve to GWYDION_WORLD_ID (no config required).
+    - Other guilds need a server_config.json entry; if missing, the user is
+      prompted to run $setworld."""
+    guild = getattr(ctx, "guild", None)
+    if guild is None:
+        await ctx.send("This command can't be used in DMs.")
+        return None
+    gid = guild.id
+    if is_gwydion_guild(gid):
+        return GWYDION_WORLD_ID
+    wid = get_world_id_for_guild(gid)
+    if wid is None:
+        await ctx.send(
+            "This server hasn't been configured for the boss leaderboard yet. "
+            "An admin needs to run `$setworld <world_id_or_name>` first "
+            "(e.g. `$setworld gwydion` or `$setworld 15`). "
+            "Try `$lbhelp` for the full list of leaderboard commands, or "
+            "`$listworlds` for known world names."
+        )
+        return None
+    return wid
+
+
 # ─── BossRanking API ──────────────────────────────────────────────────────
 
-def boss_get_fight_data(fight_id):
+def boss_get_fight_data(fight_id, world_id=None):
+    if world_id is None:
+        world_id = GWYDION_WORLD_ID
     url = (
         f"{BOSS_RANKING_URL}?board=fight"
         f"&fightid={fight_id}"
-        f"&worldid={BOSS_WORLD_ID}"
-        f"&playerWorldId={BOSS_WORLD_ID}"
+        f"&worldid={int(world_id)}"
+        f"&playerWorldId={int(world_id)}"
         f"&charId={BOSS_CHAR_ID}"
         "&sortCol=1&sortDir=0&page=1&numRecs=1"
     )
@@ -4087,14 +4535,17 @@ def boss_get_fight_data(fight_id):
     return resp.json()
 
 
-def boss_get_detailed_fights(num_recs=500, page=1, exclude_dates=True):
-    """Fetches detailed fight list filtered to World 15. By default drops fights
-    whose DateOfKill falls inside any BOSS_EXCLUDED_DATE_RANGES entry.
-    Pass exclude_dates=False to bypass the filter (used when looking up a
-    specific FightId regardless of date)."""
+def boss_get_detailed_fights(num_recs=500, page=1, exclude_dates=True, world_id=None):
+    """Fetches detailed fight list filtered to `world_id` (default: Gwydion).
+    By default drops fights whose DateOfKill falls inside any
+    BOSS_EXCLUDED_DATE_RANGES entry. Pass exclude_dates=False to bypass the
+    filter (used when looking up a specific FightId regardless of date)."""
+    if world_id is None:
+        world_id = GWYDION_WORLD_ID
+    wid = int(world_id)
     url = (
         f"{BOSS_RANKING_URL}?board=detailed"
-        f"&playerWorldId={BOSS_WORLD_ID}"
+        f"&playerWorldId={wid}"
         f"&charId={BOSS_CHAR_ID}"
         f"&sortCol=1&sortDir=0&page={page}&numRecs={num_recs}"
     )
@@ -4102,25 +4553,25 @@ def boss_get_detailed_fights(num_recs=500, page=1, exclude_dates=True):
     resp.raise_for_status()
     data = resp.json()
     fights = data.get("Data", []) if isinstance(data, dict) else data
-    fights = [f for f in fights if int(f.get("WorldId", 0)) == BOSS_WORLD_ID]
+    fights = [f for f in fights if int(f.get("WorldId", 0)) == wid]
     if exclude_dates:
         fights = [f for f in fights if not _boss_is_excluded_date(f.get("DateOfKill", ""))]
     return fights
 
 
-def boss_get_latest_fight_id():
-    fights = boss_get_detailed_fights(num_recs=500, page=1)
+def boss_get_latest_fight_id(world_id=None):
+    fights = boss_get_detailed_fights(num_recs=500, page=1, world_id=world_id)
     if not fights:
         return None
     newest = max(fights, key=lambda f: int(f.get("FightId", 0)))
     return int(newest.get("FightId"))
 
 
-def boss_get_latest_boss_fight_id(boss_text):
+def boss_get_latest_boss_fight_id(boss_text, world_id=None):
     boss_id = parse_boss_input(boss_text)
     if not boss_id:
         return None, None
-    fights = boss_get_detailed_fights(num_recs=500, page=1)
+    fights = boss_get_detailed_fights(num_recs=500, page=1, world_id=world_id)
     boss_fights = [f for f in fights if int(f.get("BossId", 0)) == boss_id]
     if not boss_fights:
         return boss_id, None
@@ -4129,50 +4580,208 @@ def boss_get_latest_boss_fight_id(boss_text):
 
 
 # ─── State persistence ────────────────────────────────────────────────────
+# Schema v1: flat list/dict, world 15 implicit.
+# Schema v2: world-keyed dict with a "_meta" key.
+#   posted_fights.json: {"_meta": {"version": 2}, "15": [fid, ...], "27": [...]}
+#   raid_history.json:  {"_meta": {"version": 2}, "15": {fid_str: rec, ...}, ...}
+# _migrate_state_files_if_needed() runs on boot and wraps any old-format file
+# under key "15" (GWYDION_WORLD_ID). Idempotent.
 
-def load_posted_fights():
+STATE_FILE_VERSION = 2
+
+
+def _migrate_state_files_if_needed():
+    """One-time migration from flat (v1) to world-keyed (v2) state files.
+    Detects the old schema by absence of '_meta'. Creates a
+    `.pre_migration_backup` next to each migrated file. Safe to call on every boot."""
+
+    # ---- posted_fights.json ----
+    if os.path.exists(POSTED_FIGHTS_FILE):
+        try:
+            with open(POSTED_FIGHTS_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception:
+            data = None
+        if isinstance(data, list):
+            # Old format: flat list of ints. Wrap under "15".
+            try:
+                with open(POSTED_FIGHTS_FILE + ".pre_migration_backup", "w", encoding="utf-8") as f:
+                    json.dump(data, f, indent=2)
+            except Exception:
+                logger.exception("Could not write posted_fights.json backup")
+            new_data = {
+                "_meta": {"version": STATE_FILE_VERSION},
+                str(GWYDION_WORLD_ID): sorted(int(x) for x in data),
+            }
+            tmp = POSTED_FIGHTS_FILE + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(new_data, f, indent=2)
+            os.replace(tmp, POSTED_FIGHTS_FILE)
+            logger.info(
+                f"Migrated posted_fights.json ({len(data)} fights → world {GWYDION_WORLD_ID})"
+            )
+
+    # ---- raid_history.json ----
+    if os.path.exists(RAID_HISTORY_FILE):
+        try:
+            with open(RAID_HISTORY_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception:
+            data = None
+        if isinstance(data, dict) and "_meta" not in data:
+            # Old format: flat dict of {fight_id_str: record}. Records have FightId.
+            looks_old = any(
+                isinstance(v, dict) and "FightId" in v for v in data.values()
+            ) if data else False
+            if looks_old:
+                try:
+                    with open(RAID_HISTORY_FILE + ".pre_migration_backup", "w", encoding="utf-8") as f:
+                        json.dump(data, f, indent=2)
+                except Exception:
+                    logger.exception("Could not write raid_history.json backup")
+                new_data = {
+                    "_meta": {"version": STATE_FILE_VERSION},
+                    str(GWYDION_WORLD_ID): data,
+                }
+                tmp = RAID_HISTORY_FILE + ".tmp"
+                with open(tmp, "w", encoding="utf-8") as f:
+                    json.dump(new_data, f, indent=2)
+                os.replace(tmp, RAID_HISTORY_FILE)
+                logger.info(
+                    f"Migrated raid_history.json ({len(data)} records → world {GWYDION_WORLD_ID})"
+                )
+
+
+def _world_keys_in_posted_file():
+    """Returns the set of world-ID ints present as keys in posted_fights.json
+    (excluding '_meta'). Used at boot to know whether seeding is needed."""
     if not os.path.exists(POSTED_FIGHTS_FILE):
         return set()
     try:
         with open(POSTED_FIGHTS_FILE, "r", encoding="utf-8") as f:
-            return set(int(x) for x in json.load(f))
+            data = json.load(f)
     except Exception:
         return set()
+    if not isinstance(data, dict):
+        return set()
+    keys = set()
+    for k in data.keys():
+        if k == "_meta":
+            continue
+        try:
+            keys.add(int(k))
+        except Exception:
+            continue
+    return keys
 
 
-def save_posted_fights(posted):
-    # Atomic write: tmp file + os.replace so a crash mid-write can't corrupt the
-    # canonical file. os.replace is atomic on the same filesystem on Windows/POSIX.
+def load_posted_fights(world_id=None):
+    """Returns the set of posted fight IDs for `world_id`. Defaults to Gwydion.
+    Returns an empty set if the file is missing or the world has no key yet."""
+    if world_id is None:
+        world_id = GWYDION_WORLD_ID
+    if not os.path.exists(POSTED_FIGHTS_FILE):
+        return set()
+    try:
+        with open(POSTED_FIGHTS_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        return set()
+    # v2 dict-keyed format
+    if isinstance(data, dict):
+        return set(int(x) for x in data.get(str(int(world_id)), []))
+    # v1 fallback (in case migration didn't run for some reason): only the
+    # Gwydion world reads from a flat list.
+    if isinstance(data, list) and int(world_id) == GWYDION_WORLD_ID:
+        return set(int(x) for x in data)
+    return set()
+
+
+def save_posted_fights(posted, world_id=None):
+    """Writes the set of posted fight IDs for `world_id`, preserving other worlds'
+    entries. Atomic write."""
+    if world_id is None:
+        world_id = GWYDION_WORLD_ID
+    if os.path.exists(POSTED_FIGHTS_FILE):
+        try:
+            with open(POSTED_FIGHTS_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if not isinstance(data, dict):
+                data = {"_meta": {"version": STATE_FILE_VERSION}}
+        except Exception:
+            data = {"_meta": {"version": STATE_FILE_VERSION}}
+    else:
+        data = {"_meta": {"version": STATE_FILE_VERSION}}
+    data.setdefault("_meta", {"version": STATE_FILE_VERSION})
+    data[str(int(world_id))] = sorted(int(x) for x in posted)
     tmp = POSTED_FIGHTS_FILE + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(sorted(int(x) for x in posted), f, indent=2)
+        json.dump(data, f, indent=2)
     os.replace(tmp, POSTED_FIGHTS_FILE)
 
 
-def load_raid_history():
+def load_raid_history(world_id=None):
+    """Returns the dict of {fight_id_str: record} for `world_id`. Defaults to Gwydion."""
+    if world_id is None:
+        world_id = GWYDION_WORLD_ID
     if not os.path.exists(RAID_HISTORY_FILE):
         return {}
     try:
         with open(RAID_HISTORY_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
-        return data if isinstance(data, dict) else {}
     except Exception:
         return {}
+    if not isinstance(data, dict):
+        return {}
+    if "_meta" in data:
+        # v2 world-keyed
+        bucket = data.get(str(int(world_id)), {})
+        return bucket if isinstance(bucket, dict) else {}
+    # v1 fallback: flat dict was Gwydion only.
+    if int(world_id) == GWYDION_WORLD_ID:
+        return data
+    return {}
 
 
-def save_raid_history(history):
-    # Atomic write — see save_posted_fights for rationale. With ~20 players per
-    # fight × N fights this can be a multi-KB write, so corruption risk on crash
-    # is real if we wrote in place.
+def save_raid_history(history, world_id=None):
+    """Writes the dict for `world_id`, preserving other worlds' entries.
+    Atomic write — see save_posted_fights for rationale."""
+    if world_id is None:
+        world_id = GWYDION_WORLD_ID
+    if os.path.exists(RAID_HISTORY_FILE):
+        try:
+            with open(RAID_HISTORY_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if not isinstance(data, dict) or "_meta" not in data:
+                # Either v1 flat (which migration should have already converted)
+                # or unexpected shape — start a fresh v2 wrapper to be safe.
+                data = {"_meta": {"version": STATE_FILE_VERSION}}
+        except Exception:
+            data = {"_meta": {"version": STATE_FILE_VERSION}}
+    else:
+        data = {"_meta": {"version": STATE_FILE_VERSION}}
+    data.setdefault("_meta", {"version": STATE_FILE_VERSION})
+    data[str(int(world_id))] = history
     tmp = RAID_HISTORY_FILE + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(history, f, indent=2)
+        json.dump(data, f, indent=2)
     os.replace(tmp, RAID_HISTORY_FILE)
 
 
 # ─── Traverser data source (chscripts/bossranking_data) ───────────────────
 
-_boss_traverser_cache = {"loaded_at": 0.0, "file_count": -1, "history": {}, "mismatched": 0}
+# Cache keyed by world_id so different worlds don't trash each other's loaded
+# history. Each value: {"loaded_at", "file_count", "history", "mismatched"}.
+_boss_traverser_cache = {}
+
+
+def _boss_traverser_cache_for(world_id):
+    """Returns the (mutable) cache dict for `world_id`, creating it if absent."""
+    bucket = _boss_traverser_cache.get(world_id)
+    if bucket is None:
+        bucket = {"loaded_at": 0.0, "file_count": -1, "history": {}, "mismatched": 0}
+        _boss_traverser_cache[world_id] = bucket
+    return bucket
 
 
 def _boss_traverser_paths():
@@ -4185,42 +4794,47 @@ def _boss_traverser_paths():
     return None, None
 
 
-def boss_load_traverser_history(force=False):
+def boss_load_traverser_history(world_id=None, force=False):
     """Reads the chscripts traverser output (fights_index.json + per-fight JSONs)
-    and returns {fight_id_str: history_record} for Gwydion only. In-memory cached
-    for BOSS_TRAVERSER_CACHE_TTL seconds; invalidates immediately if the on-disk
-    file count changes. Returns {} if the traverser directory is missing."""
+    and returns {fight_id_str: history_record} for `world_id` (default: Gwydion).
+    In-memory cached per-world for BOSS_TRAVERSER_CACHE_TTL seconds; invalidates
+    immediately if the on-disk file count changes. Returns {} if the traverser
+    directory is missing."""
+    if world_id is None:
+        world_id = GWYDION_WORLD_ID
+    world_id = int(world_id)
+    cache = _boss_traverser_cache_for(world_id)
     fights_dir, index_path = _boss_traverser_paths()
     if not fights_dir or not os.path.isdir(fights_dir) or not os.path.exists(index_path):
         return {}
     try:
         current_count = sum(
             1 for f in os.listdir(fights_dir)
-            if f.startswith(f"fight_{BOSS_WORLD_ID}_") and f.endswith(".json")
+            if f.startswith(f"fight_{world_id}_") and f.endswith(".json")
         )
     except Exception:
         current_count = -1
     now = time.time()
-    stale = (now - _boss_traverser_cache["loaded_at"]) >= BOSS_TRAVERSER_CACHE_TTL
-    changed = current_count != _boss_traverser_cache["file_count"]
-    if not force and not stale and not changed and _boss_traverser_cache["history"]:
-        return _boss_traverser_cache["history"]
+    stale = (now - cache["loaded_at"]) >= BOSS_TRAVERSER_CACHE_TTL
+    changed = current_count != cache["file_count"]
+    if not force and not stale and not changed and cache["history"]:
+        return cache["history"]
     try:
         with open(index_path, "r", encoding="utf-8") as f:
             index = json.load(f)
     except Exception:
         logger.exception("Could not read traverser fights_index.json")
-        return _boss_traverser_cache["history"]
+        return cache["history"]
     index_by_id = {}
     for r in index:
         try:
-            if int(r.get("WorldId", 0)) == BOSS_WORLD_ID:
+            if int(r.get("WorldId", 0)) == world_id:
                 index_by_id[int(r["FightId"])] = r
         except Exception:
             continue
     history = {}
     mismatched = 0
-    file_prefix = f"fight_{BOSS_WORLD_ID}_"
+    file_prefix = f"fight_{world_id}_"
     for filename in os.listdir(fights_dir):
         if not filename.startswith(file_prefix) or not filename.endswith(".json"):
             continue
@@ -4300,19 +4914,19 @@ def boss_load_traverser_history(force=False):
             "BossRestoredHealth": int(detail.get("BossRestoredHealth", 0) or 0),
             "Players": players,
         }
-    _boss_traverser_cache["loaded_at"] = now
-    _boss_traverser_cache["file_count"] = current_count
-    _boss_traverser_cache["history"] = history
-    _boss_traverser_cache["mismatched"] = mismatched
+    cache["loaded_at"] = now
+    cache["file_count"] = current_count
+    cache["history"] = history
+    cache["mismatched"] = mismatched
     logger.info(
-        f"Loaded traverser Gwydion history: {len(history)} fights "
+        f"Loaded traverser history for world {world_id}: {len(history)} fights "
         f"({current_count} files on disk, {mismatched} skipped as wrong-world data)"
     )
     return history
 
 
-def get_saved_boss_id_for_fight(fight_id):
-    history = load_raid_history()
+def get_saved_boss_id_for_fight(fight_id, world_id=None):
+    history = load_raid_history(world_id=world_id)
     key = str(int(fight_id))
     if key in history:
         try:
@@ -4324,11 +4938,13 @@ def get_saved_boss_id_for_fight(fight_id):
     return 0
 
 
-def find_detailed_fight_record(fight_id, max_pages=20):
+def find_detailed_fight_record(fight_id, max_pages=20, world_id=None):
     fight_id = int(fight_id)
     for page in range(1, max_pages + 1):
         try:
-            fights = boss_get_detailed_fights(num_recs=500, page=page, exclude_dates=False)
+            fights = boss_get_detailed_fights(
+                num_recs=500, page=page, exclude_dates=False, world_id=world_id
+            )
         except Exception:
             break
         if not fights:
@@ -4342,8 +4958,8 @@ def find_detailed_fight_record(fight_id, max_pages=20):
     return None
 
 
-def get_best_boss_id_for_fight(fight_id, fight_data=None):
-    saved = get_saved_boss_id_for_fight(fight_id)
+def get_best_boss_id_for_fight(fight_id, fight_data=None, world_id=None):
+    saved = get_saved_boss_id_for_fight(fight_id, world_id=world_id)
     if saved:
         return saved
     if fight_data:
@@ -4353,7 +4969,7 @@ def get_best_boss_id_for_fight(fight_id, fight_data=None):
                 return bid
         except Exception:
             pass
-    detailed = find_detailed_fight_record(fight_id, max_pages=20)
+    detailed = find_detailed_fight_record(fight_id, max_pages=20, world_id=world_id)
     if detailed:
         try:
             bid = int(detailed.get("BossId", 0))
@@ -4364,10 +4980,10 @@ def get_best_boss_id_for_fight(fight_id, fight_data=None):
     return 0
 
 
-def _boss_fight_to_history_record(fight_id, detailed_fight, fight_data):
+def _boss_fight_to_history_record(fight_id, detailed_fight, fight_data, world_id=None):
     boss_id = int(detailed_fight.get("BossId", fight_data.get("BossId", 0)))
     if boss_id not in BOSS_NAMES:
-        saved = get_saved_boss_id_for_fight(fight_id)
+        saved = get_saved_boss_id_for_fight(fight_id, world_id=world_id)
         if saved:
             boss_id = saved
     duration = int(fight_data.get("FightDurationSeconds", 0))
@@ -4398,36 +5014,48 @@ def _boss_fight_to_history_record(fight_id, detailed_fight, fight_data):
     }
 
 
-def add_fight_to_history(fight_id, detailed_fight=None, fight_data=None):
-    history = load_raid_history()
+def add_fight_to_history(fight_id, detailed_fight=None, fight_data=None, world_id=None):
+    history = load_raid_history(world_id=world_id)
     key = str(int(fight_id))
     if key in history:
         return False
     if fight_data is None:
-        fight_data = boss_get_fight_data(fight_id)
+        fight_data = boss_get_fight_data(fight_id, world_id=world_id)
     if detailed_fight is None:
-        detailed_fight = find_detailed_fight_record(fight_id, max_pages=20) or {}
-    history[key] = _boss_fight_to_history_record(fight_id, detailed_fight, fight_data)
-    save_raid_history(history)
+        detailed_fight = find_detailed_fight_record(fight_id, max_pages=20, world_id=world_id) or {}
+    history[key] = _boss_fight_to_history_record(fight_id, detailed_fight, fight_data, world_id=world_id)
+    save_raid_history(history, world_id=world_id)
     return True
 
 
-def initialize_posted_fights_if_needed():
-    if os.path.exists(POSTED_FIGHTS_FILE):
+def initialize_posted_fights_if_needed(world_id=None):
+    """Seeds posted_fights.json for `world_id` from the current API page if that
+    world has no entry yet. Prevents replay of every historical fight when a new
+    world is configured."""
+    if world_id is None:
+        world_id = GWYDION_WORLD_ID
+    world_id = int(world_id)
+    # If this world already has a key in posted_fights, skip seeding.
+    if world_id in _world_keys_in_posted_file():
         return
     try:
-        fights = boss_get_detailed_fights(num_recs=100, page=1)
+        fights = boss_get_detailed_fights(num_recs=100, page=1, world_id=world_id)
     except Exception:
-        logger.exception("Could not seed posted fights from API; writing empty set")
-        save_posted_fights(set())
+        logger.exception(
+            f"Could not seed posted fights from API for world {world_id}; "
+            f"writing empty set"
+        )
+        save_posted_fights(set(), world_id=world_id)
         return
     current = {
         int(f.get("FightId", 0))
         for f in fights
         if int(f.get("BossId", 0)) in CONFIRMED_BOSS_IDS
     }
-    save_posted_fights(current)
-    logger.info(f"Seeded posted_fights.json with {len(current)} existing fight(s)")
+    save_posted_fights(current, world_id=world_id)
+    logger.info(
+        f"Seeded posted_fights.json for world {world_id} with {len(current)} existing fight(s)"
+    )
 
 
 # ─── Roster bridge: Winston schema -> Larry's Pilot/Toon shape ────────────
@@ -4549,24 +5177,35 @@ def _boss_calc_pilot_row_heights(sorted_pilots):
     return heights
 
 
-def create_boss_chart_image(fight_id, data, title):
+def create_boss_chart_image(fight_id, data, title, show_pilots=True):
+    """Renders the damage chart PNG for a fight.
+
+    When `show_pilots` is False, the right-hand Pilot/Toons table is omitted
+    (used for non-Gwydion servers that don't have the Relentless roster sheet).
+    """
     duration = int(data.get("FightDurationSeconds", 0))
     total_damage = int(data.get("TotalDamageDone", 0))
     boss_hp = int(data.get("BossHealth", 0))
     boss_heal = int(data.get("BossRestoredHealth", 0))
     players = data.get("DetailsPerPlayer", [])
     players = sorted(players, key=lambda x: int(x.get("Rank", 999)))
-    sorted_pilots, missing_toons = _boss_build_pilot_totals(players)
+    if show_pilots:
+        sorted_pilots, missing_toons = _boss_build_pilot_totals(players)
+    else:
+        sorted_pilots, missing_toons = [], []
 
-    width = 1900
     left_x, left_w = 25, 1160
     right_x, right_w = 1225, 650
+    if show_pilots:
+        width = 1900
+    else:
+        width = left_x + left_w + 25  # 1210 — just enough for the left table + margin
     top = 30
     row_h = 34
     header_h = 145
-    pilot_row_heights = _boss_calc_pilot_row_heights(sorted_pilots)
+    pilot_row_heights = _boss_calc_pilot_row_heights(sorted_pilots) if show_pilots else []
     left_table_h = row_h * (len(players) + 1)
-    right_table_h = row_h + sum(pilot_row_heights)
+    right_table_h = row_h + sum(pilot_row_heights) if show_pilots else 0
     table_h = max(left_table_h, right_table_h, 8 * row_h)
     height = header_h + table_h + 115
 
@@ -4610,11 +5249,14 @@ def create_boss_chart_image(fight_id, data, title):
     draw.text((left_x + 700, table_y + 8), "DPS", fill=white, font=font_header)
     draw.text((left_x + 810, table_y + 8), "DPS Bar", fill=white, font=font_header)
 
-    draw.rectangle((right_x, table_y, right_x + right_w, table_y + row_h), fill=header_bg)
-    draw.text((right_x + 10, table_y + 8), "Pilot", fill=white, font=font_header)
-    draw.text((right_x + 315, table_y + 8), "Total Damage",
-              fill=white, font=font_header, anchor="ra")
-    draw.text((right_x + 430, table_y + 8), "%", fill=white, font=font_header, anchor="ra")
+    if show_pilots:
+        draw.rectangle((right_x, table_y, right_x + right_w, table_y + row_h), fill=header_bg)
+        draw.text((right_x + 10, table_y + 8), "Pilot", fill=white, font=font_header)
+        draw.text((right_x + 315, table_y + 8), "Total Damage",
+                  fill=white, font=font_header, anchor="ra")
+        draw.text((right_x + 430, table_y + 8), "%", fill=white, font=font_header, anchor="ra")
+        draw.text((right_x + 555, table_y + 8), "Total DPS",
+                  fill=white, font=font_header, anchor="ra")
 
     max_dps = 1
     for p in players:
@@ -4649,38 +5291,43 @@ def create_boss_chart_image(fight_id, data, title):
         draw.rectangle((bar_x, bar_y, bar_x + bar_w, bar_y + bar_h), fill=blue)
         draw.text((bar_x + 8, bar_y + 1), f"{dps:.1f}", fill=white, font=font_small)
 
-    current_y = table_y + row_h
-    for i, (pilot_name, info) in enumerate(sorted_pilots):
-        row_height = pilot_row_heights[i]
-        if i % 2 == 0:
-            draw.rectangle((right_x, current_y, right_x + right_w, current_y + row_height),
-                           fill=(18, 18, 18))
-        dmg = info["Damage"]
-        percent = dmg / total_damage * 100 if total_damage else 0
-        toons = ", ".join(info["Toons"])
-        wrapped_toons = textwrap.wrap(toons, width=42) or [""]
-        draw.text((right_x + 10, current_y + 8),
-                  _boss_trim_text(pilot_name, 24), fill=white, font=font_row)
-        draw.text((right_x + 315, current_y + 8),
-                  f"{dmg:,}", fill=white, font=font_row, anchor="ra")
-        draw.text((right_x + 430, current_y + 8),
-                  f"{percent:.2f}%", fill=white, font=font_row, anchor="ra")
-        toon_y = current_y + 31
-        draw.text((right_x + 10, toon_y), "Toons:", fill=toon_gray, font=font_tiny)
-        for li, toon_line in enumerate(wrapped_toons):
-            draw.text((right_x + 70, toon_y + (li * 19)),
-                      toon_line, fill=toon_gray, font=font_tiny)
-        current_y += row_height
+    if show_pilots:
+        current_y = table_y + row_h
+        for i, (pilot_name, info) in enumerate(sorted_pilots):
+            row_height = pilot_row_heights[i]
+            if i % 2 == 0:
+                draw.rectangle((right_x, current_y, right_x + right_w, current_y + row_height),
+                               fill=(18, 18, 18))
+            dmg = info["Damage"]
+            percent = dmg / total_damage * 100 if total_damage else 0
+            pilot_dps = dmg / duration if duration else 0
+            toons = ", ".join(info["Toons"])
+            wrapped_toons = textwrap.wrap(toons, width=42) or [""]
+            draw.text((right_x + 10, current_y + 8),
+                      _boss_trim_text(pilot_name, 24), fill=white, font=font_row)
+            draw.text((right_x + 315, current_y + 8),
+                      f"{dmg:,}", fill=white, font=font_row, anchor="ra")
+            draw.text((right_x + 430, current_y + 8),
+                      f"{percent:.2f}%", fill=white, font=font_row, anchor="ra")
+            draw.text((right_x + 555, current_y + 8),
+                      f"{pilot_dps:,.1f}", fill=white, font=font_row, anchor="ra")
+            toon_y = current_y + 31
+            draw.text((right_x + 10, toon_y), "Toons:", fill=toon_gray, font=font_tiny)
+            for li, toon_line in enumerate(wrapped_toons):
+                draw.text((right_x + 70, toon_y + (li * 19)),
+                          toon_line, fill=toon_gray, font=font_tiny)
+            current_y += row_height
 
     draw.rectangle((left_x, table_y, left_x + left_w, table_y + left_table_h),
                    outline=line_color, width=2)
-    draw.rectangle((right_x, table_y, right_x + right_w, table_y + right_table_h),
-                   outline=line_color, width=2)
+    if show_pilots:
+        draw.rectangle((right_x, table_y, right_x + right_w, table_y + right_table_h),
+                       outline=line_color, width=2)
 
     footer_y = height - 75
     draw.text((25, footer_y), "Boss Leaderboard chart (via Winston)",
               fill=gray, font=font_small)
-    if missing_toons:
+    if show_pilots and missing_toons:
         missing_text = "Roster missing: " + ", ".join(missing_toons)
         draw.text((25, footer_y + 28), _boss_trim_text(missing_text, 180),
                   fill=orange_warning, font=font_small)
@@ -4692,82 +5339,165 @@ def create_boss_chart_image(fight_id, data, title):
 
 # ─── Auto-poller ──────────────────────────────────────────────────────────
 
-async def boss_perform_auto_check():
-    """Fetches recent fights, posts any not in posted_fights.json, persists state.
-    Returns the count of fights posted this cycle."""
-    posted = load_posted_fights()
-    try:
-        fights = boss_get_detailed_fights(num_recs=100, page=1)
-    except Exception:
-        logger.exception("Boss auto-check API failed")
-        return 0
-    known = [f for f in fights if int(f.get("BossId", 0)) in CONFIRMED_BOSS_IDS]
-    new_fights = [f for f in known if int(f.get("FightId", 0)) not in posted]
-    if not new_fights:
-        return 0
-    new_fights = sorted(new_fights, key=lambda f: int(f.get("FightId", 0)))
-    if not BOSS_AUTO_POST_CHANNEL_ID:
-        logger.warning("BOSS_AUTO_POST_CHANNEL_ID is 0; configure it to enable auto-post")
-        return 0
-    channel = client.get_channel(BOSS_AUTO_POST_CHANNEL_ID)
-    if channel is None:
-        logger.warning(f"Boss auto-post channel {BOSS_AUTO_POST_CHANNEL_ID} not found")
-        return 0
-    posted_count = 0
-    for fight in new_fights:
-        fight_id = int(fight.get("FightId", 0))
+# Prevents overlap between the scheduled tick and a manual $bosspollnow.
+_boss_poll_lock = asyncio.Lock()
+
+
+def _collect_auto_post_targets():
+    """Returns {world_id: [(guild_id, channel_id, show_pilots), ...]}.
+
+    Sources:
+    - Every entry in server_config.json that has a valid world_id and channel_id.
+    - The primary Gwydion guild (using GWYDION_AUTO_POST_CHANNEL_ID) is seeded
+      implicitly so the legacy auto-post target keeps firing without the four
+      Relentless guilds having to run $setworld/$setchannel manually.
+    """
+    targets = {}
+    seen_gwydion_primary = False
+    for gid, entry in get_all_configured_guilds():
         try:
-            data = boss_get_fight_data(fight_id)
-            boss_id = get_best_boss_id_for_fight(fight_id, data)
-            title = f"{boss_display_name(boss_id)} - Damage Chart"
-            image_path = create_boss_chart_image(fight_id, data, title)
-            add_fight_to_history(fight_id, fight_data=data)
-            await channel.send(
-                f"New **{boss_display_name(boss_id)}** raid detected. Fight ID: **{fight_id}**"
-            )
-            chart_msg = await channel.send(file=discord.File(image_path))
-            try:
-                os.remove(image_path)
-            except Exception:
-                pass
-            # Create a discussion thread on the chart and ping the "LB damage" role.
-            # Role lookup is case-insensitive against the channel's guild. If the
-            # role is missing the message still sends as plain text — no ping.
-            try:
-                thread = await chart_msg.create_thread(
-                    name=f"{boss_display_name(boss_id)} - Fight {fight_id}",
-                    auto_archive_duration=1440,  # 24h
-                )
-                lb_role = None
-                if channel.guild:
-                    for r in channel.guild.roles:
-                        if r.name.lower() == "lb damage":
-                            lb_role = r
-                            break
-                mention = lb_role.mention if lb_role else "@LB damage"
-                allowed = (
-                    discord.AllowedMentions(roles=[lb_role])
-                    if lb_role else discord.AllowedMentions.none()
-                )
-                await thread.send(
-                    f"{mention} new **{boss_display_name(boss_id)}** run — Fight "
-                    f"`{fight_id}`.",
-                    allowed_mentions=allowed,
-                )
-            except discord.Forbidden:
-                logger.warning(
-                    "Bot lacks permission to create threads or mention roles in "
-                    f"channel {BOSS_AUTO_POST_CHANNEL_ID}"
-                )
-            except Exception:
-                logger.exception(f"Failed to create thread for fight {fight_id}")
-            posted.add(fight_id)
-            save_posted_fights(posted)
-            posted_count += 1
-            await asyncio.sleep(0.5)
+            wid = int(entry.get("world_id", 0))
         except Exception:
-            logger.exception(f"Failed to post fight {fight_id}")
-    return posted_count
+            continue
+        cid = entry.get("channel_id")
+        if not cid:
+            continue
+        targets.setdefault(wid, []).append((gid, int(cid), is_gwydion_guild(gid)))
+        if wid == GWYDION_WORLD_ID and int(cid) == GWYDION_AUTO_POST_CHANNEL_ID:
+            seen_gwydion_primary = True
+    # Legacy Gwydion fallback: always include the hardcoded channel even if no
+    # entry exists for it yet. Posting goes to that channel directly; we don't
+    # know which of the four Relentless guilds owns it without inspecting it.
+    if not seen_gwydion_primary:
+        # show_pilots=True because this is the canonical Gwydion auto-post.
+        targets.setdefault(GWYDION_WORLD_ID, []).append(
+            (None, GWYDION_AUTO_POST_CHANNEL_ID, True)
+        )
+    return targets
+
+
+async def boss_perform_auto_check():
+    """Iterates every configured guild's world, posts any new fights to that
+    guild's channel, and persists per-world state. Returns total fights posted
+    across all guilds this cycle."""
+    if _boss_poll_lock.locked():
+        logger.info("Boss auto-check skipped — another cycle is already running")
+        return 0
+    async with _boss_poll_lock:
+        targets = _collect_auto_post_targets()
+        if not targets:
+            logger.info("No configured guilds with auto-post channels; nothing to do")
+            return 0
+        total_posted = 0
+        for world_id, guild_channels in targets.items():
+            try:
+                posted = load_posted_fights(world_id=world_id)
+                try:
+                    fights = boss_get_detailed_fights(num_recs=100, page=1, world_id=world_id)
+                except Exception:
+                    logger.exception(f"Boss auto-check API failed for world {world_id}")
+                    continue
+                known = [f for f in fights if int(f.get("BossId", 0)) in CONFIRMED_BOSS_IDS]
+                new_fights = [f for f in known if int(f.get("FightId", 0)) not in posted]
+                if not new_fights:
+                    continue
+                new_fights = sorted(new_fights, key=lambda f: int(f.get("FightId", 0)))
+
+                for fight in new_fights:
+                    fight_id = int(fight.get("FightId", 0))
+                    # Fetch fight detail ONCE per fight, share across all guilds on this world.
+                    try:
+                        data = boss_get_fight_data(fight_id, world_id=world_id)
+                        boss_id = get_best_boss_id_for_fight(fight_id, data, world_id=world_id)
+                        add_fight_to_history(fight_id, fight_data=data, world_id=world_id)
+                    except Exception:
+                        logger.exception(
+                            f"Failed to fetch fight {fight_id} (world {world_id}); skipping"
+                        )
+                        continue
+
+                    for gid, channel_id, show_pilots in guild_channels:
+                        channel = client.get_channel(int(channel_id))
+                        if channel is None:
+                            logger.warning(
+                                f"Auto-post channel {channel_id} not found (guild {gid}, "
+                                f"world {world_id}); skipping"
+                            )
+                            continue
+                        try:
+                            title = f"{boss_display_name(boss_id)} - Damage Chart"
+                            image_path = create_boss_chart_image(
+                                fight_id, data, title, show_pilots=show_pilots
+                            )
+                            await channel.send(
+                                f"New **{boss_display_name(boss_id)}** raid detected. "
+                                f"Fight ID: **{fight_id}**"
+                            )
+                            chart_msg = await channel.send(file=discord.File(image_path))
+                            try:
+                                os.remove(image_path)
+                            except Exception:
+                                pass
+                            # Always open a discussion thread on the chart. The
+                            # "LB damage" role ping is a Relentless convention,
+                            # so only attempt that lookup in Gwydion guilds.
+                            try:
+                                thread = await chart_msg.create_thread(
+                                    name=f"{boss_display_name(boss_id)} - Fight {fight_id}",
+                                    auto_archive_duration=1440,  # 24h
+                                )
+                                is_gw = is_gwydion_guild(gid) or (
+                                    gid is None
+                                    and int(channel_id) == GWYDION_AUTO_POST_CHANNEL_ID
+                                )
+                                if is_gw:
+                                    lb_role = None
+                                    if channel.guild:
+                                        for r in channel.guild.roles:
+                                            if r.name.lower() == "lb damage":
+                                                lb_role = r
+                                                break
+                                    mention = lb_role.mention if lb_role else "@LB damage"
+                                    allowed = (
+                                        discord.AllowedMentions(roles=[lb_role])
+                                        if lb_role else discord.AllowedMentions.none()
+                                    )
+                                    await thread.send(
+                                        f"{mention} new **{boss_display_name(boss_id)}** run — "
+                                        f"Fight `{fight_id}`.",
+                                        allowed_mentions=allowed,
+                                    )
+                                else:
+                                    await thread.send(
+                                        f"New **{boss_display_name(boss_id)}** run — "
+                                        f"Fight `{fight_id}`. Discuss here.",
+                                        allowed_mentions=discord.AllowedMentions.none(),
+                                    )
+                            except discord.Forbidden:
+                                logger.warning(
+                                    "Bot lacks permission to create threads or mention "
+                                    f"roles in channel {channel_id}"
+                                )
+                            except Exception:
+                                logger.exception(
+                                    f"Failed to create thread for fight {fight_id}"
+                                )
+                            total_posted += 1
+                            await asyncio.sleep(0.5)
+                        except Exception:
+                            logger.exception(
+                                f"Failed to post fight {fight_id} to guild {gid} "
+                                f"channel {channel_id}"
+                            )
+
+                    # Mark the fight as posted ONCE per world (regardless of how many
+                    # guilds saw it). Any guild's post failure doesn't replay the
+                    # whole world — prevents storms.
+                    posted.add(fight_id)
+                    save_posted_fights(posted, world_id=world_id)
+            except Exception:
+                logger.exception(f"Boss auto-check iteration failed for world {world_id}")
+        return total_posted
 
 
 @tasks.loop(time=BOSS_POLL_ANCHOR_TIMES)
@@ -4782,13 +5512,13 @@ async def boss_poll_loop():
 
 # ─── Commands ─────────────────────────────────────────────────────────────
 
-def _boss_collect_fights_for_listing():
+def _boss_collect_fights_for_listing(world_id=None):
     """Merges traverser + local raid history + a single live API page (for fights
     newer than what either source has). Returns a list of fight rows sorted by
     FightId DESC. Each row has at least FightId, BossId, DateOfKill. Excluded
     dates are filtered out."""
     by_id = {}
-    for rec in boss_load_traverser_history().values():
+    for rec in boss_load_traverser_history(world_id=world_id).values():
         try:
             fid = int(rec.get("FightId", 0))
         except Exception:
@@ -4800,7 +5530,7 @@ def _boss_collect_fights_for_listing():
             "BossId": int(rec.get("BossId", 0)),
             "DateOfKill": rec.get("DateOfKill", ""),
         }
-    for rec in load_raid_history().values():
+    for rec in load_raid_history(world_id=world_id).values():
         try:
             fid = int(rec.get("FightId", 0))
         except Exception:
@@ -4816,7 +5546,7 @@ def _boss_collect_fights_for_listing():
         }
     # Best-effort: one live API page for ultra-recent fights not yet scraped.
     try:
-        for f in boss_get_detailed_fights(num_recs=500, page=1):
+        for f in boss_get_detailed_fights(num_recs=500, page=1, world_id=world_id):
             try:
                 fid = int(f.get("FightId", 0))
             except Exception:
@@ -4836,13 +5566,14 @@ def _boss_collect_fights_for_listing():
 class FightsPaginator(discord.ui.View):
     """Button-paginated embed view for the $fights command."""
 
-    def __init__(self, fights_list, per_page=20, timeout=300):
+    def __init__(self, fights_list, per_page=20, timeout=300, world_label=None):
         super().__init__(timeout=timeout)
         self.fights = fights_list
         self.per_page = per_page
         self.page = 0
         self.max_page = max(0, (len(fights_list) - 1) // per_page)
         self.message = None
+        self.world_label = world_label or "Gwydion"
         # Build buttons programmatically so callback signatures match across
         # discord.py / py-cord variants.
         self.btn_first = discord.ui.Button(label="⏮ First", style=discord.ButtonStyle.secondary)
@@ -4877,7 +5608,7 @@ class FightsPaginator(discord.ui.View):
         end = start + self.per_page
         page_rows = self.fights[start:end]
         embed = discord.Embed(
-            title=f"Recent Gwydion Fights — Page {self.page + 1}/{self.max_page + 1}",
+            title=f"Recent {self.world_label} Fights — Page {self.page + 1}/{self.max_page + 1}",
             colour=discord.Color.orange(),
         )
         if not page_rows:
@@ -4930,45 +5661,60 @@ class FightsPaginator(discord.ui.View):
                 pass
 
 
-@client.command(guild_ids=guilds, aliases=['fightlist', 'recentfights'])
+@client.command(aliases=['fightlist', 'recentfights'])
 async def fights(ctx, per_page: int = 20):
-    """Lists Gwydion (World 15) fights with button pagination.
-    Optional arg: per-page size (default 20, max 25 — Discord embed field cap)."""
-    per_page = max(1, min(per_page, 25))
-    fights_list = _boss_collect_fights_for_listing()
-    if not fights_list:
-        await ctx.send("No Gwydion fights found in traverser, local history, or live API.")
+    """Lists recent in-game fights for this server's configured Celtic Heroes world,
+    with button pagination. Optional arg: per-page size (default 20, max 25 —
+    Discord embed field cap)."""
+    world_id = await _require_world_for_ctx(ctx)
+    if world_id is None:
         return
-    view = FightsPaginator(fights_list, per_page=per_page, timeout=300)
+    per_page = max(1, min(per_page, 25))
+    fights_list = _boss_collect_fights_for_listing(world_id=world_id)
+    world_label = display_world(world_id)
+    if not fights_list:
+        await ctx.send(
+            f"No {world_label} fights found in traverser, local history, or live API."
+        )
+        return
+    view = FightsPaginator(
+        fights_list, per_page=per_page, timeout=300, world_label=world_label
+    )
     msg = await ctx.send(embed=view.render_embed(), view=view)
     view.message = msg
 
 
-@client.command(guild_ids=guilds, aliases=['damagechart'])
+@client.command(aliases=['damagechart'])
 async def sheet(ctx, *, target: str):
-    """Damage chart for a fight ID, or the latest fight of a named boss alias."""
+    """Damage chart for a fight ID, or the latest fight of a named boss alias.
+    Uses this server's configured Celtic Heroes world (set via `$setworld`)."""
+    world_id = await _require_world_for_ctx(ctx)
+    if world_id is None:
+        return
+    show_pilots = is_gwydion_guild(ctx.guild.id)
+    world_label = display_world(world_id)
     try:
         target_clean = target.strip()
         if target_clean.isdigit():
             fight_id = int(target_clean)
-            data = boss_get_fight_data(fight_id)
-            boss_id = get_best_boss_id_for_fight(fight_id, data)
+            data = boss_get_fight_data(fight_id, world_id=world_id)
+            boss_id = get_best_boss_id_for_fight(fight_id, data, world_id=world_id)
         else:
-            boss_id, fight_id = boss_get_latest_boss_fight_id(target_clean)
+            boss_id, fight_id = boss_get_latest_boss_fight_id(target_clean, world_id=world_id)
             if not boss_id:
                 await ctx.send(f"Unknown boss `{target}`. Try `$bossaliases`.")
                 return
             if not fight_id:
                 await ctx.send(
-                    f"No recent Gwydion fight found for {boss_display_name(boss_id)}."
+                    f"No recent {world_label} fight found for {boss_display_name(boss_id)}."
                 )
                 return
-            data = boss_get_fight_data(fight_id)
+            data = boss_get_fight_data(fight_id, world_id=world_id)
         title = f"{boss_display_name(boss_id)} - Damage Chart"
-        image_path = create_boss_chart_image(fight_id, data, title)
-        add_fight_to_history(fight_id, fight_data=data)
+        image_path = create_boss_chart_image(fight_id, data, title, show_pilots=show_pilots)
+        add_fight_to_history(fight_id, fight_data=data, world_id=world_id)
         await ctx.send(
-            f"Damage chart for fight **{fight_id}**",
+            f"Damage chart for fight **{fight_id}** ({world_label})",
             file=discord.File(image_path),
         )
         try:
@@ -4980,7 +5726,7 @@ async def sheet(ctx, *, target: str):
         await ctx.send(f"Could not generate chart: {e}")
 
 
-@client.command(guild_ids=guilds)
+@client.command()
 async def bossaliases(ctx):
     """Lists the boss alias shortcuts usable with $sheet."""
     lines = ["**Boss Aliases (for `$sheet <alias>`)**", "```"]
@@ -4997,11 +5743,60 @@ async def bossaliases(ctx):
     await ctx.send("\n".join(lines))
 
 
-@client.command(guild_ids=guilds)
+@client.command(aliases=['leaderboardhelp', 'lbh', 'lbinfo'])
+async def lbhelp(ctx):
+    """Help for the in-game boss leaderboard commands available to all servers
+    (set up by an admin via `$setworld` / `$setchannel`)."""
+    lines = [
+        "**Winston Boss Leaderboard — Commands**",
+        "",
+        "*Winston tracks Celtic Heroes boss-kill data per server. Each Discord*",
+        "*server can be configured for one CH world; data and auto-posting are*",
+        "*kept separate per world.*",
+        "",
+        "**Setup (admin / Winston Admin / REDALiCE / configured role):**",
+        "`$setworld <world_id_or_name>` — pick this server's CH world (e.g. `gwydion` or `15`)",
+        "`$setchannel [#channel]` — choose where boss kills are auto-posted",
+        "`$setchanneloff` — disable auto-posting (commands still work)",
+        "`$setsetuprole <role>` — optionally let another role configure the bot",
+        "`$serverinfo` — show this server's current configuration",
+        "`$listworlds` — known Celtic Heroes world names",
+        "`$resetserver` — clear this server's configuration",
+        "",
+        "**Leaderboard queries (everyone):**",
+        "`$fights [per_page]` — paginated list of recent in-game raids",
+        "`$sheet <fight_id_or_boss>` — damage chart for a fight or latest of a boss",
+        "`$bossaliases` — boss-name shortcuts usable with `$sheet`",
+        "`$bosspollstatus` — auto-poller status and posted-fight counts",
+        "`$historyinfo` — saved fight counts per boss",
+        "`$fighthistory [N] <player> <boss>` — last N fights at a boss",
+        "`$bests <boss> [Nd|Nw|Nm|Ny] [unique]` — top damage/DPS at a boss",
+        "",
+        "**Admin (configured setup role):**",
+        "`$bossreloadtraverser` — force-refresh the traverser cache",
+        "`$bossrescrape [year|all]` — repair truncated cached fight JSONs",
+        "`$bosspollnow` — force an immediate auto-check cycle",
+        "",
+        "*DKP, roster, and bidding commands are Gwydion-Relentless-only and won't run elsewhere.*",
+    ]
+    await ctx.send("\n".join(lines))
+
+
+@client.command()
 async def bosspollstatus(ctx):
-    """Shows auto-poller status and next scheduled fire (UTC)."""
-    posted = load_posted_fights()
-    history = load_raid_history()
+    """Shows auto-poller status and next scheduled fire (UTC) for this server."""
+    world_id = await _require_world_for_ctx(ctx)
+    if world_id is None:
+        return
+    world_label = display_world(world_id)
+    posted = load_posted_fights(world_id=world_id)
+    history = load_raid_history(world_id=world_id)
+    entry = get_server_entry(ctx.guild.id)
+    if not entry and is_gwydion_guild(ctx.guild.id):
+        # Synthesize a virtual entry for Gwydion legacy guilds
+        channel_id = GWYDION_AUTO_POST_CHANNEL_ID
+    else:
+        channel_id = (entry or {}).get("channel_id") or 0
     now = dt.now(timezone.utc)
     upcoming = []
     for t in BOSS_POLL_ANCHOR_TIMES:
@@ -5024,18 +5819,20 @@ async def bosspollstatus(ctx):
             f"(traverser may not have finished its first sweep)"
         )
     else:
-        traverser_history = boss_load_traverser_history()
-        traverser_count = _boss_traverser_cache.get("file_count", -1)
-        mismatched = _boss_traverser_cache.get("mismatched", 0)
+        traverser_history = boss_load_traverser_history(world_id=world_id)
+        cache = _boss_traverser_cache.get(int(world_id), {})
+        traverser_count = cache.get("file_count", -1)
+        mismatched = cache.get("mismatched", 0)
         traverser_status = (
-            f"`{len(traverser_history)}` loaded "
+            f"`{len(traverser_history)}` loaded for {world_label} "
             f"(files on disk: `{traverser_count}`, "
             f"skipped as wrong-world: `{mismatched}`, "
             f"path: `{fights_dir}`)"
         )
+    channel_str = f"<#{channel_id}>" if channel_id else "(none — auto-posting disabled)"
     lines = [
-        "**Boss Poll Status**",
-        f"Auto-post channel: `{BOSS_AUTO_POST_CHANNEL_ID}`",
+        f"**Boss Poll Status — {world_label}**",
+        f"Auto-post channel: {channel_str}",
         f"Schedule (UTC): {', '.join(t.strftime('%H:%M') for t in BOSS_POLL_ANCHOR_TIMES)}",
         f"Next fire (UTC): `{next_fire.strftime('%Y-%m-%d %H:%M') if next_fire else 'n/a'}`",
         f"Loop running: `{boss_poll_loop.is_running()}`",
@@ -5047,30 +5844,43 @@ async def bosspollstatus(ctx):
     await ctx.send("\n".join(lines))
 
 
-@client.command(guild_ids=guilds)
-@commands.has_any_role("General", "REDALiCE", "Helper")
+@client.command()
 async def bossreloadtraverser(ctx):
-    """Admin: force-refresh the traverser history cache."""
+    """Admin: force-refresh the traverser history cache for this server's world."""
+    world_id = await _require_world_for_ctx(ctx)
+    if world_id is None:
+        return
+    entry = get_server_entry(ctx.guild.id)
+    if not is_server_setup_authorized(ctx.author, entry):
+        await ctx.send("You don't have permission to run this admin command.")
+        return
     try:
-        history = boss_load_traverser_history(force=True)
+        history = boss_load_traverser_history(world_id=world_id, force=True)
+        cache = _boss_traverser_cache.get(int(world_id), {})
         await ctx.send(
-            f"Reloaded traverser history: **{len(history)}** Gwydion fights "
-            f"({_boss_traverser_cache.get('file_count', -1)} files on disk)."
+            f"Reloaded traverser history: **{len(history)}** {display_world(world_id)} "
+            f"fights ({cache.get('file_count', -1)} files on disk)."
         )
     except Exception as e:
         logger.exception("Manual traverser reload failed")
         await ctx.send(f"Traverser reload failed: {e}")
 
 
-@client.command(guild_ids=guilds)
-@commands.has_any_role("General", "REDALiCE", "Helper")
+@client.command()
 async def bossrescrape(ctx, scope: str = "2026"):
-    """Admin: re-fetch any Gwydion per-fight JSON whose DetailsPerPlayer is
-    suspiciously short vs the index's GroupScale (sign of an API truncation
-    at scrape time). Scope: a year string like '2026', '2025', or 'all'.
-    Default: 2026. Refetches with numRecs=2000 and overwrites the cached
-    file only if the new response has more players. Invalidates Winston's
+    """Admin: re-fetch any per-fight JSON for this server's world whose
+    DetailsPerPlayer is suspiciously short vs the index's GroupScale (sign of
+    an API truncation at scrape time). Scope: a year string like '2026', '2025',
+    or 'all'. Default: 2026. Refetches with numRecs=2000 and overwrites the
+    cached file only if the new response has more players. Invalidates Winston's
     traverser cache when done."""
+    world_id = await _require_world_for_ctx(ctx)
+    if world_id is None:
+        return
+    entry = get_server_entry(ctx.guild.id)
+    if not is_server_setup_authorized(ctx.author, entry):
+        await ctx.send("You don't have permission to run this admin command.")
+        return
     fights_dir, index_path = _boss_traverser_paths()
     if not fights_dir or not os.path.exists(index_path):
         await ctx.send("Traverser data not reachable from this host. See `$bosspollstatus`.")
@@ -5085,14 +5895,14 @@ async def bossrescrape(ctx, scope: str = "2026"):
     suspects = []
     for r in idx:
         try:
-            if int(r.get("WorldId", 0)) != BOSS_WORLD_ID:
+            if int(r.get("WorldId", 0)) != int(world_id):
                 continue
             if year_prefix and not str(r.get("DateOfKill", "")).startswith(year_prefix):
                 continue
             fid = int(r["FightId"])
         except Exception:
             continue
-        fp = os.path.join(fights_dir, f"fight_{BOSS_WORLD_ID}_{fid}.json")
+        fp = os.path.join(fights_dir, f"fight_{int(world_id)}_{fid}.json")
         if not os.path.exists(fp):
             continue
         try:
@@ -5119,12 +5929,15 @@ async def bossrescrape(ctx, scope: str = "2026"):
         if truncated or wrong_world:
             suspects.append((fid, fp, n, gs, int(r.get("TotalDamage", 0) or 0)))
     if not suspects:
-        await ctx.send(f"No truncated or wrong-world fights to repair in scope `{scope}`.")
+        await ctx.send(
+            f"No truncated or wrong-world fights to repair in scope `{scope}` "
+            f"for {display_world(world_id)}."
+        )
         return
     await ctx.send(
-        f"Found **{len(suspects)}** suspect Gwydion fight(s) in scope `{scope}` "
-        f"(truncated or wrong-world data). Refetching with `numRecs=2000`, validating "
-        f"against the index... (~{len(suspects) * 0.3:.0f}s)"
+        f"Found **{len(suspects)}** suspect {display_world(world_id)} fight(s) in scope "
+        f"`{scope}` (truncated or wrong-world data). Refetching with `numRecs=2000`, "
+        f"validating against the index... (~{len(suspects) * 0.3:.0f}s)"
     )
     fixed = 0
     still_wrong = 0
@@ -5132,7 +5945,7 @@ async def bossrescrape(ctx, scope: str = "2026"):
     for fid, fp, old_n, gs, expected_dmg in suspects:
         url = (
             f"{BOSS_RANKING_URL}?board=fight&fightid={fid}"
-            f"&worldid={BOSS_WORLD_ID}&playerWorldId=0&charId=0"
+            f"&worldid={int(world_id)}&playerWorldId=0&charId=0"
             f"&sortCol=1&sortDir=0&page=1&numRecs=2000"
         )
         try:
@@ -5155,25 +5968,30 @@ async def bossrescrape(ctx, scope: str = "2026"):
         os.replace(tmp, fp)
         fixed += 1
         await asyncio.sleep(0.15)
-    _boss_traverser_cache["loaded_at"] = 0.0
-    _boss_traverser_cache["file_count"] = -1
+    # Invalidate this world's cache so the next query reloads.
+    cache = _boss_traverser_cache.get(int(world_id))
+    if cache is not None:
+        cache["loaded_at"] = 0.0
+        cache["file_count"] = -1
     await ctx.send(
-        f"Re-scrape complete (scope `{scope}`).\n"
+        f"Re-scrape complete (scope `{scope}`, {display_world(world_id)}).\n"
         f"Repaired: **{fixed}**, still wrong-world after retry: **{still_wrong}**, "
         f"errors: **{errors}**.\n"
-        f"Winston's traverser cache has been invalidated — next `$statcard`/`$fights` "
-        f"will see the corrected data."
+        f"Cache invalidated — next `$fights`/`$sheet` will see the corrected data."
     )
 
 
-@client.command(guild_ids=guilds)
-@commands.has_any_role("General", "REDALiCE", "Helper")
+@client.command()
 async def bosspollnow(ctx):
-    """Admin: force an immediate boss auto-check cycle."""
-    await ctx.send("Running boss auto-check now...")
+    """Admin: force an immediate boss auto-check cycle across all configured guilds."""
+    entry = get_server_entry(ctx.guild.id) if ctx.guild else None
+    if not is_server_setup_authorized(ctx.author, entry):
+        await ctx.send("You don't have permission to run this admin command.")
+        return
+    await ctx.send("Running boss auto-check now (across all configured guilds)...")
     try:
         count = await boss_perform_auto_check()
-        await ctx.send(f"Auto-check complete. Posted **{count}** new fight(s).")
+        await ctx.send(f"Auto-check complete. Posted **{count}** new fight(s) total.")
     except Exception as e:
         logger.exception("Manual boss auto-check failed")
         await ctx.send(f"Auto-check failed: {e}")
@@ -5405,7 +6223,8 @@ def create_boss_stat_card_image(display_name, mode_text, per_boss, history_count
     return output_path
 
 
-@client.command(guild_ids=guilds, aliases=['playerstats', 'statcards', 'pr'])
+@client.command(aliases=['playerstats', 'statcards', 'pr'])
+@dkp_only()
 async def statcard(ctx, *, args: str):
     """Player stat card: best damage and best DPS per boss from historical data.
 
@@ -5479,21 +6298,28 @@ async def statcard(ctx, *, args: str):
         await ctx.send(f"Could not generate stat card: {e}")
 
 
-def _boss_extract_last_args(args):
+def _boss_extract_last_args(args, roster_keys=None):
     """Parses '$fighthistory' args. Returns (count, boss_id, player_name, leftover).
     Position-independent. First integer in [1, 100] wins as count (default 10).
     Boss alias is required. Player name = whatever remains. Collisions between
-    boss aliases and roster names are resolved in favor of the roster."""
+    boss aliases and roster names are resolved in favor of the roster.
+
+    `roster_keys` is the set of normalized roster names that should be preferred
+    over a boss-alias interpretation (so a player named "Crom" doesn't get parsed
+    as the boss alias). If None (the default), the Gwydion roster is fetched from
+    Google Sheets. Non-Gwydion callers should pass an empty set to skip the
+    roster fetch entirely."""
     parts = args.strip().split()
     count = 10
     count_seen = False
     boss_id = None
-    try:
-        roster_rows = boss_get_pilot_toon_map()
-        roster_keys = {boss_normalize_name(r["Toon Name"]) for r in roster_rows}
-        roster_keys |= {boss_normalize_name(r["Pilot"]) for r in roster_rows}
-    except Exception:
-        roster_keys = set()
+    if roster_keys is None:
+        try:
+            roster_rows = boss_get_pilot_toon_map()
+            roster_keys = {boss_normalize_name(r["Toon Name"]) for r in roster_rows}
+            roster_keys |= {boss_normalize_name(r["Pilot"]) for r in roster_rows}
+        except Exception:
+            roster_keys = set()
     leftover = []
     for token in parts:
         if not count_seen:
@@ -5514,12 +6340,12 @@ def _boss_extract_last_args(args):
     return count, boss_id, " ".join(leftover)
 
 
-def _boss_collect_player_boss_history(toon_keys, boss_id, limit):
+def _boss_collect_player_boss_history(toon_keys, boss_id, limit, world_id=None):
     """Returns a list of run dicts for the player's most recent `limit` fights
     against this boss. Each dict: {FightId, Date, Damage, DPS, Toons, Duration}.
     Sorted newest first by FightId DESC. Excluded dates skipped."""
-    merged = dict(load_raid_history())
-    merged.update(boss_load_traverser_history())
+    merged = dict(load_raid_history(world_id=world_id))
+    merged.update(boss_load_traverser_history(world_id=world_id))
     runs = []
     for rec in merged.values():
         if _boss_is_excluded_date(rec.get("DateOfKill", "")):
@@ -5557,7 +6383,7 @@ def _boss_collect_player_boss_history(toon_keys, boss_id, limit):
     return sorted(runs, key=lambda r: r["FightId"], reverse=True)[:limit]
 
 
-@client.command(guild_ids=guilds, aliases=['lastfights', 'recentfightsfor', 'lh'])
+@client.command(aliases=['lastfights', 'recentfightsfor', 'lh'])
 async def fighthistory(ctx, *, args: str):
     """Last N fights at a specific boss for a player, with damage/DPS summary stats.
 
@@ -5567,9 +6393,18 @@ async def fighthistory(ctx, *, args: str):
       $fighthistory 20 redalice BT             — last 20 Bloodthorn for REDALiCE
       $fighthistory redalice 10 dhiothu        — any order works
 
-    Boss aliases via `$bossaliases`. Toon-name match first, pilot fallback."""
+    Boss aliases via `$bossaliases`. On Gwydion servers the player can be a pilot
+    or toon name (roster-aware). On other servers the name is treated as a literal
+    toon name (face value, no roster lookup)."""
+    world_id = await _require_world_for_ctx(ctx)
+    if world_id is None:
+        return
+    is_gwydion = is_gwydion_guild(ctx.guild.id)
     try:
-        count, boss_id, player_name = _boss_extract_last_args(args)
+        # On non-Gwydion guilds, skip the roster fetch entirely
+        count, boss_id, player_name = _boss_extract_last_args(
+            args, roster_keys=None if is_gwydion else set()
+        )
         if not boss_id:
             await ctx.send(
                 "Usage: `$fighthistory [N] <player> <boss>` — boss alias required. "
@@ -5581,11 +6416,17 @@ async def fighthistory(ctx, *, args: str):
                 "Usage: `$fighthistory [N] <player> <boss>` — player name required."
             )
             return
-        display_name, toon_keys, mode_text = _boss_resolve_pilot_identity(player_name)
-        if not display_name:
-            await ctx.send(mode_text)
-            return
-        runs = _boss_collect_player_boss_history(toon_keys, boss_id, count)
+        if is_gwydion:
+            display_name, toon_keys, mode_text = _boss_resolve_pilot_identity(player_name)
+            if not display_name:
+                await ctx.send(mode_text)
+                return
+        else:
+            # Face-value: the typed name IS the toon. No roster lookup.
+            display_name = player_name.strip()
+            toon_keys = {boss_normalize_name(display_name)}
+            mode_text = "Toon only (face value)"
+        runs = _boss_collect_player_boss_history(toon_keys, boss_id, count, world_id=world_id)
         if not runs:
             await ctx.send(
                 f"No saved fights for `{display_name}` at "
@@ -5670,13 +6511,13 @@ def _boss_extract_bests_args(args):
     return boss_id, window_token, unique, leftover
 
 
-def _boss_collect_top_performances(boss_id, cutoff_date=None, unique_only=False, limit=5):
+def _boss_collect_top_performances(boss_id, cutoff_date=None, unique_only=False, limit=5, world_id=None):
     """Scans traverser + local raid history for the given boss. Returns
     (top_by_damage, top_by_dps) — each a list of up to `limit` performance dicts:
     {Name, Class, Damage, DPS, FightId, Date}. Excluded dates are skipped.
     If unique_only=True, keeps each toon's single best run per metric."""
-    merged = dict(load_raid_history())
-    merged.update(boss_load_traverser_history())
+    merged = dict(load_raid_history(world_id=world_id))
+    merged.update(boss_load_traverser_history(world_id=world_id))
     entries = []
     for rec in merged.values():
         if _boss_is_excluded_date(rec.get("DateOfKill", "")):
@@ -5730,9 +6571,10 @@ def _boss_collect_top_performances(boss_id, cutoff_date=None, unique_only=False,
     return top_dmg, top_dps
 
 
-@client.command(guild_ids=guilds, aliases=['top', 'topperformances', 'leaderboard'])
+@client.command(aliases=['top', 'topperformances', 'leaderboard'])
 async def bests(ctx, *, args: str):
-    """Top performances at a specific boss (top 5 by damage + top 5 by DPS).
+    """Top performances at a specific boss (top 5 by damage + top 5 by DPS) on
+    this server's configured Celtic Heroes world.
 
     Usage:
       $bests <boss>                   — top 5, all time, all entries
@@ -5741,6 +6583,9 @@ async def bests(ctx, *, args: str):
       $bests <boss> 30d unique        — both filters; any order
 
     Window tokens: Nd, Nw, Nm, Ny, all. Boss is required — try `$bossaliases`."""
+    world_id = await _require_world_for_ctx(ctx)
+    if world_id is None:
+        return
     try:
         boss_id, window_token, unique_only, leftover = _boss_extract_bests_args(args)
         if not boss_id:
@@ -5756,7 +6601,8 @@ async def bests(ctx, *, args: str):
             cutoff_date = dt.now(timezone.utc).date() - window_delta
             window_label = f"last {window_token}"
         top_dmg, top_dps = _boss_collect_top_performances(
-            boss_id, cutoff_date=cutoff_date, unique_only=unique_only, limit=5
+            boss_id, cutoff_date=cutoff_date, unique_only=unique_only, limit=5,
+            world_id=world_id,
         )
         if not top_dmg:
             await ctx.send(
@@ -5798,14 +6644,18 @@ async def bests(ctx, *, args: str):
         await ctx.send(f"Could not compute top performances: {e}")
 
 
-@client.command(guild_ids=guilds, aliases=['fighthistoryinfo', 'savedfights'])
+@client.command(aliases=['fighthistoryinfo', 'savedfights'])
 async def historyinfo(ctx):
-    """Shows saved fight counts per boss — total (all worlds) vs Gwydion (World 15)."""
+    """Shows saved fight counts per boss — total (all worlds) vs this world."""
+    world_id = await _require_world_for_ctx(ctx)
+    if world_id is None:
+        return
+    world_label = display_world(world_id)
     fights_dir, index_path = _boss_traverser_paths()
     counts_total = {}
-    counts_gwydion = {}
+    counts_this_world = {}
     grand_total = 0
-    grand_gwydion = 0
+    grand_this_world = 0
 
     if index_path and os.path.exists(index_path):
         try:
@@ -5819,25 +6669,25 @@ async def historyinfo(ctx):
                     continue
                 counts_total[bid] = counts_total.get(bid, 0) + 1
                 grand_total += 1
-                if wid == BOSS_WORLD_ID:
-                    counts_gwydion[bid] = counts_gwydion.get(bid, 0) + 1
-                    grand_gwydion += 1
+                if wid == world_id:
+                    counts_this_world[bid] = counts_this_world.get(bid, 0) + 1
+                    grand_this_world += 1
         except Exception as e:
             await ctx.send(f"Could not read traverser index: {e}")
             return
 
-    local_count = len(load_raid_history())
+    local_count = len(load_raid_history(world_id=world_id))
 
-    gwydion_detail_count = 0
+    this_world_detail_count = 0
     if fights_dir and os.path.isdir(fights_dir):
         try:
-            prefix = f"fight_{BOSS_WORLD_ID}_"
-            gwydion_detail_count = sum(
+            prefix = f"fight_{world_id}_"
+            this_world_detail_count = sum(
                 1 for fn in os.listdir(fights_dir)
                 if fn.startswith(prefix) and fn.endswith(".json")
             )
         except Exception:
-            gwydion_detail_count = -1
+            this_world_detail_count = -1
 
     if not counts_total and local_count == 0:
         await ctx.send(
@@ -5846,35 +6696,233 @@ async def historyinfo(ctx):
         )
         return
 
-    lines = ["**Saved Fight History per Boss**", "```"]
-    lines.append(f"{'Boss':<30} {'Total':>8} {'Gwydion':>8}")
+    col_label = world_label[:8]
+    lines = [f"**Saved Fight History per Boss** ({world_label})", "```"]
+    lines.append(f"{'Boss':<30} {'Total':>8} {col_label:>8}")
     lines.append(f"{'-' * 30} {'-' * 8} {'-' * 8}")
     for bid in sorted(BOSS_NAMES.keys(), key=lambda b: BOSS_NAMES[b]):
         lines.append(
             f"{BOSS_NAMES[bid]:<30} "
-            f"{counts_total.get(bid, 0):>8} {counts_gwydion.get(bid, 0):>8}"
+            f"{counts_total.get(bid, 0):>8} {counts_this_world.get(bid, 0):>8}"
         )
     unknown_total = sum(c for bid, c in counts_total.items() if bid not in BOSS_NAMES)
-    unknown_gwydion = sum(c for bid, c in counts_gwydion.items() if bid not in BOSS_NAMES)
-    if unknown_total or unknown_gwydion:
-        lines.append(f"{'(unknown bosses)':<30} {unknown_total:>8} {unknown_gwydion:>8}")
+    unknown_this_world = sum(c for bid, c in counts_this_world.items() if bid not in BOSS_NAMES)
+    if unknown_total or unknown_this_world:
+        lines.append(f"{'(unknown bosses)':<30} {unknown_total:>8} {unknown_this_world:>8}")
     lines.append(f"{'-' * 30} {'-' * 8} {'-' * 8}")
-    lines.append(f"{'TOTAL':<30} {grand_total:>8} {grand_gwydion:>8}")
+    lines.append(f"{'TOTAL':<30} {grand_total:>8} {grand_this_world:>8}")
     lines.append("```")
 
     footer_bits = [
-        f"Gwydion detail JSONs on disk: **{gwydion_detail_count}**",
-        f"Local raid_history.json cache: **{local_count}**",
+        f"{world_label} detail JSONs on disk: **{this_world_detail_count}**",
+        f"Local raid_history.json cache for {world_label}: **{local_count}**",
     ]
     lines.append(" • ".join(footer_bits))
 
     if not counts_total:
         lines.append(
-            "\n*Note: traverser index unavailable — Total/Gwydion columns are 0. "
+            f"\n*Note: traverser index unavailable — Total/{col_label} columns are 0. "
             "See `$bosspollstatus` for the diagnostic.*"
         )
 
     await ctx.send("\n".join(lines))
+
+
+# ─── Per-server setup commands ────────────────────────────────────────────
+# These commands have NO guild_ids restriction so they work in any server the
+# bot is invited to. Each gates with is_server_setup_authorized so only admins
+# or the configured setup_role can change settings.
+
+@client.command(aliases=['setceltichero', 'setworldid', 'setceltherosserver'])
+async def setworld(ctx, *, world_token: str = None):
+    """Configure this Discord server to track a Celtic Heroes world for the boss
+    leaderboard. Accepts either a numeric world ID or a known world name.
+
+    Examples:
+        $setworld 15
+        $setworld gwydion
+        $setworld Epona
+
+    Run `$listworlds` to see which names are recognised. Requires Discord
+    administrator OR a 'Winston Admin' / 'REDALiCE' role OR (if previously set)
+    this server's configured setup_role."""
+    if ctx.guild is None:
+        await ctx.send("This command can't be used in DMs.")
+        return
+    if world_token is None or not str(world_token).strip():
+        await ctx.send("Usage: `$setworld <world_id_or_name>` — e.g. `$setworld 15` or `$setworld gwydion`.")
+        return
+    entry = get_server_entry(ctx.guild.id)
+    if not is_server_setup_authorized(ctx.author, entry):
+        await ctx.send("You don't have permission to configure this server.")
+        return
+    wid, canon = resolve_world(world_token)
+    if wid is None or wid <= 0:
+        known = ", ".join(sorted(CH_WORLDS.keys())) or "(none seeded yet)"
+        await ctx.send(
+            f"Couldn't resolve `{world_token}` to a world. Pass a positive integer "
+            f"or one of the known names: {known}. Run `$listworlds` for the full list."
+        )
+        return
+    set_server_entry(ctx.guild.id, world_id=wid)
+    try:
+        initialize_posted_fights_if_needed(world_id=wid)
+    except Exception:
+        logger.exception(f"Could not seed posted_fights for world {wid}")
+    display = display_world(wid)
+    await ctx.send(
+        f"Server configured for **{display}** (world `{wid}`). "
+        f"Use `$setchannel #channel` to enable auto-posting of boss kills, or "
+        f"`$lbhelp` to see available commands."
+    )
+
+
+@client.command(aliases=['setbosschannel', 'setautopost', 'setleaderboardchannel'])
+async def setchannel(ctx, channel: discord.TextChannel = None):
+    """Set the channel where boss-kill damage charts are auto-posted.
+    With no argument, defaults to the channel where this command was run.
+    Use `$setchanneloff` to disable auto-posting."""
+    if ctx.guild is None:
+        await ctx.send("This command can't be used in DMs.")
+        return
+    entry = get_server_entry(ctx.guild.id)
+    if not is_server_setup_authorized(ctx.author, entry):
+        await ctx.send("You don't have permission to configure this server.")
+        return
+    if not entry or not entry.get("world_id"):
+        if is_gwydion_guild(ctx.guild.id):
+            # Gwydion guilds always implicitly have world 15; allow setchannel
+            # to seed an entry on their behalf.
+            entry = set_server_entry(ctx.guild.id, world_id=GWYDION_WORLD_ID)
+        else:
+            await ctx.send("Configure a world first with `$setworld <world_id_or_name>`.")
+            return
+    if channel is None:
+        channel = ctx.channel
+    set_server_entry(ctx.guild.id, channel_id=channel.id)
+    await ctx.send(f"Auto-post channel set to {channel.mention}.")
+
+
+@client.command(aliases=['unsetchannel', 'disableautopost'])
+async def setchanneloff(ctx):
+    """Disable boss-kill auto-posting in this server (clears the channel)."""
+    if ctx.guild is None:
+        await ctx.send("This command can't be used in DMs.")
+        return
+    entry = get_server_entry(ctx.guild.id)
+    if not is_server_setup_authorized(ctx.author, entry):
+        await ctx.send("You don't have permission to configure this server.")
+        return
+    if not entry:
+        await ctx.send("This server has no leaderboard configuration to update.")
+        return
+    set_server_entry(ctx.guild.id, channel_id=0)
+    await ctx.send("Auto-posting disabled. Query commands still work; "
+                   "run `$setchannel #channel` to re-enable auto-posts.")
+
+
+@client.command(aliases=['setadminrole', 'setbotrole'])
+async def setsetuprole(ctx, *, role_name: str = None):
+    """Set the role name allowed to run setup/admin commands for this server's
+    leaderboard. Pass no argument or `off` to clear. Discord admins, 'Winston Admin',
+    and 'REDALiCE' always retain access regardless of this setting."""
+    if ctx.guild is None:
+        await ctx.send("This command can't be used in DMs.")
+        return
+    entry = get_server_entry(ctx.guild.id)
+    if not is_server_setup_authorized(ctx.author, entry):
+        await ctx.send("You don't have permission to configure this server.")
+        return
+    if not entry:
+        await ctx.send("Configure a world first with `$setworld <world_id_or_name>`.")
+        return
+    clean = (role_name or "").strip()
+    if not clean or clean.lower() == "off":
+        set_server_entry(ctx.guild.id, setup_role="")
+        await ctx.send("Setup role cleared. Only Discord admins / Winston Admin / REDALiCE can configure now.")
+        return
+    set_server_entry(ctx.guild.id, setup_role=clean)
+    await ctx.send(f"Setup role set to `{clean}`. Members with that role can now configure the leaderboard.")
+
+
+@client.command(aliases=['leaderboardconfig', 'lbconfig'])
+async def serverinfo(ctx):
+    """Shows this server's leaderboard configuration."""
+    if ctx.guild is None:
+        await ctx.send("This command can't be used in DMs.")
+        return
+    entry = get_server_entry(ctx.guild.id)
+    # Synthesize a virtual entry for Gwydion guilds even before $setworld runs
+    if not entry and is_gwydion_guild(ctx.guild.id):
+        entry = {
+            "world_id": GWYDION_WORLD_ID,
+            "channel_id": GWYDION_AUTO_POST_CHANNEL_ID,
+            "setup_role": None,
+            "added_at": "(default — Gwydion legacy guild)",
+        }
+    if not entry:
+        await ctx.send(
+            "This server has no leaderboard configuration yet. "
+            "An admin can run `$setworld <world_id_or_name>` to set it up. "
+            "Run `$lbhelp` to see all available leaderboard commands, or "
+            "`$listworlds` for known world names."
+        )
+        return
+    wid = entry.get("world_id")
+    cid = entry.get("channel_id")
+    role = entry.get("setup_role") or "(none — only Discord admins / Winston Admin / REDALiCE)"
+    channel_str = f"<#{cid}>" if cid else "(none — auto-posting disabled)"
+    posted_count = len(load_posted_fights(wid)) if wid else 0
+    history_count = len(load_raid_history(wid)) if wid else 0
+    lines = [
+        f"**Leaderboard Configuration for {ctx.guild.name}**",
+        f"World: **{display_world(wid)}** (id `{wid}`)",
+        f"Auto-post channel: {channel_str}",
+        f"Setup role: `{role}`",
+        f"Posted fights tracked: `{posted_count}`",
+        f"Local raid records: `{history_count}`",
+    ]
+    await ctx.send("\n".join(lines))
+
+
+@client.command(aliases=['worldlist', 'worlds'])
+async def listworlds(ctx):
+    """Lists known Celtic Heroes world names recognised by `$setworld`."""
+    if not CH_WORLDS:
+        await ctx.send(
+            "No world names are seeded yet — `$setworld` only accepts numeric IDs. "
+            "Bot owner can add entries to CH_WORLDS in the source."
+        )
+        return
+    lines = ["**Known Celtic Heroes world names** (use with `$setworld`):", "```"]
+    pad = max(len(name) for name in CH_WORLDS) + 2
+    for name in sorted(CH_WORLDS):
+        lines.append(f"{name.ljust(pad)} {CH_WORLDS[name]}")
+    lines.append("```")
+    lines.append("Names are case-insensitive and spaces/apostrophes are ignored.")
+    lines.append("Numeric IDs also work: `$setworld 15`.")
+    await ctx.send("\n".join(lines))
+
+
+@client.command(aliases=['clearserver', 'forgetserver'])
+async def resetserver(ctx):
+    """Clear this server's leaderboard configuration. Does NOT delete the world's
+    shared posted_fights / raid_history data — those may be in use by other guilds
+    on the same world."""
+    if ctx.guild is None:
+        await ctx.send("This command can't be used in DMs.")
+        return
+    entry = get_server_entry(ctx.guild.id)
+    if not is_server_setup_authorized(ctx.author, entry):
+        await ctx.send("You don't have permission to configure this server.")
+        return
+    if remove_server_entry(ctx.guild.id):
+        await ctx.send(
+            "Server configuration cleared. Auto-posting stopped. Query commands "
+            "will prompt for `$setworld` again."
+        )
+    else:
+        await ctx.send("No configuration to clear.")
 
 
 print("Starting bot")
