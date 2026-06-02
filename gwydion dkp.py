@@ -35,110 +35,87 @@ intents = discord.Intents.all()
 client = commands.Bot(command_prefix = '$', intents = intents, case_insensitive = True)
 pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
 
-# google account 1: general kp use (lia-paranoid)
-googleacc1 = gspread.service_account(filename = "paranoid-kp-bot-43a1e7152411.json") # replace with the service account for the bot in googles apis (https://docs.gspread.org/en/latest/oauth2.html)
-bot1sheet = googleacc1.open_by_url("https://docs.google.com/spreadsheets/d/1Izu2wSmi0aEQCWTvfLAXX0ucXR2223ILzFxTiQXcl80/edit#gid=0")
-bot1ws1 = bot1sheet.get_worksheet(0)
-bot1ws2 = bot1sheet.get_worksheet(1) 
-bot1ws3 = bot1sheet.get_worksheet(2) 
-bot1ws4 = bot1sheet.get_worksheet(3) 
-bot1ws5 = bot1sheet.get_worksheet(4) 
-bot1ws6 = bot1sheet.get_worksheet(5)
-bot1ws7 = bot1sheet.get_worksheet(6)
-bot1ws8 = bot1sheet.get_worksheet(7)
-bot1ws9 = bot1sheet.get_worksheet(8)
-bot1ws10 = bot1sheet.get_worksheet(9)
-bot1ws11 = bot1sheet.get_worksheet(10)
-print("accessing the spreadsheet for account 1")
-
-# google account 2: rbpp (lia-bkp-bot)
-googleacc2 = gspread.service_account(filename = "paranoid-kp-bot-513a901effbc.json") # replace with the service account for the bot in googles apis (https://docs.gspread.org/en/latest/oauth2.html)
-bot2sheet = googleacc2.open_by_url("https://docs.google.com/spreadsheets/d/1Izu2wSmi0aEQCWTvfLAXX0ucXR2223ILzFxTiQXcl80/edit#gid=0")
-bot2ws1 = bot2sheet.get_worksheet(0) 
-bot2ws2 = bot2sheet.get_worksheet(1) 
-bot2ws3 = bot2sheet.get_worksheet(2) 
-bot2ws4 = bot2sheet.get_worksheet(3)
-bot2ws5 = bot2sheet.get_worksheet(4)
-bot2ws6 = bot2sheet.get_worksheet(5)
-bot2ws7 = bot2sheet.get_worksheet(6)
-bot2ws8 = bot2sheet.get_worksheet(7)
-bot2ws9 = bot2sheet.get_worksheet(8)
-bot2ws10 = bot2sheet.get_worksheet(9)
-bot2ws11 = bot2sheet.get_worksheet(10)
-print("accessing the spreadsheet for account 2")
-
-# google account 3: loot and logging (lia-dkp-bot)
-googleacc3 = gspread.service_account(filename = "paranoid-kp-bot-29090cc5a87a.json") # replace with the service account for the bot in googles apis (https://docs.gspread.org/en/latest/oauth2.html)
-bot3sheet = googleacc3.open_by_url("https://docs.google.com/spreadsheets/d/1Izu2wSmi0aEQCWTvfLAXX0ucXR2223ILzFxTiQXcl80/edit#gid=0")
-bot3ws1 = bot3sheet.get_worksheet(0) 
-bot3ws2 = bot3sheet.get_worksheet(1)  
-bot3ws3 = bot3sheet.get_worksheet(2) 
-bot3ws4 = bot3sheet.get_worksheet(3)
-bot3ws5 = bot3sheet.get_worksheet(4)
-bot3ws6 = bot3sheet.get_worksheet(5)
-bot3ws7 = bot3sheet.get_worksheet(6)
-bot3ws8 = bot3sheet.get_worksheet(7)
-bot3ws9 = bot3sheet.get_worksheet(8)
-bot3ws10 = bot3sheet.get_worksheet(9)
-bot3ws11 = bot3sheet.get_worksheet(10)
-bot3sheet2 = googleacc3.open_by_url("https://docs.google.com/spreadsheets/d/1GFWWkCs5jJNbgt8b_rizyOv8qIGdKh4550B5EaDtM_k/edit#gid=0")
-bot3ws12 = bot3sheet2.get_worksheet(0) # bid tracking
-bot3ws13 = bot3sheet2.get_worksheet(1) # player tracking
-print("accessing the spreadsheet for account 3")
-
-# google account 4: clan member reads (lia-leaderboard-bot)
-googleacc4 = gspread.service_account(filename = "paranoid-kp-bot-b724a91cd608.json") # replace with the service account for the bot in googles apis (https://docs.gspread.org/en/latest/oauth2.html)
-bot4sheet = googleacc4.open_by_url("https://docs.google.com/spreadsheets/d/1Izu2wSmi0aEQCWTvfLAXX0ucXR2223ILzFxTiQXcl80/edit#gid=0")
-bot4ws1 = bot4sheet.get_worksheet(0) 
-bot4ws2 = bot4sheet.get_worksheet(1) 
-bot4ws3 = bot4sheet.get_worksheet(2) 
-bot4ws4 = bot4sheet.get_worksheet(3) 
-bot4ws5 = bot4sheet.get_worksheet(4) 
-bot4ws6 = bot4sheet.get_worksheet(5) 
-bot4ws7 = bot4sheet.get_worksheet(6) 
-bot4ws8 = bot4sheet.get_worksheet(7) 
-bot4ws9 = bot4sheet.get_worksheet(8) 
-bot4ws10 = bot4sheet.get_worksheet(9) 
-bot4ws11 = bot4sheet.get_worksheet(10) 
-bot4sheet2 = googleacc4.open_by_url("https://docs.google.com/spreadsheets/d/1EjAlbyeN5RnddzXNtP0X3-agTN7v4levuqoEGPujiEI/edit?gid=286347323#gid=286347323")
-bot4ws12 = bot4sheet2.get_worksheet(0)
-bot4ws13 = bot4sheet2.get_worksheet(1)
-bot4sheet3 = googleacc4.open_by_url("https://docs.google.com/spreadsheets/d/1FbfNkF9SkD0A8a61ChoKvcG88yC2vpaHL8ffm37TSb8/edit#gid=0")
-bot4ws14 = bot4sheet3.get_worksheet(0)  # old wins "All" sheet
-print("accessing the spreadsheet for account 4")
-
-# google account 5: admin use (lia-reaping-bot)
-googleacc5 = gspread.service_account(filename = "paranoid-kp-bot-410d8c0e26d1.json") # replace with the service account for the bot in googles apis (https://docs.gspread.org/en/latest/oauth2.html)
-bot5sheet = googleacc5.open_by_url("https://docs.google.com/spreadsheets/d/1Izu2wSmi0aEQCWTvfLAXX0ucXR2223ILzFxTiQXcl80/edit#gid=0")
-bot5ws1 = bot5sheet.get_worksheet(0) 
-bot5ws2 = bot5sheet.get_worksheet(1) 
-bot5ws3 = bot5sheet.get_worksheet(2) 
-bot5ws4 = bot5sheet.get_worksheet(3) 
-bot5ws5 = bot5sheet.get_worksheet(4)
-bot5ws6 = bot5sheet.get_worksheet(5)
-bot5ws7 = bot5sheet.get_worksheet(6)
-bot5ws8 = bot5sheet.get_worksheet(7)
-bot5ws9 = bot5sheet.get_worksheet(8)
-bot5ws10 = bot5sheet.get_worksheet(9)
-bot5ws11 = bot5sheet.get_worksheet(10)
-bot5ws12 = bot5sheet.get_worksheet(11) 
-bot5ws13 = bot5sheet.get_worksheet(12)
-print("accessing the spreadsheet for account 5")
-
-# Rate-limit fallback: all 5 accounts share the same spreadsheet (indices 0-10).
-# When one account hits a 429, automatically retry with a different account.
+# ─── Service-account spreadsheet access (opened concurrently) ──────────────
+# Five independent service accounts (each its own creds + gspread Client) share
+# the master spreadsheet; accounts 3 and 4 also open secondary sheets. gspread
+# is blocking, so we open every account on its own thread — the dozen-odd HTTP
+# round-trips happen concurrently instead of serially. Within an account we pull
+# every tab in ONE metadata call via .worksheets() instead of one
+# get_worksheet(i) per tab (each of which re-fetches the whole sheet's metadata).
+from concurrent.futures import ThreadPoolExecutor
 from gspread.exceptions import APIError
 
-# Pool of worksheets per sheet index (same data, different service accounts)
+_MAIN_SHEET = "https://docs.google.com/spreadsheets/d/1Izu2wSmi0aEQCWTvfLAXX0ucXR2223ILzFxTiQXcl80/edit#gid=0"
+
+# (creds filename, [spreadsheet urls]) per account, in account order 1..5.
+_ACCOUNT_SPECS = [
+    ("paranoid-kp-bot-43a1e7152411.json", [_MAIN_SHEET]),  # 1 general kp use (lia-paranoid)
+    ("paranoid-kp-bot-513a901effbc.json", [_MAIN_SHEET]),  # 2 rbpp (lia-bkp-bot)
+    ("paranoid-kp-bot-29090cc5a87a.json", [                # 3 loot and logging (lia-dkp-bot)
+        _MAIN_SHEET,
+        "https://docs.google.com/spreadsheets/d/1GFWWkCs5jJNbgt8b_rizyOv8qIGdKh4550B5EaDtM_k/edit#gid=0",
+    ]),
+    ("paranoid-kp-bot-b724a91cd608.json", [                # 4 clan member reads (lia-leaderboard-bot)
+        _MAIN_SHEET,
+        "https://docs.google.com/spreadsheets/d/1EjAlbyeN5RnddzXNtP0X3-agTN7v4levuqoEGPujiEI/edit?gid=286347323#gid=286347323",
+        "https://docs.google.com/spreadsheets/d/1FbfNkF9SkD0A8a61ChoKvcG88yC2vpaHL8ffm37TSb8/edit#gid=0",
+    ]),
+    ("paranoid-kp-bot-410d8c0e26d1.json", [_MAIN_SHEET]),  # 5 admin use (lia-reaping-bot)
+]
+
+def _open_account(spec):
+    """Authenticate one service account and open its spreadsheet(s), pulling every
+    worksheet per sheet in a single metadata call. Runs in its own thread.
+    Returns (client, [(spreadsheet, [worksheet, ...]), ...])."""
+    filename, urls = spec
+    gc = gspread.service_account(filename=filename)
+    opened = []
+    for url in urls:
+        sh = gc.open_by_url(url)
+        opened.append((sh, sh.worksheets()))
+    return gc, opened
+
+print("opening service-account spreadsheets in parallel...")
+with ThreadPoolExecutor(max_workers=len(_ACCOUNT_SPECS)) as _pool:
+    # map() preserves input order and re-raises any worker exception here, so a
+    # bad creds file / unshared sheet still aborts startup with a clear trace.
+    _accounts = list(_pool.map(_open_account, _ACCOUNT_SPECS))
+for _n in range(len(_accounts)):
+    print("accessing the spreadsheet for account " + str(_n + 1))
+
+# Bind clients, spreadsheets and worksheet handles to the names the rest of the
+# file expects. worksheets()[i] is the same tab get_worksheet(i) returned.
+googleacc1, _open1 = _accounts[0]
+googleacc2, _open2 = _accounts[1]
+googleacc3, _open3 = _accounts[2]
+googleacc4, _open4 = _accounts[3]
+googleacc5, _open5 = _accounts[4]
+
+bot1sheet, _ws1 = _open1[0]
+bot2sheet, _ws2 = _open2[0]
+bot3sheet, _ws3 = _open3[0]
+bot3sheet2, _ws3b = _open3[1]
+bot4sheet, _ws4 = _open4[0]
+bot4sheet2, _ws4b = _open4[1]
+bot4sheet3, _ws4c = _open4[2]
+bot5sheet, _ws5 = _open5[0]
+
+bot1ws1, bot1ws2, bot1ws3, bot1ws4, bot1ws5, bot1ws6, bot1ws7, bot1ws8, bot1ws9, bot1ws10, bot1ws11 = _ws1[:11]
+bot2ws1, bot2ws2, bot2ws3, bot2ws4, bot2ws5, bot2ws6, bot2ws7, bot2ws8, bot2ws9, bot2ws10, bot2ws11 = _ws2[:11]
+bot3ws1, bot3ws2, bot3ws3, bot3ws4, bot3ws5, bot3ws6, bot3ws7, bot3ws8, bot3ws9, bot3ws10, bot3ws11 = _ws3[:11]
+bot3ws12, bot3ws13 = _ws3b[0], _ws3b[1]
+bot4ws1, bot4ws2, bot4ws3, bot4ws4, bot4ws5, bot4ws6, bot4ws7, bot4ws8, bot4ws9, bot4ws10, bot4ws11 = _ws4[:11]
+bot4ws12, bot4ws13 = _ws4b[0], _ws4b[1]
+bot4ws14 = _ws4c[0]
+bot5ws1, bot5ws2, bot5ws3, bot5ws4, bot5ws5, bot5ws6, bot5ws7, bot5ws8, bot5ws9, bot5ws10, bot5ws11, bot5ws12, bot5ws13 = _ws5[:13]
+print("accessing the spreadsheet for all accounts complete")
+
+# Pool of raw worksheets per sheet index (same data, different service accounts),
+# reused straight from each account's worksheet list — no extra metadata fetches.
+# CachingWorksheet skips the sibling that is its own underlying worksheet (`is`).
 _WS_POOL = {}
 for _idx in range(11):
-    _WS_POOL[_idx] = [
-        bot1sheet.get_worksheet(_idx) if _idx <= 10 else None,
-        bot2sheet.get_worksheet(_idx) if _idx <= 10 else None,
-        bot3sheet.get_worksheet(_idx) if _idx <= 10 else None,
-        bot4sheet.get_worksheet(_idx) if _idx <= 10 else None,
-        bot5sheet.get_worksheet(_idx) if _idx <= 10 else None,
-    ]
+    _WS_POOL[_idx] = [_ws1[_idx], _ws2[_idx], _ws3[_idx], _ws4[_idx], _ws5[_idx]]
 
 class CachedCell:
     """Lightweight Cell object returned by CachingWorksheet.find() and .cell()."""
@@ -446,16 +423,51 @@ bot4ws14 = CachingWorksheet(bot4ws14, registry_key="bot4ws14")
 print("secondary worksheets wrapped")
 
 # Pre-populate all caches at startup so the first command has zero latency.
-# Only load the formatted cache once per sheet index, then share across all
-# sibling instances (same data, different service accounts).
+# One get_all_values() per sheet (data is identical across the sibling
+# accounts). The 5 accounts warm concurrently, but each sheet's read is pinned
+# to a single account and an account's reads run sequentially on one thread —
+# gspread's per-account requests.Session isn't safe for concurrent use.
+# Round-robining the reader across accounts also spreads the load so we don't
+# funnel every warm read through account 1 and trip a 429. Best-effort: a sheet
+# that fails to warm just loads lazily on first access instead of crashing boot.
 print("warming worksheet caches...")
+
+def _warm_one(instances, fetcher_idx):
+    """Load one sheet via the chosen sibling, then share its data to the rest."""
+    fetcher = instances[fetcher_idx]
+    try:
+        fetcher._ensure_fresh()
+    except Exception as e:
+        logger.warning(f"cache warm failed for {fetcher._registry_key}: {e}")
+        return
+    for sib in instances:
+        if sib is not fetcher:
+            object.__setattr__(sib, '_data', fetcher._data)
+            object.__setattr__(sib, '_stale', False)
+
+# Bucket each sheet's warm job by the account whose session performs the read,
+# so a thread only ever touches one account's session.
+_warm_by_account = {}
 for _rk, _instances in _CACHE_REGISTRY.items():
-    if _instances:
-        _instances[0]._ensure_fresh()
-        # Share the loaded data with sibling instances to avoid redundant API calls
-        for _sib in _instances[1:]:
-            object.__setattr__(_sib, '_data', _instances[0]._data)
-            object.__setattr__(_sib, '_stale', False)
+    if not _instances:
+        continue
+    if len(_instances) > 1:
+        # main sheet index (int key, one instance per account): round-robin the
+        # reader across accounts so warm reads spread evenly.
+        _fidx = _rk % len(_instances)
+        _acc = _fidx
+    else:
+        # secondary sheet ("botNwsM" key): only that one account can read it.
+        _fidx = 0
+        _acc = int(str(_rk)[3]) - 1
+    _warm_by_account.setdefault(_acc, []).append((_instances, _fidx))
+
+def _warm_account_queue(jobs):
+    for _insts, _fi in jobs:
+        _warm_one(_insts, _fi)
+
+with ThreadPoolExecutor(max_workers=max(1, len(_warm_by_account))) as _wpool:
+    list(_wpool.map(_warm_account_queue, _warm_by_account.values()))
 print("worksheet caches warmed")
 
 vkp_bosses = {}
