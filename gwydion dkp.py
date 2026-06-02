@@ -193,7 +193,7 @@ class CachingWorksheet:
     all sibling caches for the same sheet as stale.
     """
 
-    def __init__(self, ws, siblings=None, registry_key=None):
+    def __init__(self, ws, siblings=None, registry_key=None, default_ttl=300):
         object.__setattr__(self, '_ws', ws)
         object.__setattr__(self, '_siblings', siblings or [])
         object.__setattr__(self, '_registry_key', registry_key)
@@ -201,6 +201,9 @@ class CachingWorksheet:
         object.__setattr__(self, '_data_unformatted', None)  # List[List] UNFORMATTED (lazy)
         object.__setattr__(self, '_stale', True)
         object.__setattr__(self, '_stale_unformatted', True)
+        object.__setattr__(self, '_loaded_at', 0.0)
+        object.__setattr__(self, '_loaded_at_unformatted', 0.0)
+        object.__setattr__(self, '_default_ttl', default_ttl)
         if registry_key is not None:
             _CACHE_REGISTRY.setdefault(registry_key, []).append(self)
 
@@ -230,15 +233,20 @@ class CachingWorksheet:
     # ── Cache management ─────────────────────────────────────────────────
 
     def _ensure_fresh(self):
-        """Refresh the formatted cache if stale or unloaded."""
-        if self._stale or self._data is None:
+        """Refresh the formatted cache if stale, unloaded, or TTL expired."""
+        now = time.time()
+        if (self._stale or self._data is None
+                or (now - self._loaded_at) > self._default_ttl):
             logger.debug(f"Refreshing formatted cache for registry_key={self._registry_key}")
             object.__setattr__(self, '_data', self._api_call('get_all_values'))
+            object.__setattr__(self, '_loaded_at', now)
             object.__setattr__(self, '_stale', False)
 
     def _ensure_fresh_unformatted(self):
-        """Refresh the unformatted cache if stale or unloaded."""
-        if self._stale_unformatted or self._data_unformatted is None:
+        """Refresh the unformatted cache if stale, unloaded, or TTL expired."""
+        now = time.time()
+        if (self._stale_unformatted or self._data_unformatted is None
+                or (now - self._loaded_at_unformatted) > self._default_ttl):
             logger.debug(f"Refreshing unformatted cache for registry_key={self._registry_key}")
             try:
                 raw = self._api_call('get_all_values', value_render_option='UNFORMATTED_VALUE')
@@ -246,6 +254,7 @@ class CachingWorksheet:
                 # Older gspread versions: get_all_values() may not accept the kwarg
                 raw = self._api_call('get', value_render_option='UNFORMATTED_VALUE')
             object.__setattr__(self, '_data_unformatted', raw if raw else [])
+            object.__setattr__(self, '_loaded_at_unformatted', now)
             object.__setattr__(self, '_stale_unformatted', False)
 
     def _mark_all_stale(self):
@@ -342,6 +351,47 @@ class CachingWorksheet:
         result = self._api_call('update_acell', label, value)
         self._mark_all_stale()
         return result
+
+    # ── Async siblings (dispatch sync work to a worker thread) ───────────
+    # Awaitable variants of the I/O-bound methods. Reads still serve from
+    # cache (cheap) but the *first* read after staleness/TTL is an HTTP call,
+    # so async wrappers around reads keep the event loop unblocked too.
+
+    async def aupdate_cell(self, row, col, value):
+        return await asyncio.to_thread(self.update_cell, row, col, value)
+
+    async def aupdate(self, values, *args, **kwargs):
+        return await asyncio.to_thread(self.update, values, *args, **kwargs)
+
+    async def aappend_row(self, values, **kwargs):
+        return await asyncio.to_thread(self.append_row, values, **kwargs)
+
+    async def adelete_rows(self, start, end=None):
+        return await asyncio.to_thread(self.delete_rows, start, end)
+
+    async def aupdate_acell(self, label, value):
+        return await asyncio.to_thread(self.update_acell, label, value)
+
+    async def afind(self, value, in_column=None):
+        return await asyncio.to_thread(self.find, value, in_column)
+
+    async def aacell(self, label):
+        return await asyncio.to_thread(self.acell, label)
+
+    async def acell_(self, row, col):
+        return await asyncio.to_thread(self.cell, row, col)
+
+    async def acol_values(self, col):
+        return await asyncio.to_thread(self.col_values, col)
+
+    async def arow_values(self, row, value_render_option=None):
+        return await asyncio.to_thread(self.row_values, row, value_render_option)
+
+    async def aget_all_values(self, **kwargs):
+        return await asyncio.to_thread(self.get_all_values, **kwargs)
+
+    async def arefresh(self):
+        return await asyncio.to_thread(self.refresh)
 
     # ── Proxy unknown attributes to underlying worksheet ─────────────────
 
@@ -469,7 +519,7 @@ KP_WORKSHEETS = {
 
 DURATION_REGEX = r"(\d{2}:\d{2}:\d{2})"
 ROW_REGEX = r"^\s*\d*\s*([A-Za-z][A-Za-z0-9_]+).*?([\d,]{5,})\s*$"
-OCR_API_KEY = "K89202162788957"
+OCR_API_KEY = os.getenv("OCR_API_KEY", "K89202162788957")
 BLACKLIST = {"total", "health", "damage", "dps"}
 
 bidslastupdate = time.time()
@@ -508,12 +558,61 @@ def dkp_only():
     return commands.check(predicate)
 
 
+def author_in_gwydion_guild(author):
+    """True if `author` is a member of one of the four legacy Relentless guilds,
+    determined from the guilds the bot shares with them (User.mutual_guilds).
+    Requires the members intent (on via Intents.all()) and the member cache."""
+    try:
+        return any(is_gwydion_guild(g.id) for g in getattr(author, "mutual_guilds", []))
+    except Exception:
+        return False
+
+
+def dkp_read():
+    """Check decorator for read-only KP / roster lookups. Allows the command in
+    the four legacy Relentless guilds (same as @dkp_only) AND in DMs — but a DM is
+    only permitted if the author is a member of one of those guilds. Reads hit the
+    single master spreadsheet through the read-only service account, so no
+    per-guild context is needed.
+
+    Failures surface through on_command_error:
+      'dkp_wrong_server'  -> run in a non-Relentless server
+      'dkp_dm_not_member' -> DM from someone not in a Relentless server"""
+    async def predicate(ctx):
+        guild = getattr(ctx, "guild", None)
+        if guild is None:
+            if author_in_gwydion_guild(ctx.author):
+                return True
+            raise commands.CheckFailure("dkp_dm_not_member")
+        if is_gwydion_guild(guild.id):
+            return True
+        raise commands.CheckFailure("dkp_wrong_server")
+    return commands.check(predicate)
+
+
 print("setup done")
 
 def cached_col_values(worksheet, col, cache_key=None, ttl=None):
-    """Thin wrapper — caching is now handled by CachingWorksheet.
-    cache_key and ttl kept for call-site compatibility but are unused."""
+    """Thin wrapper — caching (including TTL) is handled by CachingWorksheet.
+    cache_key and ttl kept for call-site compatibility; freshness is governed
+    by the worksheet's default_ttl (300s).
+
+    NOTE: synchronous. On cache miss / TTL expiry this issues a blocking
+    Sheets call. Use `acached_col_values` from async commands so the
+    event loop isn't stalled."""
     return worksheet.col_values(col)
+
+
+async def acached_col_values(worksheet, col, cache_key=None, ttl=None):
+    """Async sibling of `cached_col_values` — dispatches the (possibly
+    blocking) col_values read to a worker thread."""
+    return await asyncio.to_thread(worksheet.col_values, col)
+
+
+async def sheet_call(fn, *args, **kwargs):
+    """Run a blocking gspread / requests call in a worker thread so it
+    does not stall the Discord event loop."""
+    return await asyncio.to_thread(fn, *args, **kwargs)
 
 def toBool(string):
     string = string.capitalize()
@@ -684,30 +783,28 @@ def not_found_message(name, suggestions):
 async def bidloop():
     global bidslastupdate, _bids_dirty
     bidslastupdate = time.time()
-    if not _bids_dirty:
-        return
     twelvehoursinseconds = 43200
     resultschannel = 1232811852811993169
     try:
         _bids_dirty = False
-        bidopentimes = bot3ws12.col_values(1)
-        itemids = bot3ws12.col_values(2)
-        itemnames = bot3ws12.col_values(3)
-        itemkp = bot3ws12.col_values(4)
-        bidstatus = bot3ws12.col_values(5)
+        bidopentimes = await bot3ws12.acol_values(1)
+        itemids = await bot3ws12.acol_values(2)
+        itemnames = await bot3ws12.acol_values(3)
+        itemkp = await bot3ws12.acol_values(4)
+        bidstatus = await bot3ws12.acol_values(5)
         combilist = list(zip(bidopentimes, itemids, bidstatus, itemnames, itemkp))
-        useritemids = bot3ws13.col_values(3)
-        useritemstatus = bot3ws13.col_values(7)
+        useritemids = await bot3ws13.acol_values(3)
+        useritemstatus = await bot3ws13.acol_values(7)
         combiuserlist = list(zip(useritemids,useritemstatus))
         for i in range(1, len(combilist)):
             if combilist[i][2] == "Open" and float(time.time()) > float(combilist[i][0]) + twelvehoursinseconds:
-                bot3ws12.update_cell(int(combilist[i][1]) + 1, 5, "Closed")
+                await bot3ws12.aupdate_cell(int(combilist[i][1]) + 1, 5, "Closed")
                 for j in range(1, len(combiuserlist)):
                     if combiuserlist[j][1] == "Open" and combiuserlist[j][0] == combilist[i][1]:
-                        bot3ws13.update_cell(j + 1, 7, "Closed")
-                cell = bot3ws12.find(combilist[i][1])
+                        await bot3ws13.aupdate_cell(j + 1, 7, "Closed")
+                cell = await bot3ws12.afind(combilist[i][1])
                 row_num = cell.row
-                bidrow = bot3ws12.row_values(row_num)
+                bidrow = await bot3ws12.arow_values(row_num)
                 #cut off everything but the player name and the bids
                 bidrow = bidrow[5:]
                 # split the rest alternating between the player and their bid
@@ -974,6 +1071,17 @@ async def on_command_error(ctx, error):
         except Exception:
             pass
         return
+    if isinstance(error, commands.CheckFailure) and str(error) == "dkp_dm_not_member":
+        # A read command was DMed by someone the bot doesn't share a Relentless
+        # server with — keep KP lookups scoped to clan members.
+        try:
+            await ctx.send(
+                "These commands are only available to members of the Relentless (Gwydion) "
+                "servers. Make sure you're in a server with Winston, then try again."
+            )
+        except Exception:
+            pass
+        return
     if isinstance(error, commands.BadArgument):
         await ctx.send("you made an error in the command arguments")
         print(error)
@@ -1053,7 +1161,7 @@ async def makeleaderboard(ctx):
                     temp_files.append(fname)
                     print(f"DEBUG: Saved attachment to {fname}")
 
-        df = process_images(temp_files)
+        df = await sheet_call(process_images, temp_files)
 
         table = df.to_string(index=False)
         output = f"```\n{table}\n```"
@@ -1094,12 +1202,12 @@ async def startbid(ctx, item, startprice, kp, startbidder):
         await ctx.send("Invalid kp type! Please use VKP, GKP, PKP, AKP, RBPPUNOX, DPKP")
         return
     #get the bottom row for the id
-    id = len(bot3ws12.col_values(1))
+    id = len(await bot3ws12.acol_values(1))
     startprice = int(startprice)
     bidrow = [time.time(), id, item, kp, "Open", startbidder, startprice]
-    bot3ws12.append_row(bidrow)
+    await bot3ws12.aappend_row(bidrow)
     userrow = [time.time(), str(ctx.author.id), id, item, startprice, kp, "Open", startbidder]
-    bot3ws13.append_row(userrow)
+    await bot3ws13.aappend_row(userrow)
     await ctx.send("Bid for " + item + " has started at " + str(startprice) + " " + kp + " by " + startbidder)
     await ctx.send("The ID for this bid is " + str(id) + ". Please use this number to bid on the item!")
 
@@ -1108,7 +1216,7 @@ async def startbid(ctx, item, startprice, kp, startbidder):
 async def getitemname(ctx):
     """gets the item name from an image"""
     image = ctx.message.attachments[0]
-    response = requests.get(image.url)
+    response = await sheet_call(requests.get, image.url)
     img = Image.open(BytesIO(response.content))
     processed = preprocessforgreen(img)
     text = pytesseract.image_to_string(processed)
@@ -1143,15 +1251,15 @@ async def sendbid(ctx, id, price, bidder):
     _bids_dirty = True
     id = int(id)
     price = int(price)
-    bidrow = bot3ws12.find(str(id))
+    bidrow = await bot3ws12.afind(str(id))
     bidrownum = bidrow.row
-    bidrow = bot3ws12.row_values(bidrownum)
+    bidrow = await bot3ws12.arow_values(bidrownum)
     if bidrow[4] == "Open":
         bidrow.append(bidder)
         bidrow.append(price)
-        bot3ws12.update([bidrow], "A" + str(bidrownum), value_input_option='USER_ENTERED')
+        await bot3ws12.aupdate([bidrow], "A" + str(bidrownum), value_input_option='USER_ENTERED')
         userrow = [time.time(), str(ctx.author.id), id, bidrow[2], price, bidrow[3], "Open", bidder]
-        bot3ws13.append_row(userrow, value_input_option="raw")
+        await bot3ws13.aappend_row(userrow, value_input_option="raw")
         await ctx.send("Bid for " + bidrow[2] + " has been placed at " + str(price) + " " + bidrow[3] + " by " + bidder)
     else:
         await ctx.send("This bid is closed!")
@@ -1163,22 +1271,22 @@ async def cancelbid(ctx, id, price, bidder):
     global _bids_dirty
     _bids_dirty = True
     # check on the user bids sheet if the bid exists
-    userids = bot3ws13.col_values(2)
-    itemids = bot3ws13.col_values(3)
-    itemprices = bot3ws13.col_values(5)
-    toonnames = bot3ws13.col_values(8)
+    userids = await bot3ws13.acol_values(2)
+    itemids = await bot3ws13.acol_values(3)
+    itemprices = await bot3ws13.acol_values(5)
+    toonnames = await bot3ws13.acol_values(8)
     combili = list(zip(userids, itemids, itemprices, toonnames))
     bidfound = False
     for i in range(1, len(combili)):
         if combili[i][0] == str(ctx.author.id) and combili[i][1] == id and combili[i][2] == price and combili[i][3] == bidder:
             rownum = i + 1
-            bot3ws13.delete_rows(rownum)
+            await bot3ws13.adelete_rows(rownum)
             bidfound = True
     if bidfound:
         #get the row for the item from the main sheet
-        bidrow = bot3ws12.find(str(id))
+        bidrow = await bot3ws12.afind(str(id))
         bidrownum = bidrow.row
-        bidrow = bot3ws12.row_values(bidrownum)
+        bidrow = await bot3ws12.arow_values(bidrownum)
         #remove the bidder price from the bid row
         #check that the bidder and price are sequential on the row
         print(bidder, price)
@@ -1189,13 +1297,13 @@ async def cancelbid(ctx, id, price, bidder):
                 bidrow.pop(i)
                 break
         if(len(bidrow) <= 6):
-            bot3ws12.update_cell(bidrownum, 5, "Closed")
+            await bot3ws12.aupdate_cell(bidrownum, 5, "Closed")
             await ctx.send("The bid for " + bidrow[2] + " has been closed. " + bidder + " has cancelled their bid")
         else:
         #update the bid row
             bidrow.append("")
             bidrow.append("")
-            bot3ws12.update([bidrow], "A" + str(bidrownum), value_input_option='USER_ENTERED')
+            await bot3ws12.aupdate([bidrow], "A" + str(bidrownum), value_input_option='USER_ENTERED')
         await ctx.send("Bid for " + id + " with bid " + price + " has been cancelled")
     
 
@@ -1213,11 +1321,11 @@ async def bidtimeinfo(ctx):
 async def mybids(ctx):
     """Shows the bids you have placed"""
     user = ctx.author.id
-    userids = bot3ws13.col_values(2)
+    userids = await bot3ws13.acol_values(2)
     userbids = []
     for i in range(len(userids)):
         if userids[i] == str(user):
-            userbids.append(bot3ws13.row_values(i + 1))
+            userbids.append(await bot3ws13.arow_values(i + 1))
     if not userbids:
         await ctx.send("You have no bids placed")
     else:
@@ -1233,10 +1341,10 @@ async def bidinfo(ctx, id):
         id = int(id)
         # bidrow = bot3ws12.find(str(id))
         # search column 2 for the id
-        bidrow = bot3ws12.find(str(id), in_column=2)
+        bidrow = await bot3ws12.afind(str(id), in_column=2)
         if bidrow:
             bidrownum = bidrow.row
-            bidrow = bot3ws12.row_values(bidrownum)
+            bidrow = await bot3ws12.arow_values(bidrownum)
             timeleft = float(bidrow[0]) + 43200 - time.time()
             hoursleft = timeleft // 3600
             minutesleft = (timeleft % 3600) // 60
@@ -1266,17 +1374,17 @@ async def addpoints(ctx, playername, pointtype, earned, spent, adjusted):
     earned = float(earned)
     spent = float(spent)
     adjusted = float(adjusted)
-    findnames, caps, spaces, suggestions = find_name(playername, bot5ws1.col_values(1))
+    findnames, caps, spaces, suggestions = find_name(playername, await bot5ws1.acol_values(1))
     if not findnames:
         await ctx.send(not_found_message(playername, suggestions))
         return
     playername = findnames
     ws = KP_WORKSHEETS[pointtype]["admin"]
-    playerrow = ws.find(playername, in_column=1)
+    playerrow = await ws.afind(playername, in_column=1)
     rownum = playerrow.row
-    ws.update_cell(rownum, 4, earned)
-    ws.update_cell(rownum, 5, spent)
-    ws.update_cell(rownum, 6, adjusted)
+    await ws.aupdate_cell(rownum, 4, earned)
+    await ws.aupdate_cell(rownum, 5, spent)
+    await ws.aupdate_cell(rownum, 6, adjusted)
     await ctx.send(pointtype + " for " + playername + " has been updated")
 
 @client.command()
@@ -1284,27 +1392,27 @@ async def addpoints(ctx, playername, pointtype, earned, spent, adjusted):
 @commands.has_any_role("General", "REDALiCE")
 async def addallearned(ctx, playername, VKP, GKP, PKP, AKP, RBPPUNOX, DPKP, RBPP):
     """Adds all the points earned to the player in the order VKP, GKP, PKP, AKP, RBPPUNOX, DPKP, RBPP"""
-    playerrow = bot5ws2.find(playername, in_column=1)
+    playerrow = await bot5ws2.afind(playername, in_column=1)
     rownum = playerrow.row
-    bot5ws2.update_cell(rownum, 4, float(VKP))
-    playerrow = bot5ws3.find(playername, in_column=1)
+    await bot5ws2.aupdate_cell(rownum, 4, float(VKP))
+    playerrow = await bot5ws3.afind(playername, in_column=1)
     rownum = playerrow.row
-    bot5ws3.update_cell(rownum, 4, float(GKP))
-    playerrow = bot5ws4.find(playername, in_column=1)
+    await bot5ws3.aupdate_cell(rownum, 4, float(GKP))
+    playerrow = await bot5ws4.afind(playername, in_column=1)
     rownum = playerrow.row
-    bot5ws4.update_cell(rownum, 4, float(PKP))
-    playerrow = bot5ws5.find(playername, in_column=1)
+    await bot5ws4.aupdate_cell(rownum, 4, float(PKP))
+    playerrow = await bot5ws5.afind(playername, in_column=1)
     rownum = playerrow.row
-    bot5ws5.update_cell(rownum, 4, float(AKP))
-    playerrow = bot5ws6.find(playername, in_column=1)
+    await bot5ws5.aupdate_cell(rownum, 4, float(AKP))
+    playerrow = await bot5ws6.afind(playername, in_column=1)
     rownum = playerrow.row
-    bot5ws6.update_cell(rownum, 4, float(RBPPUNOX))
-    playerrow = bot5ws7.find(playername, in_column=1)
+    await bot5ws6.aupdate_cell(rownum, 4, float(RBPPUNOX))
+    playerrow = await bot5ws7.afind(playername, in_column=1)
     rownum = playerrow.row
-    bot5ws7.update_cell(rownum, 4, float(DPKP))
-    playerrow = bot5ws8.find(playername, in_column=1)
+    await bot5ws7.aupdate_cell(rownum, 4, float(DPKP))
+    playerrow = await bot5ws8.afind(playername, in_column=1)
     rownum = playerrow.row
-    bot5ws8.update_cell(rownum, 4, float(RBPP))
+    await bot5ws8.aupdate_cell(rownum, 4, float(RBPP))
     await ctx.send("All points for " + playername + " have been updated")
 
 
@@ -1348,7 +1456,7 @@ async def addmem(ctx, name, rank, main, level, cclass):
     rank = rank.capitalize()
     main = toBool(main)
     level = int(level)
-    user_list = bot5ws1.col_values(1)
+    user_list = await bot5ws1.acol_values(1)
     if cclass not in ["Warrior", "Rogue", "Mage", "Druid", "Ranger"]:
         await ctx.send("Invalid class! Please use Warrior, Rogue, Mage, Druid, or Ranger")
         return
@@ -1362,8 +1470,8 @@ async def addmem(ctx, name, rank, main, level, cclass):
             body =[name,rank,main,level,cclass,"",name,"",False,False,False,False,False,False,False, 0]
         else:
             body =[name,rank,main,level,cclass,"","","",False,False,False,False,False,False,False, 0]
-        bot5ws1.append_row(body)
-        rownum = len(bot5ws2.col_values(1)) + 1
+        await bot5ws1.aappend_row(body)
+        rownum = len(await bot5ws2.acol_values(1)) + 1
         rownum = str(rownum)
         currformula = '=Sum(D' + rownum + '+F'+rownum+'-E'+rownum+')'
         attendformula1 = "=(COUNTIFS('Bosses last 30'!C2:C, \"*VKP*\", 'Bosses last 30'!D2:D, \"*" + name + "*\"))/COUNTIFS('Bosses last 30'!B2:B, \"<>*HALF*\", 'Bosses last 30'!B2:B, \"<>\", 'Bosses last 30'!C2:C, \"*VKP*\")"
@@ -1380,24 +1488,24 @@ async def addmem(ctx, name, rank, main, level, cclass):
         kpbody6 = [name,0,attendformula6,0,0,0,currformula]
         attendformula7 = "=(COUNTIFS('Bosses last 30'!C2:C, \"*RBPP*\", 'Bosses last 30'!D2:D, \"*" + name + "*\"))/COUNTIFS('Bosses last 30'!B2:B, \"<>*HALF*\", 'Bosses last 30'!B2:B, \"<>\", 'Bosses last 30'!C2:C, \"*RBPP*\")"
         kpbody7 = [name,0,attendformula7,0,0,0,currformula]
-        bot5ws2.append_row(kpbody1, value_input_option='USER_ENTERED')
-        bot5ws3.append_row(kpbody2, value_input_option='USER_ENTERED')
-        bot5ws4.append_row(kpbody3, value_input_option='USER_ENTERED')
-        bot5ws5.append_row(kpbody4, value_input_option='USER_ENTERED')
-        bot5ws6.append_row(kpbody5, value_input_option='USER_ENTERED')
-        bot5ws7.append_row(kpbody6, value_input_option='USER_ENTERED')
-        bot5ws8.append_row(kpbody7, value_input_option='USER_ENTERED')
+        await bot5ws2.aappend_row(kpbody1, value_input_option='USER_ENTERED')
+        await bot5ws3.aappend_row(kpbody2, value_input_option='USER_ENTERED')
+        await bot5ws4.aappend_row(kpbody3, value_input_option='USER_ENTERED')
+        await bot5ws5.aappend_row(kpbody4, value_input_option='USER_ENTERED')
+        await bot5ws6.aappend_row(kpbody5, value_input_option='USER_ENTERED')
+        await bot5ws7.aappend_row(kpbody6, value_input_option='USER_ENTERED')
+        await bot5ws8.aappend_row(kpbody7, value_input_option='USER_ENTERED')
         lootbody = [name]
         lootbody2 = ["Costs"]
-        bot5ws9.append_row(lootbody)
-        bot5ws9.append_row(lootbody2)
+        await bot5ws9.aappend_row(lootbody)
+        await bot5ws9.aappend_row(lootbody2)
         if main:
             maintext = "Main"
         else:
             maintext = "Alt"
         await ctx.send(name + " (" + str(level) + " " + cclass + ", " + maintext + ", " + rank + ") was added to the list")
         logbody = ["addmem", str(ctx.author.name), dt.now().strftime("%d/%m/%Y %H:%M:%S"), str([name, rank, main, level, cclass])]
-        bot3ws11.append_row(logbody)
+        await bot3ws11.aappend_row(logbody)
     else:
         await ctx.send(name + " is already in the list!")
 
@@ -1407,29 +1515,29 @@ async def addmem(ctx, name, rank, main, level, cclass):
 async def rosteradmin(ctx, subcommand, name, params):
     """roster management for admins
     subcommands: rank, main"""
-    user_list = bot5ws1.col_values(1)
+    user_list = await bot5ws1.acol_values(1)
     realname, caps, spaces, suggestions = find_name(name, user_list)
     if realname != None:
-        cell = bot5ws1.find(realname, in_column=1)
+        cell = await bot5ws1.afind(realname, in_column=1)
         row_num = cell.row
         subcommand = subcommand.lower()
         if subcommand == "rank":
             params = params.capitalize()
-            bot5ws1.update_cell(row_num, 2, params)
+            await bot5ws1.aupdate_cell(row_num, 2, params)
             await ctx.send(realname + "'s rank has been updated to " + str(params))
             # find all their alts and update those too
-            alts = bot5ws1.col_values(7)
+            alts = await bot5ws1.acol_values(7)
             for i in range(1, len(alts)):
                 if alts[i] == realname:
-                    bot5ws1.update_cell(i + 1, 2, params)
+                    await bot5ws1.aupdate_cell(i + 1, 2, params)
             logbody = ["roster", str(ctx.author.name), dt.now().strftime("%d/%m/%Y %H:%M:%S"), str([realname, subcommand, params])]
-            bot3ws11.append_row(logbody)
+            await bot3ws11.aappend_row(logbody)
         elif subcommand == "main":
             params = toBool(params)
-            bot5ws1.update_cell(row_num, 3, params)
+            await bot5ws1.aupdate_cell(row_num, 3, params)
             await ctx.send(realname + "'s main status has been updated to " + str(params))
             logbody = ["roster", str(ctx.author.name), dt.now().strftime("%d/%m/%Y %H:%M:%S"), str([realname, subcommand, params])]
-            bot3ws11.append_row(logbody)
+            await bot3ws11.aappend_row(logbody)
         else:
             await ctx.send("invalid subcommand")
 
@@ -1438,157 +1546,157 @@ async def rosteradmin(ctx, subcommand, name, params):
 async def roster(ctx, subcommand, name, params):
     """Roster Management Command
     subcommands: dg, subclass, cgoffhand, dl, dlmain, dloffhand, edl, edlmain, edloffhand, setall, level, setmain, bulksetmain, faction"""
-    user_list = bot5ws1.col_values(1)
+    user_list = await bot5ws1.acol_values(1)
     realname, caps, spaces, suggestions = find_name(name, user_list)
     if realname != None:
-        cell = bot5ws1.find(realname, in_column=1)
+        cell = await bot5ws1.afind(realname, in_column=1)
         row_num = cell.row
         subcommand = subcommand.lower()
         if subcommand == "dg":
-            bot5ws1.update_cell(row_num, 6, params)
+            await bot5ws1.aupdate_cell(row_num, 6, params)
             await ctx.send(realname + "'s DG has been updated to " + str(params))
             logbody = ["roster", str(ctx.author.name), dt.now().strftime("%d/%m/%Y %H:%M:%S"), str([realname, subcommand, params])]
-            bot3ws11.append_row(logbody)
+            await bot3ws11.aappend_row(logbody)
         elif subcommand == "removealt":
             if realname != None:
-                bot5ws1.update_cell(row_num, 7, "")
+                await bot5ws1.aupdate_cell(row_num, 7, "")
                 await ctx.send(realname + "'s Main character has been removed")
                 logbody = ["roster", str(ctx.author.name), dt.now().strftime("%d/%m/%Y %H:%M:%S"), str([realname, subcommand, params])]
-                bot3ws11.append_row(logbody)
+                await bot3ws11.aappend_row(logbody)
             else:
                 await ctx.send(params + " not in list!")
         elif subcommand == "setmain":
             names_list = params.split(",")
             # set the realname main to itself as well
-            bot5ws1.update_cell(row_num, 7, realname)
-            bot5ws1.update_cell(row_num, 3, True)
+            await bot5ws1.aupdate_cell(row_num, 7, realname)
+            await bot5ws1.aupdate_cell(row_num, 3, True)
             await ctx.send(realname + "'s Main character has been updated to " + str(realname))
             if realname != None:
                 for names in names_list:
                     findnames, caps, spaces, suggestions = find_name(names, user_list)
                     if findnames != None:
-                        cell = bot5ws1.find(findnames, in_column=1)
+                        cell = await bot5ws1.afind(findnames, in_column=1)
                         row_num = cell.row
-                        bot5ws1.update_cell(row_num, 7, realname)
-                        bot5ws1.update_cell(row_num, 3, False)
+                        await bot5ws1.aupdate_cell(row_num, 7, realname)
+                        await bot5ws1.aupdate_cell(row_num, 3, False)
                         await ctx.send(findnames + "'s Main character has been updated to " + realname)
                         logbody = ["roster", str(ctx.author.name), dt.now().strftime("%d/%m/%Y %H:%M:%S"), str([findnames, subcommand, realname])]
-                        bot3ws11.append_row(logbody)
+                        await bot3ws11.aappend_row(logbody)
                     else:
                         await ctx.send(not_found_message(names, suggestions))
         elif subcommand == "bulksetmain":
             names_list = params.split(",")
             # set the realname main to itself as well
-            bot5ws1.update_cell(row_num, 7, realname)
-            bot5ws1.update_cell(row_num, 3, True)
+            await bot5ws1.aupdate_cell(row_num, 7, realname)
+            await bot5ws1.aupdate_cell(row_num, 3, True)
             await ctx.send(realname + "'s Main character has been updated to " + str(realname))
             if realname != None:
                 for names in names_list:
                     findnames, caps, spaces, suggestions = find_name(names, user_list)
                     if findnames != None:
-                        cell = bot5ws1.find(findnames, in_column=1)
+                        cell = await bot5ws1.afind(findnames, in_column=1)
                         row_num = cell.row
-                        bot5ws1.update_cell(row_num, 7, realname)
-                        bot5ws1.update_cell(row_num, 3, False)
+                        await bot5ws1.aupdate_cell(row_num, 7, realname)
+                        await bot5ws1.aupdate_cell(row_num, 3, False)
                         await ctx.send(findnames + "'s Main character has been updated to " + realname)
                         logbody = ["roster", str(ctx.author.name), dt.now().strftime("%d/%m/%Y %H:%M:%S"), str([findnames, subcommand, realname])]
-                        bot3ws11.append_row(logbody)
+                        await bot3ws11.aappend_row(logbody)
                     else:
                         await ctx.send(not_found_message(names, suggestions))
         elif subcommand == "level":
-            bot5ws1.update_cell(row_num, 4, params)
+            await bot5ws1.aupdate_cell(row_num, 4, params)
             await ctx.send(realname + "'s level has been updated to " + str(params))
             logbody = ["roster", str(ctx.author.name), dt.now().strftime("%d/%m/%Y %H:%M:%S"), str([realname, subcommand, params])]
-            bot3ws11.append_row(logbody)
+            await bot3ws11.aappend_row(logbody)
         elif subcommand == "class":
             params = params.capitalize()
             if params not in ["Warrior", "Rogue", "Mage", "Druid", "Ranger"]:
                 await ctx.send("Invalid class! Please use Warrior, Rogue, Mage, Druid, or Ranger")
                 return
-            bot5ws1.update_cell(row_num, 5, params)
+            await bot5ws1.aupdate_cell(row_num, 5, params)
             await ctx.send(realname + "'s class has been updated to " + str(params))
             logbody = ["roster", str(ctx.author.name), dt.now().strftime("%d/%m/%Y %H:%M:%S"), str([realname, subcommand, params])]
-            bot3ws11.append_row(logbody)
+            await bot3ws11.aappend_row(logbody)
         elif subcommand == "subclass":
-            bot5ws1.update_cell(row_num, 8, params)
+            await bot5ws1.aupdate_cell(row_num, 8, params)
             await ctx.send(realname + "'s Subclass has been updated to " + str(params))
             logbody = ["roster", str(ctx.author.name), dt.now().strftime("%d/%m/%Y %H:%M:%S"), str([realname, subcommand, params])]
-            bot3ws11.append_row(logbody)
+            await bot3ws11.aappend_row(logbody)
         elif subcommand == "cgoffhand":
-            bot5ws1.update_cell(row_num, 9, params)
+            await bot5ws1.aupdate_cell(row_num, 9, params)
             await ctx.send(realname + "'s CG Offhand has been updated to " + str(params))
             logbody = ["roster", str(ctx.author.name), dt.now().strftime("%d/%m/%Y %H:%M:%S"), str([realname, subcommand, params])]
-            bot3ws11.append_row(logbody)
+            await bot3ws11.aappend_row(logbody)
         elif subcommand == "dl":
             params = toBool(params)
-            bot5ws1.update_cell(row_num, 10, params)
+            await bot5ws1.aupdate_cell(row_num, 10, params)
             await ctx.send(realname + "'s DL has been updated to " + str(params))
             logbody = ["roster", str(ctx.author.name), dt.now().strftime("%d/%m/%Y %H:%M:%S"), str([realname, subcommand, params])]
-            bot3ws11.append_row(logbody)
+            await bot3ws11.aappend_row(logbody)
         elif subcommand == "dlmain":
             params = toBool(params)
-            bot5ws1.update_cell(row_num, 11, params)
+            await bot5ws1.aupdate_cell(row_num, 11, params)
             await ctx.send(realname + "'s DL Main has been updated to " + str(params))
             logbody = ["roster", str(ctx.author.name), dt.now().strftime("%d/%m/%Y %H:%M:%S"), str([realname, subcommand, params])]
-            bot3ws11.append_row(logbody)
+            await bot3ws11.aappend_row(logbody)
         elif subcommand == "dloffhand":
             params = toBool(params)
-            bot5ws1.update_cell(row_num, 12, params)
+            await bot5ws1.aupdate_cell(row_num, 12, params)
             await ctx.send(realname + "'s DL Offhand has been updated to " + str(params))
             logbody = ["roster", str(ctx.author.name), dt.now().strftime("%d/%m/%Y %H:%M:%S"), str([realname, subcommand, params])]
-            bot3ws11.append_row(logbody)
+            await bot3ws11.aappend_row(logbody)
         elif subcommand == "edl":
             params = toBool(params)
-            bot5ws1.update_cell(row_num, 13, params)
+            await bot5ws1.aupdate_cell(row_num, 13, params)
             await ctx.send(realname + "'s EDL has been updated to " + str(params))
             logbody = ["roster", str(ctx.author.name), dt.now().strftime("%d/%m/%Y %H:%M:%S"), str([realname, subcommand, params])]
-            bot3ws11.append_row(logbody)
+            await bot3ws11.aappend_row(logbody)
         elif subcommand == "edlmain":
             params = toBool(params)
-            bot5ws1.update_cell(row_num, 14, params)
+            await bot5ws1.aupdate_cell(row_num, 14, params)
             await ctx.send(realname + "'s EDL Main has been updated to " + str(params))
             logbody = ["roster", str(ctx.author.name), dt.now().strftime("%d/%m/%Y %H:%M:%S"), str([realname, subcommand, params])]
-            bot3ws11.append_row(logbody)
+            await bot3ws11.aappend_row(logbody)
         elif subcommand == "edloffhand":
             params = toBool(params)
-            bot5ws1.update_cell(row_num, 15, params)
+            await bot5ws1.aupdate_cell(row_num, 15, params)
             await ctx.send(realname + "'s EDL Offhand has been updated to " + str(params))
             logbody = ["roster", str(ctx.author.name), dt.now().strftime("%d/%m/%Y %H:%M:%S"), str([realname, subcommand, params])]
-            bot3ws11.append_row(logbody)
+            await bot3ws11.aappend_row(logbody)
         elif subcommand == "setall":
             params = toBool(params)
-            bot5ws1.update_cell(row_num, 9, params)
-            bot5ws1.update_cell(row_num, 10, params)
-            bot5ws1.update_cell(row_num, 11, params)
-            bot5ws1.update_cell(row_num, 12, params)
-            bot5ws1.update_cell(row_num, 13, params)
-            bot5ws1.update_cell(row_num, 14, params)
-            bot5ws1.update_cell(row_num, 15, params)
+            await bot5ws1.aupdate_cell(row_num, 9, params)
+            await bot5ws1.aupdate_cell(row_num, 10, params)
+            await bot5ws1.aupdate_cell(row_num, 11, params)
+            await bot5ws1.aupdate_cell(row_num, 12, params)
+            await bot5ws1.aupdate_cell(row_num, 13, params)
+            await bot5ws1.aupdate_cell(row_num, 14, params)
+            await bot5ws1.aupdate_cell(row_num, 15, params)
             await ctx.send(realname + "'s gear has all been updated to " + str(params))
             logbody = ["roster", str(ctx.author.name), dt.now().strftime("%d/%m/%Y %H:%M:%S"), str([realname, subcommand, params])]
-            bot3ws11.append_row(logbody)
+            await bot3ws11.aappend_row(logbody)
         elif subcommand == "faction":
             params = int(params)
-            bot5ws1.update_cell(row_num, 16, params)
+            await bot5ws1.aupdate_cell(row_num, 16, params)
             await ctx.send(realname + "'s Valley Faction has been updated to tier " + str(params))
             logbody = ["roster", str(ctx.author.name), dt.now().strftime("%d/%m/%Y %H:%M:%S"), str([realname, subcommand, params])]
-            bot3ws11.append_row(logbody)
+            await bot3ws11.aappend_row(logbody)
         else:
             await ctx.send("invalid subcommand")
     else:
         await ctx.send(not_found_message(name, suggestions))
 
 @client.command(aliases=["p", "toon", "char", "character"])
-@dkp_only()
+@dkp_read()
 async def player(ctx, *name):
     """Displays a player's information"""
     name = " ".join(name)
-    user_list = cached_col_values(bot4ws1, 1, "roster_names")
+    user_list = await acached_col_values(bot4ws1, 1, "roster_names")
     realname, caps, spaces, suggestions = find_name(name, user_list)
     if realname != None:
-        cell = bot4ws1.find(realname, in_column=1)
+        cell = await bot4ws1.afind(realname, in_column=1)
         row_num = cell.row
-        embedvals = bot4ws1.row_values(row_num, value_render_option='UNFORMATTED_VALUE')
+        embedvals = await bot4ws1.arow_values(row_num, value_render_option='UNFORMATTED_VALUE')
         embed = discord.Embed(title = realname, colour=discord.Color.orange())
         embed.add_field(name = "Rank", value = embedvals[1], inline = True)
         embed.add_field(name = "Main", value = embedvals[2], inline = True)
@@ -1605,45 +1713,45 @@ async def player(ctx, *name):
         # embed.add_field(name = "EDL Main", value = embedvals[13], inline = True)
         # embed.add_field(name = "EDL Offhand", value = embedvals[14], inline = True)
         embed.add_field(name = "Valley Faction", value = embedvals[15], inline = True)
-        cell2 = bot4ws2.find(realname, in_column=1)
+        cell2 = await bot4ws2.afind(realname, in_column=1)
         row_num2 = cell2.row
-        dkprowvals = bot4ws2.row_values(row_num2, value_render_option='UNFORMATTED_VALUE')
+        dkprowvals = await bot4ws2.arow_values(row_num2, value_render_option='UNFORMATTED_VALUE')
         embed.add_field(name = "VKP", value = "Earned: " + str(dkprowvals[3]) + ", Current: " + str(dkprowvals[6]), inline = False)
-        cell3 = bot4ws3.find(realname, in_column=1)
+        cell3 = await bot4ws3.afind(realname, in_column=1)
         row_num3 = cell3.row
-        dkprowvals2 = bot4ws3.row_values(row_num3, value_render_option='UNFORMATTED_VALUE')
+        dkprowvals2 = await bot4ws3.arow_values(row_num3, value_render_option='UNFORMATTED_VALUE')
         embed.add_field(name = "GKP", value = "Earned: " + str(dkprowvals2[3]) + ", Current: " + str(dkprowvals2[6]), inline = False)
-        cell5 = bot4ws5.find(realname, in_column=1)
+        cell5 = await bot4ws5.afind(realname, in_column=1)
         row_num5 = cell5.row
-        dkprowvals4 = bot4ws5.row_values(row_num5, value_render_option='UNFORMATTED_VALUE')
+        dkprowvals4 = await bot4ws5.arow_values(row_num5, value_render_option='UNFORMATTED_VALUE')
         embed.add_field(name = "AKP", value = "Earned: " + str(dkprowvals4[3]) + ", Current: " + str(dkprowvals4[6]), inline = False)
-        cell6 = bot4ws6.find(realname, in_column=1)
+        cell6 = await bot4ws6.afind(realname, in_column=1)
         row_num6 = cell6.row
-        dkprowvals5 = bot4ws6.row_values(row_num6, value_render_option='UNFORMATTED_VALUE')
+        dkprowvals5 = await bot4ws6.arow_values(row_num6, value_render_option='UNFORMATTED_VALUE')
         embed.add_field(name = "RBPPUNOX", value = "Earned: " + str(dkprowvals5[3]) + ", Current: " + str(dkprowvals5[6]), inline = False)
-        cell7 = bot4ws7.find(realname, in_column=1)
+        cell7 = await bot4ws7.afind(realname, in_column=1)
         row_num7 = cell7.row
-        dkprowvals6 = bot4ws7.row_values(row_num7, value_render_option='UNFORMATTED_VALUE')
+        dkprowvals6 = await bot4ws7.arow_values(row_num7, value_render_option='UNFORMATTED_VALUE')
         embed.add_field(name = "DPKP", value = "Earned: " + str(dkprowvals6[3]) + ", Current: " + str(dkprowvals6[6]), inline = False)
-        cell8 = bot4ws8.find(realname, in_column=1)
+        cell8 = await bot4ws8.afind(realname, in_column=1)
         row_num8 = cell8.row
-        dkprowvals7 = bot4ws8.row_values(row_num8, value_render_option='UNFORMATTED_VALUE')
+        dkprowvals7 = await bot4ws8.arow_values(row_num8, value_render_option='UNFORMATTED_VALUE')
         embed.add_field(name = "RBPP", value = "Earned: " + str(dkprowvals7[3]) + ", Current: " + str(dkprowvals7[6]), inline = False)
         await ctx.send(embed=embed)
     else:
         await ctx.send(not_found_message(name, suggestions))
 
 @client.command(aliases=["pf", "playerfullinfo", "playerfullinformation"])
-@dkp_only()
+@dkp_read()
 async def playerfull(ctx, *name):
     """Displays a player's information"""
     name = " ".join(name)
-    user_list = cached_col_values(bot4ws1, 1, "roster_names")
+    user_list = await acached_col_values(bot4ws1, 1, "roster_names")
     realname, caps, spaces, suggestions = find_name(name, user_list)
     if realname != None:
-        cell = bot4ws1.find(realname, in_column=1)
+        cell = await bot4ws1.afind(realname, in_column=1)
         row_num = cell.row
-        embedvals = bot4ws1.row_values(row_num, value_render_option='UNFORMATTED_VALUE')
+        embedvals = await bot4ws1.arow_values(row_num, value_render_option='UNFORMATTED_VALUE')
         embed = discord.Embed(title = realname, colour=discord.Color.orange())
         embed.add_field(name = "Rank", value = embedvals[1], inline = True)
         embed.add_field(name = "Main", value = embedvals[2], inline = True)
@@ -1659,80 +1767,80 @@ async def playerfull(ctx, *name):
         embed.add_field(name = "EDL", value = embedvals[12], inline = True)
         embed.add_field(name = "EDL Main", value = embedvals[13], inline = True)
         embed.add_field(name = "EDL Offhand", value = embedvals[14], inline = True)
-        cell2 = bot4ws2.find(realname, in_column=1)
+        cell2 = await bot4ws2.afind(realname, in_column=1)
         row_num2 = cell2.row
-        dkprowvals = bot4ws2.row_values(row_num2, value_render_option='UNFORMATTED_VALUE')
+        dkprowvals = await bot4ws2.arow_values(row_num2, value_render_option='UNFORMATTED_VALUE')
         embed.add_field(name = "VKP", value = "Earned: " + str(dkprowvals[3]) + ", Current: " + str(dkprowvals[6]), inline = False)
-        cell3 = bot4ws3.find(realname, in_column=1)
+        cell3 = await bot4ws3.afind(realname, in_column=1)
         row_num3 = cell3.row
-        dkprowvals2 = bot4ws3.row_values(row_num3, value_render_option='UNFORMATTED_VALUE')
+        dkprowvals2 = await bot4ws3.arow_values(row_num3, value_render_option='UNFORMATTED_VALUE')
         embed.add_field(name = "GKP", value = "Earned: " + str(dkprowvals2[3]) + ", Current: " + str(dkprowvals2[6]), inline = False)
-        cell5 = bot4ws5.find(realname, in_column=1)
+        cell5 = await bot4ws5.afind(realname, in_column=1)
         row_num5 = cell5.row
-        dkprowvals4 = bot4ws5.row_values(row_num5, value_render_option='UNFORMATTED_VALUE')
+        dkprowvals4 = await bot4ws5.arow_values(row_num5, value_render_option='UNFORMATTED_VALUE')
         embed.add_field(name = "AKP", value = "Earned: " + str(dkprowvals4[3]) + ", Current: " + str(dkprowvals4[6]), inline = False)
-        cell6 = bot4ws6.find(realname, in_column=1)
+        cell6 = await bot4ws6.afind(realname, in_column=1)
         row_num6 = cell6.row
-        dkprowvals5 = bot4ws6.row_values(row_num6, value_render_option='UNFORMATTED_VALUE')
+        dkprowvals5 = await bot4ws6.arow_values(row_num6, value_render_option='UNFORMATTED_VALUE')
         embed.add_field(name = "RBPPUNOX", value = "Earned: " + str(dkprowvals5[3]) + ", Current: " + str(dkprowvals5[6]), inline = False)
-        cell7 = bot4ws7.find(realname, in_column=1)
+        cell7 = await bot4ws7.afind(realname, in_column=1)
         row_num7 = cell7.row
-        dkprowvals6 = bot4ws7.row_values(row_num7, value_render_option='UNFORMATTED_VALUE')
+        dkprowvals6 = await bot4ws7.arow_values(row_num7, value_render_option='UNFORMATTED_VALUE')
         embed.add_field(name = "DPKP", value = "Earned: " + str(dkprowvals6[3]) + ", Current: " + str(dkprowvals6[6]), inline = False)
-        cell8 = bot4ws8.find(realname, in_column=1)
+        cell8 = await bot4ws8.afind(realname, in_column=1)
         row_num8 = cell8.row
-        dkprowvals7 = bot4ws8.row_values(row_num8, value_render_option='UNFORMATTED_VALUE')
+        dkprowvals7 = await bot4ws8.arow_values(row_num8, value_render_option='UNFORMATTED_VALUE')
         embed.add_field(name = "RBPP", value = "Earned: " + str(dkprowvals7[3]) + ", Current: " + str(dkprowvals7[6]), inline = False)
         await ctx.send(embed=embed)
     else:
         await ctx.send(not_found_message(name, suggestions))
 
 @client.command(aliases=["pkp"])
-@dkp_only()
+@dkp_read()
 async def playerkp(ctx, *name):
     """Displays a player's KP information"""
     name = " ".join(name)
-    user_list = cached_col_values(bot4ws1, 1, "roster_names")
+    user_list = await acached_col_values(bot4ws1, 1, "roster_names")
     realname, caps, spaces, suggestions = find_name(name, user_list)
     if realname != None:
-        cell = bot4ws2.find(realname, in_column=1)
+        cell = await bot4ws2.afind(realname, in_column=1)
         row_num = cell.row
-        embedvals = bot4ws2.row_values(row_num)
+        embedvals = await bot4ws2.arow_values(row_num)
         embed = discord.Embed(title = realname + "'s KP", colour=discord.Color.orange())
         embed.add_field(name = "VKP", value = "Last Raid: " + embedvals[1] + ", Att %: " + embedvals[2] + ", Earned: " + embedvals[3] + ", Spent: " + embedvals[4] + ", Adjusted: " + embedvals[5] + ", Current: " + str(embedvals[6]), inline = False)
-        cell2 = bot4ws3.find(realname, in_column=1)
+        cell2 = await bot4ws3.afind(realname, in_column=1)
         row_num2 = cell2.row
-        embedvals2 = bot4ws3.row_values(row_num2)
+        embedvals2 = await bot4ws3.arow_values(row_num2)
         embed.add_field(name = "GKP", value = "Last Raid: " + embedvals2[1] + ", Att %: " + embedvals2[2] + ", Earned: " + embedvals2[3] + ", Spent: " + embedvals2[4] + ", Adjusted: " + embedvals2[5] + ", Current: " + str(embedvals2[6]), inline = False)
-        cell4 = bot4ws5.find(realname, in_column=1)
+        cell4 = await bot4ws5.afind(realname, in_column=1)
         row_num4 = cell4.row
-        embedvals4 = bot4ws5.row_values(row_num4)
+        embedvals4 = await bot4ws5.arow_values(row_num4)
         embed.add_field(name = "AKP", value = "Last Raid: " + embedvals4[1] + ", Att %: " + embedvals4[2] + ", Earned: " + embedvals4[3] + ", Spent: " + embedvals4[4] + ", Adjusted: " + embedvals4[5] + ", Current: " + str(embedvals4[6]), inline = False)
-        cell5 = bot4ws6.find(realname, in_column=1)
+        cell5 = await bot4ws6.afind(realname, in_column=1)
         row_num5 = cell5.row
-        embedvals5 = bot4ws6.row_values(row_num5)
+        embedvals5 = await bot4ws6.arow_values(row_num5)
         embed.add_field(name = "RBPPUNOX", value = "Last Raid: " + embedvals5[1] + ", Att %: " + embedvals5[2] + ", Earned: " + embedvals5[3] + ", Spent: " + embedvals5[4] + ", Adjusted: " + embedvals5[5] + ", Current: " + str(embedvals5[6]), inline = False)
-        cell6 = bot4ws7.find(realname, in_column=1)
+        cell6 = await bot4ws7.afind(realname, in_column=1)
         row_num6 = cell6.row
-        embedvals6 = bot4ws7.row_values(row_num6)
+        embedvals6 = await bot4ws7.arow_values(row_num6)
         embed.add_field(name = "DPKP", value = "Last Raid: " + embedvals6[1] + ", Att %: " + embedvals6[2] + ", Earned: " + embedvals6[3] + ", Spent: " + embedvals6[4] + ", Adjusted: " + embedvals6[5] + ", Current: " + str(embedvals6[6]), inline = False)
-        cell7 = bot4ws8.find(realname, in_column=1)
+        cell7 = await bot4ws8.afind(realname, in_column=1)
         row_num7 = cell7.row
-        embedvals7 = bot4ws8.row_values(row_num7)
+        embedvals7 = await bot4ws8.arow_values(row_num7)
         embed.add_field(name = "RBPP", value = "Last Raid: " + embedvals7[1] + ", Att %: " + embedvals7[2] + ", Earned: " + embedvals7[3] + ", Spent: " + embedvals7[4] + ", Adjusted: " + embedvals7[5] + ", Current: " + str(embedvals7[6]), inline = False)
         await ctx.send(embed=embed)
     else:
         await ctx.send(not_found_message(name, suggestions))
 
 @client.command(aliases=["toons", "chars", "characterlist"])
-@dkp_only()
+@dkp_read()
 async def characters(ctx, *name):
     """shows all characters a player has"""
     name = " ".join(name)
-    mains_list = bot4ws1.col_values(7)
-    characters_list = cached_col_values(bot4ws1, 1, "roster_names")
-    levels_list = bot4ws1.col_values(4)
-    cclass_list = bot4ws1.col_values(5)
+    mains_list = await bot4ws1.acol_values(7)
+    characters_list = await acached_col_values(bot4ws1, 1, "roster_names")
+    levels_list = await bot4ws1.acol_values(4)
+    cclass_list = await bot4ws1.acol_values(5)
     mains_to_chars = zip(mains_list, characters_list, levels_list, cclass_list)
     # remove header
     mains_to_chars = list(mains_to_chars)[1:]
@@ -1761,9 +1869,9 @@ async def characters(ctx, *name):
     altrealname, caps, spaces, alt_suggestions = find_name(name, characters_list)
     if altrealname != None:
         #pull the main first, then find all instances of the main in the character list, paginate every 20 and send
-        cell = bot4ws1.find(altrealname, in_column=1)
+        cell = await bot4ws1.afind(altrealname, in_column=1)
         row_num = cell.row
-        main_name = bot4ws1.cell(row_num, 7).value
+        main_name = (await bot4ws1.acell_(row_num, 7)).value
         user_characters = [(character, level, cclass) for main, character, level, cclass in mains_to_chars if main == main_name]
         total = len(user_characters)
         pagecounter = 0
@@ -1790,54 +1898,54 @@ async def characters(ctx, *name):
 async def fullpointwipe(ctx, name, verification):
     """fully wipes someones points, including earned points"""
     if verification == "releleaderfullwipe":
-        user_list = bot5ws1.col_values(1)
+        user_list = await bot5ws1.acol_values(1)
         realname, caps, spaces, suggestions = find_name(name, user_list)
         if realname != None:
-            cell1 = bot5ws2.find(realname, in_column=1)
+            cell1 = await bot5ws2.afind(realname, in_column=1)
             row_num1 = cell1.row
             currformula1 = '=Sum(D' + str(row_num1) + '+F'+str(row_num1)+'-E'+str(row_num1)+')'
             attendformula1 = "=(COUNTIFS('Bosses last 30'!C2:C, \"*VKP*\", 'Bosses last 30'!D2:D, \"*" + realname + "*\"))/COUNTIFS('Bosses last 30'!B2:B, \"<>*HALF*\", 'Bosses last 30'!B2:B, \"<>\", 'Bosses last 30'!C2:C, \"*VKP*\")"
             wipedrow1 = [realname,0,attendformula1,0,0,0,currformula1]
-            bot5ws2.update([wipedrow1], "A" + str(row_num1), value_input_option='USER_ENTERED')
-            cell2 = bot5ws3.find(realname, in_column=1)
+            await bot5ws2.aupdate([wipedrow1], "A" + str(row_num1), value_input_option='USER_ENTERED')
+            cell2 = await bot5ws3.afind(realname, in_column=1)
             row_num2 = cell2.row
             currformula2 = '=Sum(D' + str(row_num2) + '+F'+str(row_num2)+'-E'+str(row_num2)+')'
             attendformula2 = "=(COUNTIFS('Bosses last 30'!C2:C, \"*GKP*\", 'Bosses last 30'!D2:D, \"*" + realname + "*\"))/COUNTIFS('Bosses last 30'!B2:B, \"<>*HALF*\", 'Bosses last 30'!B2:B, \"<>\", 'Bosses last 30'!C2:C, \"*GKP*\")"
             wipedrow2 = [realname,0,attendformula2,0,0,0,currformula2]
-            bot5ws3.update([wipedrow2], "A" + str(row_num2), value_input_option='USER_ENTERED')
-            cell3 = bot5ws4.find(realname, in_column=1)
+            await bot5ws3.aupdate([wipedrow2], "A" + str(row_num2), value_input_option='USER_ENTERED')
+            cell3 = await bot5ws4.afind(realname, in_column=1)
             row_num3 = cell3.row
             currformula3 = '=Sum(D' + str(row_num3) + '+F'+str(row_num3)+'-E'+str(row_num3)+')'
             attendformula3 = "=(COUNTIFS('Bosses last 30'!C2:C, \"*PKP*\", 'Bosses last 30'!D2:D, \"*" + realname + "*\"))/COUNTIFS('Bosses last 30'!B2:B, \"<>*HALF*\", 'Bosses last 30'!B2:B, \"<>\", 'Bosses last 30'!C2:C, \"*PKP*\")"
             wipedrow3 = [realname,0,attendformula3,0,0,0,currformula3]
-            bot5ws4.update([wipedrow3], "A" + str(row_num3), value_input_option='USER_ENTERED')
-            cell4 = bot5ws5.find(realname, in_column=1)
+            await bot5ws4.aupdate([wipedrow3], "A" + str(row_num3), value_input_option='USER_ENTERED')
+            cell4 = await bot5ws5.afind(realname, in_column=1)
             row_num4 = cell4.row
             currformula4 = '=Sum(D' + str(row_num4) + '+F'+str(row_num4)+'-E'+str(row_num4)+')'
             attendformula4 = "=(COUNTIFS('Bosses last 30'!C2:C, \"*AKP*\", 'Bosses last 30'!D2:D, \"*" + realname + "*\"))/COUNTIFS('Bosses last 30'!B2:B, \"<>*HALF*\", 'Bosses last 30'!B2:B, \"<>\", 'Bosses last 30'!C2:C, \"*AKP*\")"
             wipedrow4 = [realname,0,attendformula4,0,0,0,currformula4]
-            bot5ws5.update([wipedrow4], "A" + str(row_num4), value_input_option='USER_ENTERED')
-            cell5 = bot5ws6.find(realname, in_column=1)
+            await bot5ws5.aupdate([wipedrow4], "A" + str(row_num4), value_input_option='USER_ENTERED')
+            cell5 = await bot5ws6.afind(realname, in_column=1)
             row_num5 = cell5.row
             currformula5 = '=Sum(D' + str(row_num5) + '+F'+str(row_num5)+'-E'+str(row_num5)+')'
             attendformula5 = "=(COUNTIFS('Bosses last 30'!C2:C, \"*RBPPUNOX*\", 'Bosses last 30'!D2:D, \"*" + realname + "*\"))/COUNTIFS('Bosses last 30'!B2:B, \"<>*HALF*\", 'Bosses last 30'!B2:B, \"<>\", 'Bosses last 30'!C2:C, \"*RBPPUNOX*\")"
             wipedrow5 = [realname,0,attendformula5,0,0,0,currformula5]
-            bot5ws6.update([wipedrow5], "A" + str(row_num5), value_input_option='USER_ENTERED')
-            cell6 = bot5ws7.find(realname, in_column=1)
+            await bot5ws6.aupdate([wipedrow5], "A" + str(row_num5), value_input_option='USER_ENTERED')
+            cell6 = await bot5ws7.afind(realname, in_column=1)
             row_num6 = cell6.row
             currformula6 = '=Sum(D' + str(row_num6) + '+F'+str(row_num6)+'-E'+str(row_num6)+')'
             attendformula6 = "=(COUNTIFS('Bosses last 30'!C2:C, \"*DPKP*\", 'Bosses last 30'!D2:D, \"*" + realname + "*\"))/COUNTIFS('Bosses last 30'!B2:B, \"<>*HALF*\", 'Bosses last 30'!B2:B, \"<>\", 'Bosses last 30'!C2:C, \"*DPKP*\")"
             wipedrow6 = [realname,0,attendformula6,0,0,0,currformula6]
-            bot5ws7.update([wipedrow6], "A" + str(row_num6), value_input_option='USER_ENTERED')
-            cell7 = bot5ws8.find(realname, in_column=1)
+            await bot5ws7.aupdate([wipedrow6], "A" + str(row_num6), value_input_option='USER_ENTERED')
+            cell7 = await bot5ws8.afind(realname, in_column=1)
             row_num7 = cell7.row
             currformula7 = '=Sum(D' + str(row_num7) + '+F'+str(row_num7)+'-E'+str(row_num7)+')'
             attendformula7 = "=(COUNTIFS('Bosses last 30'!C2:C, \"*RBPP*\", 'Bosses last 30'!D2:D, \"*" + realname + "*\"))/COUNTIFS('Bosses last 30'!B2:B, \"<>*HALF*\", 'Bosses last 30'!B2:B, \"<>\", 'Bosses last 30'!C2:C, \"*RBPP*\")"
             wipedrow7 = [realname,0,attendformula7,0,0,0,currformula7]
-            bot5ws8.update([wipedrow7], "A" + str(row_num7), value_input_option='USER_ENTERED')
+            await bot5ws8.aupdate([wipedrow7], "A" + str(row_num7), value_input_option='USER_ENTERED')
             await ctx.send(realname + "'s points have been fully wiped")
             logbody = ["wipe", str(ctx.author.name), dt.now().strftime("%d/%m/%Y %H:%M:%S"), str([realname])]
-            bot3ws11.append_row(logbody)
+            await bot3ws11.aappend_row(logbody)
         else:
             await ctx.send(not_found_message(name, suggestions))
 
@@ -1864,9 +1972,11 @@ def parse_deduct_args(args_str):
             number = float(match.group(3))
         except ValueError:
             return (None, None, None, None)
+        if number <= 0:
+            return (None, None, None, None)
         kp = match.group(4).upper()
         return (name, item, number, kp)
-    
+
     return (None, None, None, None)
 
 
@@ -1913,10 +2023,13 @@ def _write_loot(ws, lootrow, item, cost_str):
 
 def internal_deduct(args_str):
     name, item, number, kp = parse_deduct_args(args_str)
-    
+
     if name is None or item is None or kp is None:
         return("Could not parse line: " + str(args_str))
-    
+
+    if number <= 0:
+        return("Amount must be positive (line: " + str(args_str) + ")")
+
     kp = kp.upper()
 
     if kp == "VKP":
@@ -2055,124 +2168,128 @@ async def deduct(ctx, name, item, number, kp):
     kp = kp.upper()
     number = float(number)
 
+    if number <= 0:
+        await ctx.send("Amount must be positive.")
+        return
+
     if kp == "VKP":
-        user_list = bot3ws2.col_values(1)
+        user_list = await bot3ws2.acol_values(1)
         realname, caps, spaces, suggestions = find_name(name, user_list)
         if realname != None:
-            cell = bot3ws2.find(realname, in_column=1)
+            cell = await bot3ws2.afind(realname, in_column=1)
             row_num = cell.row
-            current = float(bot3ws2.cell(row_num, 7).value)
+            current = float((await bot3ws2.acell_(row_num, 7)).value)
             new = current - number
-            newspent = float(bot3ws2.cell(row_num, 5).value) + number
+            newspent = float((await bot3ws2.acell_(row_num, 5)).value) + number
             if new < 0:
                 await ctx.send("Cannot deduct more points than the player has")
             else:
-                bot3ws2.update_cell(row_num, 5, newspent)
-                lootcell = bot3ws9.find(realname, in_column=1)
-                _write_loot(bot3ws9, lootcell.row, item, str(number) + " VKP")
+                await bot3ws2.aupdate_cell(row_num, 5, newspent)
+                lootcell = await bot3ws9.afind(realname, in_column=1)
+                await sheet_call(_write_loot, bot3ws9, lootcell.row, item, str(number) + " VKP")
                 await ctx.send(realname + " has been deducted " + str(number) + " VKP for " + item)
                 logbody = ["deduct", str(ctx.author.name), dt.now().strftime("%d/%m/%Y %H:%M:%S"), str([realname, item, number, kp])]
-                bot3ws11.append_row(logbody)
+                await bot3ws11.aappend_row(logbody)
         else:
             await ctx.send(not_found_message(name, suggestions))
     elif kp == "GKP":
-        user_list = bot3ws3.col_values(1)
+        user_list = await bot3ws3.acol_values(1)
         realname, caps, spaces, suggestions = find_name(name, user_list)
         if realname != None:
-            cell = bot3ws3.find(realname, in_column=1)
+            cell = await bot3ws3.afind(realname, in_column=1)
             row_num = cell.row
-            current = float(bot3ws3.cell(row_num, 7).value)
+            current = float((await bot3ws3.acell_(row_num, 7)).value)
             new = current - number
-            newspent = float(bot3ws3.cell(row_num, 5).value) + number
+            newspent = float((await bot3ws3.acell_(row_num, 5)).value) + number
             if new < 0:
                 await ctx.send("Cannot deduct more points than the player has")
             else:
-                bot3ws3.update_cell(row_num, 5, newspent)
-                lootcell = bot3ws9.find(realname, in_column=1)
-                _write_loot(bot3ws9, lootcell.row, item, str(number) + " GKP")
+                await bot3ws3.aupdate_cell(row_num, 5, newspent)
+                lootcell = await bot3ws9.afind(realname, in_column=1)
+                await sheet_call(_write_loot, bot3ws9, lootcell.row, item, str(number) + " GKP")
                 await ctx.send(realname + " has been deducted " + str(number) + " GKP for " + item)
                 logbody = ["deduct", str(ctx.author.name), dt.now().strftime("%d/%m/%Y %H:%M:%S"), str([realname, item, number, kp])]
-                bot3ws11.append_row(logbody)
+                await bot3ws11.aappend_row(logbody)
         else:
             await ctx.send(not_found_message(name, suggestions))
     elif kp == "PKP":
-        user_list = bot3ws4.col_values(1)
+        user_list = await bot3ws4.acol_values(1)
         realname, caps, spaces, suggestions = find_name(name, user_list)
         if realname != None:
-            cell = bot3ws4.find(realname, in_column=1)
+            cell = await bot3ws4.afind(realname, in_column=1)
             row_num = cell.row
-            current = float(bot3ws4.cell(row_num, 7).value)
+            current = float((await bot3ws4.acell_(row_num, 7)).value)
             new = current - number
-            newspent = float(bot3ws4.cell(row_num, 5).value) + number
+            newspent = float((await bot3ws4.acell_(row_num, 5)).value) + number
             if new < 0:
                 await ctx.send("Cannot deduct more points than the player has")
             else:
-                bot3ws4.update_cell(row_num, 5, newspent)
-                lootcell = bot3ws9.find(realname, in_column=1)
-                _write_loot(bot3ws9, lootcell.row, item, str(number) + " PKP")
+                await bot3ws4.aupdate_cell(row_num, 5, newspent)
+                lootcell = await bot3ws9.afind(realname, in_column=1)
+                await sheet_call(_write_loot, bot3ws9, lootcell.row, item, str(number) + " PKP")
                 await ctx.send(realname + " has been deducted " + str(number) + " PKP for " + item)
                 logbody = ["deduct", str(ctx.author.name), dt.now().strftime("%d/%m/%Y %H:%M:%S"), str([realname, item, number, kp])]
-                bot3ws11.append_row(logbody)
+                await bot3ws11.aappend_row(logbody)
         else:
             await ctx.send(not_found_message(name, suggestions))
     elif kp == "AKP":
-        user_list = bot3ws5.col_values(1)
+        user_list = await bot3ws5.acol_values(1)
         realname, caps, spaces, suggestions = find_name(name, user_list)
         if realname != None:
-            cell = bot3ws5.find(realname, in_column=1)
+            cell = await bot3ws5.afind(realname, in_column=1)
             row_num = cell.row
-            current = float(bot3ws5.cell(row_num, 7).value)
+            current = float((await bot3ws5.acell_(row_num, 7)).value)
             new = current - number
-            newspent = float(bot3ws5.cell(row_num, 5).value) + number
+            newspent = float((await bot3ws5.acell_(row_num, 5)).value) + number
             if new < 0:
                 await ctx.send("Cannot deduct more points than the player has")
             else:
-                bot3ws5.update_cell(row_num, 5, newspent)
-                lootcell = bot3ws9.find(realname, in_column=1)
-                _write_loot(bot3ws9, lootcell.row, item, str(number) + " AKP")
+                await bot3ws5.aupdate_cell(row_num, 5, newspent)
+                lootcell = await bot3ws9.afind(realname, in_column=1)
+                await sheet_call(_write_loot, bot3ws9, lootcell.row, item, str(number) + " AKP")
                 await ctx.send(realname + " has been deducted " + str(number) + " AKP for " + item)
                 logbody = ["deduct", str(ctx.author.name), dt.now().strftime("%d/%m/%Y %H:%M:%S"), str([realname, item, number, kp])]
-                bot3ws11.append_row(logbody)
+                await bot3ws11.aappend_row(logbody)
         else:
             await ctx.send(not_found_message(name, suggestions))
     elif kp == "RBPPUNOX":
-        user_list = bot3ws6.col_values(1)
+        user_list = await bot3ws6.acol_values(1)
         realname, caps, spaces, suggestions = find_name(name, user_list)
         if realname != None:
-            cell = bot3ws6.find(realname, in_column=1)
+            cell = await bot3ws6.afind(realname, in_column=1)
             row_num = cell.row
-            current = float(bot3ws6.cell(row_num, 7).value)
+            current = float((await bot3ws6.acell_(row_num, 7)).value)
             new = current - number
-            newspent = float(bot3ws6.cell(row_num, 5).value) + number
+            newspent = float((await bot3ws6.acell_(row_num, 5)).value) + number
             if new < 0:
                 await ctx.send("Cannot deduct more points than the player has")
             else:
-                bot3ws6.update_cell(row_num, 5, newspent)
-                lootcell = bot3ws9.find(realname, in_column=1)
-                _write_loot(bot3ws9, lootcell.row, item, str(number) + " RBPPUNOX")
+                await bot3ws6.aupdate_cell(row_num, 5, newspent)
+                lootcell = await bot3ws9.afind(realname, in_column=1)
+                await sheet_call(_write_loot, bot3ws9, lootcell.row, item, str(number) + " RBPPUNOX")
                 await ctx.send(realname + " has been deducted " + str(number) + " RBPPUNOX for " + item)
                 logbody = ["deduct", str(ctx.author.name), dt.now().strftime("%d/%m/%Y %H:%M:%S"), str([realname, item, number, kp])]
-                bot3ws11.append_row(logbody)
+                await bot3ws11.aappend_row(logbody)
         else:
             await ctx.send(not_found_message(name, suggestions))
     elif kp == "DPKP":
-        user_list = bot3ws7.col_values(1)
+        user_list = await bot3ws7.acol_values(1)
         realname, caps, spaces, suggestions = find_name(name, user_list)
         if realname != None:
-            cell = bot3ws7.find(realname, in_column=1)
+            cell = await bot3ws7.afind(realname, in_column=1)
             row_num = cell.row
-            current = float(bot3ws7.cell(row_num, 7).value)
+            current = float((await bot3ws7.acell_(row_num, 7)).value)
             new = current - number
-            newspent = float(bot3ws7.cell(row_num, 5).value) + number
+            newspent = float((await bot3ws7.acell_(row_num, 5)).value) + number
             if new < 0:
                 await ctx.send("Cannot deduct more points than the player has")
             else:
-                bot3ws7.update_cell(row_num, 5, newspent)
-                lootcell = bot3ws9.find(realname, in_column=1)
-                _write_loot(bot3ws9, lootcell.row, item, str(number) + " DPKP")
+                await bot3ws7.aupdate_cell(row_num, 5, newspent)
+                lootcell = await bot3ws9.afind(realname, in_column=1)
+                await sheet_call(_write_loot, bot3ws9, lootcell.row, item, str(number) + " DPKP")
                 await ctx.send(realname + " has been deducted " + str(number) + " DPKP for " + item)
                 logbody = ["deduct", str(ctx.author.name), dt.now().strftime("%d/%m/%Y %H:%M:%S"), str([realname, item, number, kp])]
-                bot3ws11.append_row(logbody)
+                await bot3ws11.aappend_row(logbody)
         else:
             await ctx.send(not_found_message(name, suggestions))
     else:
@@ -2197,8 +2314,9 @@ async def bidgen(ctx, *message):
         # Fetch the message being replied to
         replied_msg = await ctx.channel.fetch_message(ctx.message.reference.message_id)
         message = replied_msg.content
-        
-    
+    else:
+        message = ' '.join(message)
+
     lines = message.strip().split('\n')
     commands_output = []
     i = 0
@@ -2244,19 +2362,19 @@ async def bidgen(ctx, *message):
         await ctx.send("No valid loot entries found. Please check the format:\n```\nPlayer Name - Item Name\n(amount pointpool)\n```")
 
 @client.command(aliases=["loot", "wonitems"])
-@dkp_only()
+@dkp_read()
 async def winnings(ctx, name, kp = None):
     """Displays a player's loot winnings"""
     if kp != None:
         kp = kp.upper()
     if kp == None:
-        user_list = bot4ws9.col_values(1)
+        user_list = await bot4ws9.acol_values(1)
         realname, caps, spaces, suggestions = find_name(name, user_list)
         if realname != None:
-            cell = bot4ws9.find(realname, in_column=1)
+            cell = await bot4ws9.afind(realname, in_column=1)
             row_num = cell.row
-            lootlist = bot4ws9.row_values(row_num)
-            costlist = bot4ws9.row_values(row_num + 1)
+            lootlist = await bot4ws9.arow_values(row_num)
+            costlist = await bot4ws9.arow_values(row_num + 1)
             lootlist.pop(0)
             costlist.pop(0)
             width = max(len(lootlist), len(costlist))
@@ -2283,13 +2401,13 @@ async def winnings(ctx, name, kp = None):
         else:
             await ctx.send(not_found_message(name, suggestions))
     else:
-        user_list = bot4ws9.col_values(1)
+        user_list = await bot4ws9.acol_values(1)
         realname, caps, spaces, suggestions = find_name(name, user_list)
         if realname != None:
-            cell = bot4ws9.find(realname, in_column=1)
+            cell = await bot4ws9.afind(realname, in_column=1)
             row_num = cell.row
-            lootlist = bot4ws9.row_values(row_num)
-            costlist = bot4ws9.row_values(row_num + 1)
+            lootlist = await bot4ws9.arow_values(row_num)
+            costlist = await bot4ws9.arow_values(row_num + 1)
             lootlist.pop(0)
             costlist.pop(0)
             width = max(len(lootlist), len(costlist))
@@ -2325,77 +2443,88 @@ async def winnings(ctx, name, kp = None):
 async def refunditem(ctx, name, itemnum):
     """Refunds an item and returns the points to the player"""
     itemnum = int(itemnum)
-    user_list = bot3ws9.col_values(1)
+    if itemnum < 1:
+        await ctx.send("Item number must be >= 1 (column 0 holds the player name).")
+        return
+    user_list = await bot3ws9.acol_values(1)
     realname, caps, spaces, suggestions = find_name(name, user_list)
     if realname != None:
-        cell = bot3ws9.find(realname, in_column=1)
+        cell = await bot3ws9.afind(realname, in_column=1)
         row_num = cell.row
-        lootlist = bot3ws9.row_values(row_num)
-        costlist = bot3ws9.row_values(row_num + 1)
-        if itemnum < len(lootlist):
-            itemname = lootlist[itemnum]
-            cost = costlist[itemnum]
-            cost = cost.split(" ")
-            itemprice = float(cost[0])
-            itemkp = cost[1]
-            newitemname = "[REFUNDED] " + itemname
-            bot3ws9.update_cell(row_num, itemnum + 1, newitemname)
-            if itemkp == "VKP":
-                kpcell = bot3ws2.find(realname, in_column=1)
-                kprow = kpcell.row
-                spent = float(bot3ws2.cell(kprow, 5).value)
-                newspent = spent - itemprice
-                bot3ws2.update_cell(kprow, 5, newspent)
-                await ctx.send(realname + " has been refunded " + str(itemprice) + " VKP for " + itemname)
-                logbody = ["refund", str(ctx.author.name), dt.now().strftime("%d/%m/%Y %H:%M:%S"), str([realname, itemname, itemprice, itemkp])]
-                bot3ws11.append_row(logbody)
-            elif itemkp == "GKP":
-                kpcell = bot3ws3.find(realname, in_column=1)
-                kprow = kpcell.row
-                spent = float(bot3ws3.cell(kprow, 5).value)
-                newspent = spent - itemprice
-                bot3ws3.update_cell(kprow, 5, newspent)
-                await ctx.send(realname + " has been refunded " + str(itemprice) + " GKP for " + itemname)
-                logbody = ["refund", str(ctx.author.name), dt.now().strftime("%d/%m/%Y %H:%M:%S"), str([realname, itemname, itemprice, itemkp])]
-                bot3ws11.append_row(logbody)
-            elif itemkp == "PKP":
-                kpcell = bot3ws4.find(realname, in_column=1)
-                kprow = kpcell.row
-                spent = float(bot3ws4.cell(kprow, 5).value)
-                newspent = spent - itemprice
-                bot3ws4.update_cell(kprow, 5, newspent)
-                await ctx.send(realname + " has been refunded " + str(itemprice) + " PKP for " + itemname)
-                logbody = ["refund", str(ctx.author.name), dt.now().strftime("%d/%m/%Y %H:%M:%S"), str([realname, itemname, itemprice, itemkp])]
-                bot3ws11.append_row(logbody)
-            elif itemkp == "AKP":
-                kpcell = bot3ws5.find(realname, in_column=1)
-                kprow = kpcell.row
-                spent = float(bot3ws5.cell(kprow, 5).value)
-                newspent = spent - itemprice
-                bot3ws5.update_cell(kprow, 5, newspent)
-                await ctx.send(realname + " has been refunded " + str(itemprice) + " AKP for " + itemname)
-                logbody = ["refund", str(ctx.author.name), dt.now().strftime("%d/%m/%Y %H:%M:%S"), str([realname, itemname, itemprice, itemkp])]
-                bot3ws11.append_row(logbody)
-            elif itemkp == "RBPPUNOX":
-                kpcell = bot3ws6.find(realname, in_column=1)
-                kprow = kpcell.row
-                spent = float(bot3ws6.cell(kprow, 5).value)
-                newspent = spent - itemprice
-                bot3ws6.update_cell(kprow, 5, newspent)
-                await ctx.send(realname + " has been refunded " + str(itemprice) + " RBPPUNOX for " + itemname)
-                logbody = ["refund", str(ctx.author.name), dt.now().strftime("%d/%m/%Y %H:%M:%S"), str([realname, itemname, itemprice, itemkp])]
-                bot3ws11.append_row(logbody)
-            elif itemkp == "DPKP":
-                kpcell = bot3ws7.find(realname, in_column=1)
-                kprow = kpcell.row
-                spent = float(bot3ws7.cell(kprow, 5).value)
-                newspent = spent - itemprice
-                bot3ws7.update_cell(kprow, 5, newspent)
-                await ctx.send(realname + " has been refunded " + str(itemprice) + " DPKP for " + itemname)
-                logbody = ["refund", str(ctx.author.name), dt.now().strftime("%d/%m/%Y %H:%M:%S"), str([realname, itemname, itemprice, itemkp])]
-                bot3ws11.append_row(logbody)
-            else:
-                await ctx.send("Invalid KP type. somehow?")
+        lootlist = await bot3ws9.arow_values(row_num)
+        costlist = await bot3ws9.arow_values(row_num + 1)
+        if itemnum >= len(lootlist) or itemnum >= len(costlist):
+            await ctx.send(f"Item {itemnum} is out of range for {realname} (loot has {len(lootlist) - 1} entries).")
+            return
+        itemname = lootlist[itemnum]
+        cost_raw = costlist[itemnum]
+        if not itemname or not cost_raw:
+            await ctx.send(f"Item slot {itemnum} for {realname} is empty.")
+            return
+        if itemname.startswith("[REFUNDED] "):
+            await ctx.send(f"Item {itemnum} ({itemname}) is already refunded.")
+            return
+        cost = cost_raw.split(" ")
+        itemprice = float(cost[0])
+        itemkp = cost[1]
+        newitemname = "[REFUNDED] " + itemname
+        await bot3ws9.aupdate_cell(row_num, itemnum + 1, newitemname)
+        if itemkp == "VKP":
+            kpcell = await bot3ws2.afind(realname, in_column=1)
+            kprow = kpcell.row
+            spent = float((await bot3ws2.acell_(kprow, 5)).value)
+            newspent = spent - itemprice
+            await bot3ws2.aupdate_cell(kprow, 5, newspent)
+            await ctx.send(realname + " has been refunded " + str(itemprice) + " VKP for " + itemname)
+            logbody = ["refund", str(ctx.author.name), dt.now().strftime("%d/%m/%Y %H:%M:%S"), str([realname, itemname, itemprice, itemkp])]
+            await bot3ws11.aappend_row(logbody)
+        elif itemkp == "GKP":
+            kpcell = await bot3ws3.afind(realname, in_column=1)
+            kprow = kpcell.row
+            spent = float((await bot3ws3.acell_(kprow, 5)).value)
+            newspent = spent - itemprice
+            await bot3ws3.aupdate_cell(kprow, 5, newspent)
+            await ctx.send(realname + " has been refunded " + str(itemprice) + " GKP for " + itemname)
+            logbody = ["refund", str(ctx.author.name), dt.now().strftime("%d/%m/%Y %H:%M:%S"), str([realname, itemname, itemprice, itemkp])]
+            await bot3ws11.aappend_row(logbody)
+        elif itemkp == "PKP":
+            kpcell = await bot3ws4.afind(realname, in_column=1)
+            kprow = kpcell.row
+            spent = float((await bot3ws4.acell_(kprow, 5)).value)
+            newspent = spent - itemprice
+            await bot3ws4.aupdate_cell(kprow, 5, newspent)
+            await ctx.send(realname + " has been refunded " + str(itemprice) + " PKP for " + itemname)
+            logbody = ["refund", str(ctx.author.name), dt.now().strftime("%d/%m/%Y %H:%M:%S"), str([realname, itemname, itemprice, itemkp])]
+            await bot3ws11.aappend_row(logbody)
+        elif itemkp == "AKP":
+            kpcell = await bot3ws5.afind(realname, in_column=1)
+            kprow = kpcell.row
+            spent = float((await bot3ws5.acell_(kprow, 5)).value)
+            newspent = spent - itemprice
+            await bot3ws5.aupdate_cell(kprow, 5, newspent)
+            await ctx.send(realname + " has been refunded " + str(itemprice) + " AKP for " + itemname)
+            logbody = ["refund", str(ctx.author.name), dt.now().strftime("%d/%m/%Y %H:%M:%S"), str([realname, itemname, itemprice, itemkp])]
+            await bot3ws11.aappend_row(logbody)
+        elif itemkp == "RBPPUNOX":
+            kpcell = await bot3ws6.afind(realname, in_column=1)
+            kprow = kpcell.row
+            spent = float((await bot3ws6.acell_(kprow, 5)).value)
+            newspent = spent - itemprice
+            await bot3ws6.aupdate_cell(kprow, 5, newspent)
+            await ctx.send(realname + " has been refunded " + str(itemprice) + " RBPPUNOX for " + itemname)
+            logbody = ["refund", str(ctx.author.name), dt.now().strftime("%d/%m/%Y %H:%M:%S"), str([realname, itemname, itemprice, itemkp])]
+            await bot3ws11.aappend_row(logbody)
+        elif itemkp == "DPKP":
+            kpcell = await bot3ws7.afind(realname, in_column=1)
+            kprow = kpcell.row
+            spent = float((await bot3ws7.acell_(kprow, 5)).value)
+            newspent = spent - itemprice
+            await bot3ws7.aupdate_cell(kprow, 5, newspent)
+            await ctx.send(realname + " has been refunded " + str(itemprice) + " DPKP for " + itemname)
+            logbody = ["refund", str(ctx.author.name), dt.now().strftime("%d/%m/%Y %H:%M:%S"), str([realname, itemname, itemprice, itemkp])]
+            await bot3ws11.aappend_row(logbody)
+        else:
+            await ctx.send("Invalid KP type. somehow?")
 
 
 @client.command(aliases=["refundold"])
@@ -2405,21 +2534,24 @@ async def refundolditem(ctx, name, amount, kp):
     """Processes a refund for an item that was not added to the loot list"""
     amount = float(amount)
     kp = kp.upper()
+    if amount <= 0:
+        await ctx.send("Amount must be positive.")
+        return
     if kp not in KP_WORKSHEETS:
         await ctx.send("Invalid KP pool!")
         return
     ws = KP_WORKSHEETS[kp]["deduct"]
-    user_list = ws.col_values(1)
+    user_list = await ws.acol_values(1)
     realname, caps, spaces, suggestions = find_name(name, user_list)
     if realname != None:
-        cell = ws.find(realname, in_column=1)
+        cell = await ws.afind(realname, in_column=1)
         row_num = cell.row
-        currentspent = float(ws.cell(row_num, 5).value)
+        currentspent = float((await ws.acell_(row_num, 5)).value)
         new = currentspent - amount
-        ws.update_cell(row_num, 5, new)
+        await ws.aupdate_cell(row_num, 5, new)
         await ctx.send(realname + " has been refunded " + str(amount) + " " + kp)
         logbody = ["refund", str(ctx.author.name), dt.now().strftime("%d/%m/%Y %H:%M:%S"), str([realname, amount, kp])]
-        bot3ws11.append_row(logbody)
+        await bot3ws11.aappend_row(logbody)
     else:
         await ctx.send(not_found_message(name, suggestions))
 
@@ -2429,17 +2561,17 @@ async def refundolditem(ctx, name, amount, kp):
 @commands.has_any_role("General", "Guardian", "REDALiCE")
 async def compactloot(ctx, name):
     """Repacks a player's loot row so items sit contiguously from column B."""
-    user_list = bot3ws9.col_values(1)
+    user_list = await bot3ws9.acol_values(1)
     realname, caps, spaces, suggestions = find_name(name, user_list)
     if realname is None:
         await ctx.send(not_found_message(name, suggestions))
         return
 
-    cell = bot3ws9.find(realname, in_column=1)
+    cell = await bot3ws9.afind(realname, in_column=1)
     row_num = cell.row
-    bot3ws9.refresh()
-    lootlist = bot3ws9.row_values(row_num)
-    costlist = bot3ws9.row_values(row_num + 1)
+    await bot3ws9.arefresh()
+    lootlist = await bot3ws9.arow_values(row_num)
+    costlist = await bot3ws9.arow_values(row_num + 1)
 
     width = max(len(lootlist), len(costlist))
 
@@ -2461,11 +2593,11 @@ async def compactloot(ctx, name):
         await ctx.send(realname + " has no loot entries to compact.")
         return
 
-    bot3ws9.update([packed_items], "B" + str(row_num), value_input_option='USER_ENTERED')
-    bot3ws9.update([packed_costs], "B" + str(row_num + 1), value_input_option='USER_ENTERED')
+    await bot3ws9.aupdate([packed_items], "B" + str(row_num), value_input_option='USER_ENTERED')
+    await bot3ws9.aupdate([packed_costs], "B" + str(row_num + 1), value_input_option='USER_ENTERED')
 
     logbody = ["compactloot", str(ctx.author.name), dt.now().strftime("%d/%m/%Y %H:%M:%S"), str([realname, len(pairs)])]
-    bot3ws11.append_row(logbody)
+    await bot3ws11.aappend_row(logbody)
 
     await ctx.send(f"Compacted {len(pairs)} item(s) for {realname}.")
 
@@ -2481,16 +2613,16 @@ async def adjust(ctx, name, number, kp):
         await ctx.send("Invalid KP pool!")
         return
     ws = KP_WORKSHEETS[kp]["admin"]
-    user_list = ws.col_values(1)
+    user_list = await ws.acol_values(1)
     realname, caps, spaces, suggestions = find_name(name, user_list)
     if realname != None:
-        cell = ws.find(realname, in_column=1)
+        cell = await ws.afind(realname, in_column=1)
         row_num = cell.row
-        adjusted = float(ws.cell(row_num, 6).value) + number
-        ws.update_cell(row_num, 6, adjusted)
+        adjusted = float((await ws.acell_(row_num, 6)).value) + number
+        await ws.aupdate_cell(row_num, 6, adjusted)
         await ctx.send(realname + "'s " + kp + " has been adjusted by " + str(number))
         logbody = ["adjust", str(ctx.author.name), dt.now().strftime("%d/%m/%Y %H:%M:%S"), str([realname, number, kp])]
-        bot3ws11.append_row(logbody)
+        await bot3ws11.aappend_row(logbody)
     else:
         await ctx.send(not_found_message(name, suggestions))
 
@@ -2532,7 +2664,7 @@ async def bossconfig(ctx, action, pool = None, bossname = None, points = None):
         save_bosses()
         await ctx.send("Added " + bossname + " to " + pool + " with " + str(points) + " points.")
         logbody = ["bossconfig add", str(ctx.author.name), dt.now().strftime("%d/%m/%Y %H:%M:%S"), str([pool, bossname, points])]
-        bot3ws11.append_row(logbody)
+        await bot3ws11.aappend_row(logbody)
     elif action == "remove":
         if bossname not in BOSS_DICTS[pool]:
             await ctx.send(bossname + " is not in " + pool + "!")
@@ -2541,7 +2673,7 @@ async def bossconfig(ctx, action, pool = None, bossname = None, points = None):
         save_bosses()
         await ctx.send("Removed " + bossname + " from " + pool + " (was " + str(old_points) + " points).")
         logbody = ["bossconfig remove", str(ctx.author.name), dt.now().strftime("%d/%m/%Y %H:%M:%S"), str([pool, bossname, old_points])]
-        bot3ws11.append_row(logbody)
+        await bot3ws11.aappend_row(logbody)
     elif action == "update":
         if points is None:
             await ctx.send("Usage: `$bossconfig update <pool> <bossname> <points>`")
@@ -2555,7 +2687,7 @@ async def bossconfig(ctx, action, pool = None, bossname = None, points = None):
         save_bosses()
         await ctx.send("Updated " + bossname + " in " + pool + " from " + str(old_points) + " to " + str(points) + " points.")
         logbody = ["bossconfig update", str(ctx.author.name), dt.now().strftime("%d/%m/%Y %H:%M:%S"), str([pool, bossname, old_points, points])]
-        bot3ws11.append_row(logbody)
+        await bot3ws11.aappend_row(logbody)
     else:
         await ctx.send("Unknown action! Use: `list`, `add`, `remove`, or `update`")
 
@@ -2566,7 +2698,7 @@ async def boss(ctx, bossname, toonlist):
     """attendance command"""
     # check the bossname against the lists
     # some bosses have level requirements to check also, so need to pull the row from the roster
-    user_list = cached_col_values(bot4ws1, 1, "roster_names")
+    user_list = await acached_col_values(bot4ws1, 1, "roster_names")
     bossname = bossname.capitalize()
     await ctx.send("processing attendance for " + bossname)
     toonlist = toonlist.split(",")
@@ -2587,10 +2719,10 @@ async def boss(ctx, bossname, toonlist):
     for t in toonlist:
         findt, caps, spaces, suggestions = find_name(t, user_list)
         if findt is not None:
-            cell = bot4ws1.find(findt, in_column=1)
+            cell = await bot4ws1.afind(findt, in_column=1)
             row_num = cell.row
             #get the whole row
-            row = bot3ws1.row_values(row_num)
+            row = await bot3ws1.arow_values(row_num)
             level = int(row[3])
             maintoon = row[2]
             maintoon = toBool(maintoon)
@@ -2600,135 +2732,135 @@ async def boss(ctx, bossname, toonlist):
             if maintoon and findt not in rbpp_list:
             # rbpp and dino and crom
                 if bossname in rbpp_bosses:
-                    cell2 = bot2ws8.find(findt, in_column=1)
+                    cell2 = await bot2ws8.afind(findt, in_column=1)
                     row_num2 = cell2.row
-                    earned = float(bot2ws8.cell(row_num2, 4).value)
+                    earned = float((await bot2ws8.acell_(row_num2, 4)).value)
                     new = earned + 1
-                    bot2ws8.update_cell(row_num2, 4, new)
-                    bot5ws8.update_cell(row_num2, 2, currenttime)
+                    await bot2ws8.aupdate_cell(row_num2, 4, new)
+                    await bot5ws8.aupdate_cell(row_num2, 2, currenttime)
                     rbpp_list.append(findt)
                     if "RBPP" not in kppool:
                         kppool.append("RBPP")
                 if bossname in dpkp_bosses:
-                    cell3 = bot1ws7.find(findt, in_column=1)
+                    cell3 = await bot1ws7.afind(findt, in_column=1)
                     row_num3 = cell3.row
-                    earned = float(bot1ws7.cell(row_num3, 4).value)
+                    earned = float((await bot1ws7.acell_(row_num3, 4)).value)
                     new = earned + dpkp_bosses[bossname]
-                    bot1ws7.update_cell(row_num3, 4, new)
-                    bot5ws7.update_cell(row_num3, 2, currenttime)
+                    await bot1ws7.aupdate_cell(row_num3, 4, new)
+                    await bot5ws7.aupdate_cell(row_num3, 2, currenttime)
                     dpkp_list.append(findt)
                     if "DPKP" not in kppool:
                         kppool.append("DPKP")
                 if bossname in rbppunox_bosses:
-                    cell8 = bot2ws6.find(findt, in_column=1)
+                    cell8 = await bot2ws6.afind(findt, in_column=1)
                     row_num8 = cell8.row
-                    earned = float(bot2ws6.cell(row_num8, 4).value)
+                    earned = float((await bot2ws6.acell_(row_num8, 4)).value)
                     new = earned + rbppunox_bosses[bossname]
-                    bot2ws6.update_cell(row_num8, 4, new)
-                    bot5ws6.update_cell(row_num8, 2, currenttime)
+                    await bot2ws6.aupdate_cell(row_num8, 4, new)
+                    await bot5ws6.aupdate_cell(row_num8, 2, currenttime)
                     rbppunox_list.append(findt)
                     if "RBPPUNOX" not in kppool:
                         kppool.append("RBPPUNOX")
                 if bossname in vkp_bosses:
-                    cell7 = bot1ws2.find(findt, in_column=1)
+                    cell7 = await bot1ws2.afind(findt, in_column=1)
                     row_num7 = cell7.row
-                    earned = float(bot1ws2.cell(row_num7, 4).value)
+                    earned = float((await bot1ws2.acell_(row_num7, 4)).value)
                     new = earned + vkp_bosses[bossname]
-                    bot1ws2.update_cell(row_num7, 4, new)
-                    bot5ws2.update_cell(row_num7, 2, currenttime)
+                    await bot1ws2.aupdate_cell(row_num7, 4, new)
+                    await bot5ws2.aupdate_cell(row_num7, 2, currenttime)
                     vkp_list.append(findt)
                     if "VKP" not in kppool:
                         kppool.append("VKP")
             elif mainchar not in rbpp_list:
                 if bossname in rbpp_bosses:
-                    cell2 = bot2ws8.find(mainchar, in_column=1)
+                    cell2 = await bot2ws8.afind(mainchar, in_column=1)
                     row_num2 = cell2.row
-                    earned = float(bot2ws8.cell(row_num2, 4).value)
+                    earned = float((await bot2ws8.acell_(row_num2, 4)).value)
                     new = earned + 1
-                    bot2ws8.update_cell(row_num2, 4, new)
-                    bot5ws8.update_cell(row_num2, 2, currenttime)
+                    await bot2ws8.aupdate_cell(row_num2, 4, new)
+                    await bot5ws8.aupdate_cell(row_num2, 2, currenttime)
                     rbpp_list.append(mainchar)
                     if "RBPP" not in kppool:
                         kppool.append("RBPP")
                 if bossname in dpkp_bosses:
-                    cell3 = bot1ws7.find(mainchar, in_column=1)
+                    cell3 = await bot1ws7.afind(mainchar, in_column=1)
                     row_num3 = cell3.row
-                    earned = float(bot1ws7.cell(row_num3, 4).value)
+                    earned = float((await bot1ws7.acell_(row_num3, 4)).value)
                     new = earned + dpkp_bosses[bossname]
-                    bot1ws7.update_cell(row_num3, 4, new)
-                    bot5ws7.update_cell(row_num3, 2, currenttime)
+                    await bot1ws7.aupdate_cell(row_num3, 4, new)
+                    await bot5ws7.aupdate_cell(row_num3, 2, currenttime)
                     dpkp_list.append(mainchar)
                     if "DPKP" not in kppool:
                         kppool.append("DPKP")
                 if bossname in rbppunox_bosses:
-                    cell8 = bot2ws6.find(mainchar, in_column=1)
+                    cell8 = await bot2ws6.afind(mainchar, in_column=1)
                     row_num8 = cell8.row
-                    earned = float(bot2ws6.cell(row_num8, 4).value)
+                    earned = float((await bot2ws6.acell_(row_num8, 4)).value)
                     new = earned + rbppunox_bosses[bossname]
-                    bot2ws6.update_cell(row_num8, 4, new)
-                    bot5ws6.update_cell(row_num8, 2, currenttime)
+                    await bot2ws6.aupdate_cell(row_num8, 4, new)
+                    await bot5ws6.aupdate_cell(row_num8, 2, currenttime)
                     rbppunox_list.append(mainchar)
                     if "RBPPUNOX" not in kppool:
                         kppool.append("RBPPUNOX")
                 if bossname in vkp_bosses:
-                    cell7 = bot1ws2.find(mainchar, in_column=1)
+                    cell7 = await bot1ws2.afind(mainchar, in_column=1)
                     row_num7 = cell7.row
-                    earned = float(bot1ws2.cell(row_num7, 4).value)
+                    earned = float((await bot1ws2.acell_(row_num7, 4)).value)
                     new = earned + vkp_bosses[bossname]
-                    bot1ws2.update_cell(row_num7, 4, new)
-                    bot5ws2.update_cell(row_num7, 2, currenttime)
+                    await bot1ws2.aupdate_cell(row_num7, 4, new)
+                    await bot5ws2.aupdate_cell(row_num7, 2, currenttime)
                     vkp_list.append(mainchar)
                     if "VKP" not in kppool:
                         kppool.append("VKP")
             if bossname in akp_bosses:
                 if level >= 220:
-                    cell4 = bot1ws5.find(findt, in_column=1)
+                    cell4 = await bot1ws5.afind(findt, in_column=1)
                     row_num4 = cell4.row
-                    earned = float(bot1ws5.cell(row_num4, 4).value)
+                    earned = float((await bot1ws5.acell_(row_num4, 4)).value)
                     new = earned + akp_bosses[bossname]
-                    bot1ws5.update_cell(row_num4, 4, new)
-                    bot5ws5.update_cell(row_num4, 2, currenttime)
+                    await bot1ws5.aupdate_cell(row_num4, 4, new)
+                    await bot5ws5.aupdate_cell(row_num4, 2, currenttime)
                     akp_list.append(findt)
                     if "AKP" not in kppool:
                         kppool.append("AKP")
                 else:
-                    cell4 = bot1ws5.find(findt, in_column=1)
+                    cell4 = await bot1ws5.afind(findt, in_column=1)
                     row_num4 = cell4.row
-                    earned = float(bot1ws5.cell(row_num4, 4).value)
+                    earned = float((await bot1ws5.acell_(row_num4, 4)).value)
                     new = earned + akp_bosses[bossname] - 5
-                    bot1ws5.update_cell(row_num4, 4, new)
-                    bot5ws5.update_cell(row_num4, 2, currenttime)
+                    await bot1ws5.aupdate_cell(row_num4, 4, new)
+                    await bot5ws5.aupdate_cell(row_num4, 2, currenttime)
                     akp_low_list.append(findt)
                     if "AKP" not in kppool:
                         kppool.append("AKP")
             if bossname in pkp_bosses:
                 if level >= 220 or bossname == "Bane":
-                    cell5 = bot1ws4.find(findt, in_column=1)
+                    cell5 = await bot1ws4.afind(findt, in_column=1)
                     row_num5 = cell5.row
-                    earned = float(bot1ws4.cell(row_num5, 4).value)
+                    earned = float((await bot1ws4.acell_(row_num5, 4)).value)
                     new = earned + pkp_bosses[bossname]
-                    bot1ws4.update_cell(row_num5, 4, new)
-                    bot5ws4.update_cell(row_num5, 2, currenttime)
+                    await bot1ws4.aupdate_cell(row_num5, 4, new)
+                    await bot5ws4.aupdate_cell(row_num5, 2, currenttime)
                     pkp_list.append(findt)
                     if "PKP" not in kppool:
                         kppool.append("PKP")
                 else:
-                    cell5 = bot1ws4.find(findt, in_column=1)
+                    cell5 = await bot1ws4.afind(findt, in_column=1)
                     row_num5 = cell5.row
-                    earned = float(bot1ws4.cell(row_num5, 4).value)
+                    earned = float((await bot1ws4.acell_(row_num5, 4)).value)
                     new = earned + pkp_bosses[bossname] - 5
-                    bot1ws4.update_cell(row_num5, 4, new)
-                    bot5ws4.update_cell(row_num5, 2, currenttime)
+                    await bot1ws4.aupdate_cell(row_num5, 4, new)
+                    await bot5ws4.aupdate_cell(row_num5, 2, currenttime)
                     pkp_low_list.append(findt)
                     if "PKP" not in kppool:
                         kppool.append("PKP")
             if bossname in gkp_bosses:
-                cell6 = bot1ws3.find(findt, in_column=1)
+                cell6 = await bot1ws3.afind(findt, in_column=1)
                 row_num6 = cell6.row
-                earned = float(bot1ws3.cell(row_num6, 4).value)
+                earned = float((await bot1ws3.acell_(row_num6, 4)).value)
                 new = earned + gkp_bosses[bossname]
-                bot1ws3.update_cell(row_num6, 4, new)
-                bot5ws3.update_cell(row_num6, 2, currenttime)
+                await bot1ws3.aupdate_cell(row_num6, 4, new)
+                await bot5ws3.aupdate_cell(row_num6, 2, currenttime)
                 gkp_list.append(findt)
                 if "GKP" not in kppool:
                     kppool.append("GKP")
@@ -2745,48 +2877,48 @@ async def boss(ctx, bossname, toonlist):
         rbpp_to_send = ', '.join(map(str, rbpp_list))
         embed.add_field(name = "1 RBPP", value = rbpp_to_send, inline = False)
         bosslog = [dt.now().strftime("%d/%m/%Y %H:%M:%S"), str(bossname), "RBPP", str(rbpp_list)]
-        bot3ws10.append_row(bosslog, value_input_option='USER_ENTERED')
+        await bot3ws10.aappend_row(bosslog, value_input_option='USER_ENTERED')
     if dpkp_list != []:
         dpkp_to_send = ', '.join(map(str, dpkp_list))
         embed.add_field(name = str(dpkp_bosses[bossname])+ " DPKP", value = dpkp_to_send, inline = False)
         bosslog = [dt.now().strftime("%d/%m/%Y %H:%M:%S"), str(bossname), "DPKP", str(dpkp_list)]
-        bot3ws10.append_row(bosslog, value_input_option='USER_ENTERED')
+        await bot3ws10.aappend_row(bosslog, value_input_option='USER_ENTERED')
     if akp_list != []:
         akp_to_send = ', '.join(map(str, akp_list))
         embed.add_field(name = str(akp_bosses[bossname])+ " AKP", value = akp_to_send, inline = False)
         bosslog = [dt.now().strftime("%d/%m/%Y %H:%M:%S"), str(bossname), "AKP", str(akp_list)]
-        bot3ws10.append_row(bosslog, value_input_option='USER_ENTERED')
+        await bot3ws10.aappend_row(bosslog, value_input_option='USER_ENTERED')
     if akp_low_list != []:
         akp_low_to_send = ', '.join(map(str, akp_low_list))
         embed.add_field(name = str((akp_bosses[bossname]-5)) + " AKP", value = akp_low_to_send, inline = False)
-        bosslog = [dt.now().strftime("%d/%m/%Y %H:%M:%S"), str(bossname), "AKP", str(akp_list)]
-        bot3ws10.append_row(bosslog, value_input_option='USER_ENTERED')
+        bosslog = [dt.now().strftime("%d/%m/%Y %H:%M:%S"), str(bossname), "AKP", str(akp_low_list)]
+        await bot3ws10.aappend_row(bosslog, value_input_option='USER_ENTERED')
     if pkp_list != []:
         pkp_to_send = ', '.join(map(str, pkp_list))
         embed.add_field(name = str(pkp_bosses[bossname])+ " PKP", value = pkp_to_send, inline = False)
         bosslog = [dt.now().strftime("%d/%m/%Y %H:%M:%S"), str(bossname), "PKP", str(pkp_list)]
-        bot3ws10.append_row(bosslog, value_input_option='USER_ENTERED')
+        await bot3ws10.aappend_row(bosslog, value_input_option='USER_ENTERED')
     if pkp_low_list != []:
         pkp_low_to_send = ', '.join(map(str, pkp_low_list))
         embed.add_field(name = str((pkp_bosses[bossname]-5)) + " PKP", value = pkp_low_to_send, inline = False)
-        bosslog = [dt.now().strftime("%d/%m/%Y %H:%M:%S"), str(bossname), "PKP", str(pkp_list)]
-        bot3ws10.append_row(bosslog, value_input_option='USER_ENTERED')
+        bosslog = [dt.now().strftime("%d/%m/%Y %H:%M:%S"), str(bossname), "PKP", str(pkp_low_list)]
+        await bot3ws10.aappend_row(bosslog, value_input_option='USER_ENTERED')
     if gkp_list != []:
         gkp_to_send = ', '.join(map(str, gkp_list))
         embed.add_field(name = str(gkp_bosses[bossname])+ " GKP", value = gkp_to_send, inline = False)
         bosslog = [dt.now().strftime("%d/%m/%Y %H:%M:%S"), str(bossname), "GKP", str(gkp_list)]
-        bot3ws10.append_row(bosslog, value_input_option='USER_ENTERED')
+        await bot3ws10.aappend_row(bosslog, value_input_option='USER_ENTERED')
     if vkp_list != []:
         vkp_to_send = ', '.join(map(str, vkp_list))
         embed.add_field(name = str(vkp_bosses[bossname])+ " VKP", value = vkp_to_send, inline = False)
         bosslog = [dt.now().strftime("%d/%m/%Y %H:%M:%S"), str(bossname), "VKP", str(vkp_list)]
-        bot3ws10.append_row(bosslog, value_input_option='USER_ENTERED')
+        await bot3ws10.aappend_row(bosslog, value_input_option='USER_ENTERED')
     if rbppunox_list != []:
         rbppunox_to_send = ', '.join(map(str, rbppunox_list))
         embed.add_field(name = str(rbppunox_bosses[bossname])+ " RBPPUNOX", value = rbppunox_to_send, inline = False)
         bosslog = [dt.now().strftime("%d/%m/%Y %H:%M:%S"), str(bossname), "RBPPUNOX", str(rbppunox_list)]
-        bot3ws10.append_row(bosslog, value_input_option='USER_ENTERED')
-    
+        await bot3ws10.aappend_row(bosslog, value_input_option='USER_ENTERED')
+
     print("sending embed")
 
     # if not emptyattend:
@@ -2794,7 +2926,7 @@ async def boss(ctx, bossname, toonlist):
 
     await ctx.send(embed=embed)
     logbody = ["boss", str(ctx.author.name), dt.now().strftime("%d/%m/%Y %H:%M:%S"), str([bossname, toonlist])]
-    bot3ws11.append_row(logbody)
+    await bot3ws11.aappend_row(logbody)
     
 @client.command()
 @dkp_only()
@@ -2804,7 +2936,7 @@ async def bosshalf(ctx, bossname, toonlist):
     await ctx.send("processing a half point attendance for " + bossname)
     # check the bossname against the lists
     # some bosses have level requirements to check also, so need to pull the row from the roster
-    user_list = cached_col_values(bot3ws1, 1, "roster_names")
+    user_list = await acached_col_values(bot3ws1, 1, "roster_names")
     bossname = bossname.capitalize()
     toonlist = toonlist.split(",")
     toonlist = [x.strip() for x in toonlist]
@@ -2823,60 +2955,60 @@ async def bosshalf(ctx, bossname, toonlist):
     for t in toonlist:
         findt, caps, spaces, suggestions = find_name(t, user_list)
         if findt is not None:
-            cell = bot3ws1.find(findt, in_column=1)
+            cell = await bot3ws1.afind(findt, in_column=1)
             row_num = cell.row
-            level = int(bot3ws1.cell(row_num, 4).value)
-            maintoon = bot3ws1.cell(row_num, 3).value
+            level = int((await bot3ws1.acell_(row_num, 4)).value)
+            maintoon = (await bot3ws1.acell_(row_num, 3)).value
             maintoon = toBool(maintoon)
             if bossname in akp_bosses:
                 if level >= 220:
-                    cell4 = bot1ws5.find(findt, in_column=1)
+                    cell4 = await bot1ws5.afind(findt, in_column=1)
                     row_num4 = cell4.row
-                    earned = float(bot1ws5.cell(row_num4, 4).value)
+                    earned = float((await bot1ws5.acell_(row_num4, 4)).value)
                     new = earned + (akp_bosses[bossname])/2
-                    bot1ws5.update_cell(row_num4, 4, new)
-                    bot5ws5.update_cell(row_num4, 2, currenttime)
+                    await bot1ws5.aupdate_cell(row_num4, 4, new)
+                    await bot5ws5.aupdate_cell(row_num4, 2, currenttime)
                     akp_list.append(findt)
                     if "AKP" not in kppool:
                         kppool.append("AKP")
                 else:
-                    cell4 = bot1ws5.find(findt, in_column=1)
+                    cell4 = await bot1ws5.afind(findt, in_column=1)
                     row_num4 = cell4.row
-                    earned = float(bot1ws5.cell(row_num4, 4).value)
+                    earned = float((await bot1ws5.acell_(row_num4, 4)).value)
                     new = earned + (akp_bosses[bossname] - 5)/2
-                    bot1ws5.update_cell(row_num4, 4, new)
-                    bot5ws5.update_cell(row_num4, 2, currenttime)
+                    await bot1ws5.aupdate_cell(row_num4, 4, new)
+                    await bot5ws5.aupdate_cell(row_num4, 2, currenttime)
                     akp_low_list.append(findt)
                     if "AKP" not in kppool:
                         kppool.append("AKP")
             if bossname in pkp_bosses:
                 if level >= 220 or bossname == "Bane":
-                    cell5 = bot1ws4.find(findt, in_column=1)
+                    cell5 = await bot1ws4.afind(findt, in_column=1)
                     row_num5 = cell5.row
-                    earned = float(bot1ws4.cell(row_num5, 4).value)
+                    earned = float((await bot1ws4.acell_(row_num5, 4)).value)
                     new = earned + (pkp_bosses[bossname])/2
-                    bot1ws4.update_cell(row_num5, 4, new)
-                    bot5ws4.update_cell(row_num5, 2, currenttime)
+                    await bot1ws4.aupdate_cell(row_num5, 4, new)
+                    await bot5ws4.aupdate_cell(row_num5, 2, currenttime)
                     pkp_list.append(findt)
                     if "PKP" not in kppool:
                         kppool.append("PKP")
                 else:
-                    cell5 = bot1ws4.find(findt, in_column=1)
+                    cell5 = await bot1ws4.afind(findt, in_column=1)
                     row_num5 = cell5.row
-                    earned = float(bot1ws4.cell(row_num5, 4).value)
+                    earned = float((await bot1ws4.acell_(row_num5, 4)).value)
                     new = earned + (pkp_bosses[bossname] - 5)/2
-                    bot1ws4.update_cell(row_num5, 4, new)
-                    bot5ws4.update_cell(row_num5, 2, currenttime)
+                    await bot1ws4.aupdate_cell(row_num5, 4, new)
+                    await bot5ws4.aupdate_cell(row_num5, 2, currenttime)
                     pkp_low_list.append(findt)
                     if "PKP" not in kppool:
                         kppool.append("PKP")
             if bossname in gkp_bosses:
-                cell6 = bot1ws3.find(findt, in_column=1)
+                cell6 = await bot1ws3.afind(findt, in_column=1)
                 row_num6 = cell6.row
-                earned = float(bot1ws3.cell(row_num6, 4).value)
+                earned = float((await bot1ws3.acell_(row_num6, 4)).value)
                 new = earned + (gkp_bosses[bossname])/2
-                bot1ws3.update_cell(row_num6, 4, new)
-                bot5ws3.update_cell(row_num6, 2, currenttime)
+                await bot1ws3.aupdate_cell(row_num6, 4, new)
+                await bot5ws3.aupdate_cell(row_num6, 2, currenttime)
                 gkp_list.append(findt)
                 if "GKP" not in kppool:
                     kppool.append("GKP")
@@ -2915,17 +3047,17 @@ async def bosshalf(ctx, bossname, toonlist):
 
     if not emptyattend:
         bosslog = [dt.now().strftime("%d/%m/%Y %H:%M:%S"), str(bossname + " HALF"), str(kppool), str(toonlist)]
-        bot3ws10.append_row(bosslog, value_input_option='USER_ENTERED')
+        await bot3ws10.aappend_row(bosslog, value_input_option='USER_ENTERED')
 
     await ctx.send(embed=embed)
-    
+
     logbody = ["bosshalf", str(ctx.author.name), dt.now().strftime("%d/%m/%Y %H:%M:%S"), str([bossname, toonlist])]
-    bot3ws11.append_row(logbody)
+    await bot3ws11.aappend_row(logbody)
 
 
 
 @client.command(aliases=['plb', 'pointsleaderboard', 'pointslb', 'pointlb'])
-@dkp_only()
+@dkp_read()
 async def pointleaderboard(ctx, kp, maxkp = 99999, number = 10):
     """displays the leaderboard for current points in a certain KP pool"""
     kp = kp.upper()
@@ -2935,8 +3067,8 @@ async def pointleaderboard(ctx, kp, maxkp = 99999, number = 10):
         await ctx.send("Invalid KP pool")
         return
     ws = KP_WORKSHEETS[kp]["read"]
-    namelist = cached_col_values(ws, 1, f"lb_{kp}_names", ttl=120)[1:]
-    pointlist = cached_col_values(ws, 7, f"lb_{kp}_points", ttl=120)[1:]
+    namelist = (await ws.acol_values(1))[1:]
+    pointlist = (await ws.acol_values(7))[1:]
     floatpointlist = list(map(float, pointlist))
     combined = list(zip(namelist, floatpointlist))
     sortedcombined = sorted(combined, key=lambda x: x[1], reverse=True)
@@ -2959,7 +3091,7 @@ async def pointleaderboard(ctx, kp, maxkp = 99999, number = 10):
 
 
 @client.command(aliases=['plb30', 'pointsleaderboardlast30', 'pointslb30', 'pointlb30'])
-@dkp_only()
+@dkp_read()
 async def pointleaderboardlast30(ctx, kp, maxatt = 100, number = 10):
     """darkhealz last 30 command"""
     kp = kp.upper()
@@ -2969,9 +3101,9 @@ async def pointleaderboardlast30(ctx, kp, maxatt = 100, number = 10):
         await ctx.send("Invalid KP pool")
         return
     ws = KP_WORKSHEETS[kp]["read"]
-    namelist = cached_col_values(ws, 1, f"lb_{kp}_names", ttl=120)[1:]
-    pointlist = cached_col_values(ws, 7, f"lb_{kp}_points", ttl=120)[1:]
-    attlist = cached_col_values(ws, 3, f"lb_{kp}_att", ttl=120)[1:]
+    namelist = (await ws.acol_values(1))[1:]
+    pointlist = (await ws.acol_values(7))[1:]
+    attlist = (await ws.acol_values(3))[1:]
     floatpointlist = list(map(float, pointlist))
     # attlist is in the format "7.49%", so we need to convert it to a float and remove the percentage sign
     # attlist could also be '#DIV/0!' because my sheet math is no good, so we need to handle that
@@ -3007,76 +3139,91 @@ async def mainswap(ctx, oldname, newname):
     # swaps all the characters owned by this person to the newname
 
     # get oldname current points
-    roster_names = cached_col_values(bot3ws1, 1, "roster_names")
-    findoldname, caps, spaces, suggestions = find_name(oldname, roster_names)
-    findnewname, caps, spaces, suggestions = find_name(newname, roster_names)
+    roster_names = await acached_col_values(bot3ws1, 1, "roster_names")
+    findoldname, caps_old, spaces_old, suggestions_old = find_name(oldname, roster_names)
+    findnewname, caps_new, spaces_new, suggestions_new = find_name(newname, roster_names)
+
+    if findoldname is None:
+        await ctx.send(not_found_message(oldname, suggestions_old))
+        return
+    if findnewname is None:
+        await ctx.send(not_found_message(newname, suggestions_new))
+        return
 
     # cache all find() row lookups — avoids ~25 redundant API reads
-    old_roster_row = bot1ws1.find(findoldname, in_column = 1).row
-    new_roster_row = bot1ws1.find(findnewname, in_column = 1).row
-    old_rbpp_row = bot1ws8.find(findoldname, in_column = 1).row
-    new_rbpp_row = bot1ws8.find(findnewname, in_column = 1).row
-    old_dpkp_row = bot1ws7.find(findoldname, in_column = 1).row
-    new_dpkp_row = bot1ws7.find(findnewname, in_column = 1).row
-    old_vkp_row = bot1ws2.find(findoldname, in_column = 1).row
-    new_vkp_row = bot1ws2.find(findnewname, in_column = 1).row
+    old_roster_cell = await bot1ws1.afind(findoldname, in_column = 1)
+    old_roster_row = old_roster_cell.row
+    new_roster_cell = await bot1ws1.afind(findnewname, in_column = 1)
+    new_roster_row = new_roster_cell.row
+    old_rbpp_cell = await bot1ws8.afind(findoldname, in_column = 1)
+    old_rbpp_row = old_rbpp_cell.row
+    new_rbpp_cell = await bot1ws8.afind(findnewname, in_column = 1)
+    new_rbpp_row = new_rbpp_cell.row
+    old_dpkp_cell = await bot1ws7.afind(findoldname, in_column = 1)
+    old_dpkp_row = old_dpkp_cell.row
+    new_dpkp_cell = await bot1ws7.afind(findnewname, in_column = 1)
+    new_dpkp_row = new_dpkp_cell.row
+    old_vkp_cell = await bot1ws2.afind(findoldname, in_column = 1)
+    old_vkp_row = old_vkp_cell.row
+    new_vkp_cell = await bot1ws2.afind(findnewname, in_column = 1)
+    new_vkp_row = new_vkp_cell.row
 
     # check if oldname and newname have the same main (ie are owned by the same person)
-    oldcell = bot5ws1.acell(f'G{old_roster_row}').value
-    newcell = bot5ws1.acell(f'G{new_roster_row}').value
+    oldcell = (await bot5ws1.aacell(f'G{old_roster_row}')).value
+    newcell = (await bot5ws1.aacell(f'G{new_roster_row}')).value
     if oldcell != newcell:
         await ctx.send("These characters are not owned by the same person.")
         return
 
     # set oldname main to false, newname main to true
-    bot5ws1.update_acell(f'C{old_roster_row}', 'FALSE')
-    bot5ws1.update_acell(f'C{new_roster_row}', 'TRUE')
+    await bot5ws1.aupdate_acell(f'C{old_roster_row}', 'FALSE')
+    await bot5ws1.aupdate_acell(f'C{new_roster_row}', 'TRUE')
 
     # set all instances of oldname to newname in column G of bot5ws1
-    characters_list = bot5ws1.col_values(7)
+    characters_list = await bot5ws1.acol_values(7)
     for i in range(len(characters_list)):
         if characters_list[i] == findoldname:
-            bot5ws1.update_acell(f'G{i + 1}', findnewname)
+            await bot5ws1.aupdate_acell(f'G{i + 1}', findnewname)
 
-    oldrbppe = bot5ws8.acell(f'D{old_rbpp_row}').value
-    olddpkpe = bot5ws7.acell(f'D{old_dpkp_row}').value
-    oldvkpe = bot5ws2.acell(f'D{old_vkp_row}').value
+    oldrbppe = (await bot5ws8.aacell(f'D{old_rbpp_row}')).value
+    olddpkpe = (await bot5ws7.aacell(f'D{old_dpkp_row}')).value
+    oldvkpe = (await bot5ws2.aacell(f'D{old_vkp_row}')).value
 
-    oldrbpps = bot5ws8.acell(f'E{new_rbpp_row}').value
-    olddpkps = bot5ws7.acell(f'E{new_dpkp_row}').value
-    oldvkps = bot5ws2.acell(f'E{new_vkp_row}').value
+    oldrbpps = (await bot5ws8.aacell(f'E{old_rbpp_row}')).value
+    olddpkps = (await bot5ws7.aacell(f'E{old_dpkp_row}')).value
+    oldvkps = (await bot5ws2.aacell(f'E{old_vkp_row}')).value
 
-    oldrbppa = bot5ws8.acell(f'F{old_rbpp_row}').value
-    olddpkpa = bot5ws7.acell(f'F{old_dpkp_row}').value
-    oldvkpa = bot5ws2.acell(f'F{old_vkp_row}').value
+    oldrbppa = (await bot5ws8.aacell(f'F{old_rbpp_row}')).value
+    olddpkpa = (await bot5ws7.aacell(f'F{old_dpkp_row}')).value
+    oldvkpa = (await bot5ws2.aacell(f'F{old_vkp_row}')).value
 
     print(f"Old main {findoldname} has {oldrbppe} RBPP, {olddpkpe} DPKP, and {oldvkpe} VKP")
 
     # set newnames points to the oldmains values.
-    bot5ws8.update_acell(f'D{new_rbpp_row}', oldrbppe)
-    bot5ws7.update_acell(f'D{new_dpkp_row}', olddpkpe)
-    bot5ws2.update_acell(f'D{new_vkp_row}', oldvkpe)
+    await bot5ws8.aupdate_acell(f'D{new_rbpp_row}', oldrbppe)
+    await bot5ws7.aupdate_acell(f'D{new_dpkp_row}', olddpkpe)
+    await bot5ws2.aupdate_acell(f'D{new_vkp_row}', oldvkpe)
 
-    bot5ws8.update_acell(f'E{new_rbpp_row}', oldrbpps)
-    bot5ws7.update_acell(f'E{new_dpkp_row}', olddpkps)
-    bot5ws2.update_acell(f'E{new_vkp_row}', oldvkps)
+    await bot5ws8.aupdate_acell(f'E{new_rbpp_row}', oldrbpps)
+    await bot5ws7.aupdate_acell(f'E{new_dpkp_row}', olddpkps)
+    await bot5ws2.aupdate_acell(f'E{new_vkp_row}', oldvkps)
 
-    bot5ws8.update_acell(f'F{new_rbpp_row}', oldrbppa)
-    bot5ws7.update_acell(f'F{new_dpkp_row}', olddpkpa)
-    bot5ws2.update_acell(f'F{new_vkp_row}', oldvkpa)
+    await bot5ws8.aupdate_acell(f'F{new_rbpp_row}', oldrbppa)
+    await bot5ws7.aupdate_acell(f'F{new_dpkp_row}', olddpkpa)
+    await bot5ws2.aupdate_acell(f'F{new_vkp_row}', oldvkpa)
 
     # set the oldnames points to 0
-    bot5ws8.update_acell(f'D{old_rbpp_row}', 0)
-    bot5ws7.update_acell(f'D{old_dpkp_row}', 0)
-    bot5ws2.update_acell(f'D{old_vkp_row}', 0)
+    await bot5ws8.aupdate_acell(f'D{old_rbpp_row}', 0)
+    await bot5ws7.aupdate_acell(f'D{old_dpkp_row}', 0)
+    await bot5ws2.aupdate_acell(f'D{old_vkp_row}', 0)
 
-    bot5ws8.update_acell(f'E{old_rbpp_row}', 0)
-    bot5ws7.update_acell(f'E{old_dpkp_row}', 0)
-    bot5ws2.update_acell(f'E{old_vkp_row}', 0)
+    await bot5ws8.aupdate_acell(f'E{old_rbpp_row}', 0)
+    await bot5ws7.aupdate_acell(f'E{old_dpkp_row}', 0)
+    await bot5ws2.aupdate_acell(f'E{old_vkp_row}', 0)
 
-    bot5ws8.update_acell(f'F{old_rbpp_row}', 0)
-    bot5ws7.update_acell(f'F{old_dpkp_row}', 0)
-    bot5ws2.update_acell(f'F{old_vkp_row}', 0)
+    await bot5ws8.aupdate_acell(f'F{old_rbpp_row}', 0)
+    await bot5ws7.aupdate_acell(f'F{old_dpkp_row}', 0)
+    await bot5ws2.aupdate_acell(f'F{old_vkp_row}', 0)
 
     await ctx.send(f"Swapped main from {findoldname} to {findnewname}. {findnewname} now has {oldrbppe} RBPP, {olddpkpe} DPKP, and {oldvkpe} VKP")
 
@@ -3088,17 +3235,19 @@ async def newowner(ctx, *charnames):
     charnames = list(charnames)
     charnames = [x.strip() for x in charnames]
     sendlist = []
+    roster_names_for_newowner = await acached_col_values(bot3ws1, 1, "roster_names")
     for c in charnames:
-        findc, caps, spaces, suggestions = find_name(c, cached_col_values(bot3ws1, 1, "roster_names"))
+        findc, caps, spaces, suggestions = find_name(c, roster_names_for_newowner)
         if findc is not None:
             # set the main to Blank
-            bot5ws1.update_acell(f'G{bot1ws1.find(findc, in_column = 1).row}', '')
+            roster_cell = await bot1ws1.afind(findc, in_column = 1)
+            await bot5ws1.aupdate_acell(f'G{roster_cell.row}', '')
             # set all the wins to [OLD] prefix
             # for each column above 2 in ws9 in the row
             # get the name, append [OLD] to the front, and update the cell
-            row = bot1ws9.find(findc, in_column = 1).row
+            loot_cell = await bot1ws9.afind(findc, in_column = 1)
+            row = loot_cell.row
             for col in range(2, bot1ws9.col_count + 1):
-                name = bot1ws9.acell(f'{chr(64 + col)}{row}').value
                 # handle column letter greater than 26 -> AA, AB, etc
                 colletter = ''
                 if col > 26:
@@ -3106,43 +3255,58 @@ async def newowner(ctx, *charnames):
                     colletter += chr(64 + (col % 26))
                 else:
                     colletter = chr(64 + col)
+                name = (await bot1ws9.aacell(f'{colletter}{row}')).value
                 print("changing " + str(name) + " in cell " + f'{colletter}{row}')
                 if name != '' and name is not None and not name.startswith('[OLD] '):
                     newname = '[OLD] ' + name
-                    bot1ws9.update_acell(f'{colletter}{row}', newname)
+                    await bot1ws9.aupdate_acell(f'{colletter}{row}', newname)
                 else:
                     # stop the for loop, we have reached the end
                     break
             # set the points to 0 by adjusting them
             # get the current points in column g
             # add that value to column f
-            currvkp = float(bot5ws2.acell(f'G{bot4ws2.find(findc, in_column = 1).row}').value)
-            adjustedvkp = float(bot5ws2.acell(f'F{bot4ws2.find(findc, in_column = 1).row}').value)
-            bot5ws1.update_acell(f'F{bot1ws2.find(findc, in_column = 1).row}', adjustedvkp - currvkp)
+            vkp4_cell = await bot4ws2.afind(findc, in_column = 1)
+            vkp1_cell = await bot1ws2.afind(findc, in_column = 1)
+            currvkp = float((await bot5ws2.aacell(f'G{vkp4_cell.row}')).value)
+            adjustedvkp = float((await bot5ws2.aacell(f'F{vkp4_cell.row}')).value)
+            await bot5ws2.aupdate_acell(f'F{vkp1_cell.row}', adjustedvkp - currvkp)
 
-            currgkp = float(bot5ws3.acell(f'G{bot4ws3.find(findc, in_column = 1).row}').value)
-            adjustedgkp = float(bot5ws3.acell(f'F{bot4ws3.find(findc, in_column = 1).row}').value)
-            bot5ws3.update_acell(f'F{bot1ws3.find(findc, in_column = 1).row}', adjustedgkp - currgkp)
+            gkp4_cell = await bot4ws3.afind(findc, in_column = 1)
+            gkp1_cell = await bot1ws3.afind(findc, in_column = 1)
+            currgkp = float((await bot5ws3.aacell(f'G{gkp4_cell.row}')).value)
+            adjustedgkp = float((await bot5ws3.aacell(f'F{gkp4_cell.row}')).value)
+            await bot5ws3.aupdate_acell(f'F{gkp1_cell.row}', adjustedgkp - currgkp)
 
-            currpkp = float(bot5ws4.acell(f'G{bot4ws4.find(findc, in_column = 1).row}').value)
-            adjustedpkp = float(bot5ws4.acell(f'F{bot4ws4.find(findc, in_column = 1).row}').value)
-            bot5ws4.update_acell(f'F{bot1ws4.find(findc, in_column = 1).row}', adjustedpkp - currpkp)
+            pkp4_cell = await bot4ws4.afind(findc, in_column = 1)
+            pkp1_cell = await bot1ws4.afind(findc, in_column = 1)
+            currpkp = float((await bot5ws4.aacell(f'G{pkp4_cell.row}')).value)
+            adjustedpkp = float((await bot5ws4.aacell(f'F{pkp4_cell.row}')).value)
+            await bot5ws4.aupdate_acell(f'F{pkp1_cell.row}', adjustedpkp - currpkp)
 
-            currakp = float(bot5ws5.acell(f'G{bot4ws5.find(findc, in_column = 1).row}').value)
-            adjustedakp = float(bot5ws5.acell(f'F{bot4ws5.find(findc, in_column = 1).row}').value)
-            bot5ws5.update_acell(f'F{bot1ws5.find(findc, in_column = 1).row}', adjustedakp - currakp)
+            akp4_cell = await bot4ws5.afind(findc, in_column = 1)
+            akp1_cell = await bot1ws5.afind(findc, in_column = 1)
+            currakp = float((await bot5ws5.aacell(f'G{akp4_cell.row}')).value)
+            adjustedakp = float((await bot5ws5.aacell(f'F{akp4_cell.row}')).value)
+            await bot5ws5.aupdate_acell(f'F{akp1_cell.row}', adjustedakp - currakp)
 
-            currrbppunox = float(bot5ws6.acell(f'G{bot4ws6.find(findc, in_column = 1).row}').value)
-            adjustedrbppunox = float(bot5ws6.acell(f'F{bot4ws6.find(findc, in_column = 1).row}').value)
-            bot5ws6.update_acell(f'F{bot1ws6.find(findc, in_column = 1).row}', adjustedrbppunox - currrbppunox)
+            rbppunox4_cell = await bot4ws6.afind(findc, in_column = 1)
+            rbppunox1_cell = await bot1ws6.afind(findc, in_column = 1)
+            currrbppunox = float((await bot5ws6.aacell(f'G{rbppunox4_cell.row}')).value)
+            adjustedrbppunox = float((await bot5ws6.aacell(f'F{rbppunox4_cell.row}')).value)
+            await bot5ws6.aupdate_acell(f'F{rbppunox1_cell.row}', adjustedrbppunox - currrbppunox)
 
-            currdpkp = float(bot5ws7.acell(f'G{bot4ws7.find(findc, in_column = 1).row}').value)
-            adjusteddpkp = float(bot5ws7.acell(f'F{bot4ws7.find(findc, in_column = 1).row}').value)
-            bot5ws7.update_acell(f'F{bot1ws7.find(findc, in_column = 1).row}', adjusteddpkp - currdpkp)
+            dpkp4_cell = await bot4ws7.afind(findc, in_column = 1)
+            dpkp1_cell = await bot1ws7.afind(findc, in_column = 1)
+            currdpkp = float((await bot5ws7.aacell(f'G{dpkp4_cell.row}')).value)
+            adjusteddpkp = float((await bot5ws7.aacell(f'F{dpkp4_cell.row}')).value)
+            await bot5ws7.aupdate_acell(f'F{dpkp1_cell.row}', adjusteddpkp - currdpkp)
 
-            currrbpp = float(bot5ws8.acell(f'G{bot4ws8.find(findc, in_column = 1).row}').value)
-            adjustedrbpp = float(bot5ws8.acell(f'F{bot4ws8.find(findc, in_column = 1).row}').value)
-            bot5ws8.update_acell(f'F{bot1ws8.find(findc, in_column = 1).row}', adjustedrbpp - currrbpp)
+            rbpp4_cell = await bot4ws8.afind(findc, in_column = 1)
+            rbpp1_cell = await bot1ws8.afind(findc, in_column = 1)
+            currrbpp = float((await bot5ws8.aacell(f'G{rbpp4_cell.row}')).value)
+            adjustedrbpp = float((await bot5ws8.aacell(f'F{rbpp4_cell.row}')).value)
+            await bot5ws8.aupdate_acell(f'F{rbpp1_cell.row}', adjustedrbpp - currrbpp)
 
             sendlist.append(findc)
         else:
@@ -3150,14 +3314,14 @@ async def newowner(ctx, *charnames):
     await ctx.send("Processed the following characters: " + ', '.join(sendlist))
 
 @client.command(aliases=['cplb', 'classpointsleaderboard', 'classpointslb', 'classpointlb'])
-@dkp_only()
+@dkp_read()
 async def classpointleaderboard(ctx, kp, classname, maxkp = 99999, number = 10):
     """displays the leaderboard for current points in a certain KP pool for a certain class"""
     kp = kp.upper()
     classname = classname.capitalize()
     maxkp = float(maxkp)
-    sheet1names = cached_col_values(bot4ws1, 1, "roster_names")
-    sheet1classes = cached_col_values(bot4ws1, 5, "roster_classes")
+    sheet1names = await bot4ws1.acol_values(1)
+    sheet1classes = await bot4ws1.acol_values(5)
     classnamelist = []
     for i in range(len(sheet1names)):
         if sheet1classes[i].capitalize() == classname:
@@ -3166,8 +3330,8 @@ async def classpointleaderboard(ctx, kp, classname, maxkp = 99999, number = 10):
         await ctx.send("Invalid KP pool")
         return
     ws = KP_WORKSHEETS[kp]["read"]
-    namelist = cached_col_values(ws, 1, f"lb_{kp}_names", ttl=120)[1:]
-    pointlist = cached_col_values(ws, 7, f"lb_{kp}_points", ttl=120)[1:]
+    namelist = (await ws.acol_values(1))[1:]
+    pointlist = (await ws.acol_values(7))[1:]
     floatpointlist = list(map(float, pointlist))
     combined = list(zip(namelist, floatpointlist))
     sortedcombined = sorted(combined, key=lambda x: x[1], reverse=True)
@@ -3190,7 +3354,7 @@ async def classpointleaderboard(ctx, kp, classname, maxkp = 99999, number = 10):
 
 
 @client.command(aliases=['elb', 'earnedpointsleaderboard', 'earnedpointslb', 'earnedpointlb'])
-@dkp_only()
+@dkp_read()
 async def earnedleaderboard(ctx, kp, number = 10):
     """displays the leaderboard for total points earned in a certain KP pool"""
     kp = kp.upper()
@@ -3198,8 +3362,8 @@ async def earnedleaderboard(ctx, kp, number = 10):
         await ctx.send("Invalid KP pool")
         return
     ws = KP_WORKSHEETS[kp]["read"]
-    namelist = cached_col_values(ws, 1, f"lb_{kp}_names", ttl=120)[1:]
-    pointlist = cached_col_values(ws, 4, f"lb_{kp}_earned", ttl=120)[1:]
+    namelist = (await ws.acol_values(1))[1:]
+    pointlist = (await ws.acol_values(4))[1:]
     floatpointlist = list(map(float, pointlist))
     combined = list(zip(namelist, floatpointlist))
     sortedcombined = sorted(combined, key=lambda x: x[1], reverse=True)
@@ -3253,7 +3417,7 @@ async def gen(ctx):
         if bossnames not in bosses:
             bosses += bossnames + ", "
     bosses = bosses[:-2]
-    toonnames = bot5ws1.col_values(1)
+    toonnames = await bot5ws1.acol_values(1)
     
     charnames = []
     charhalfnames = []
@@ -3316,14 +3480,14 @@ async def gen(ctx):
 async def dg(ctx):
     """displays the currently eligible players for dg armour"""
     print("[DG] Starting DG eligibility check")
-    dglist = bot4ws13.col_values(1)
-    mainlist = bot4ws13.col_values(2)
-    set_number = bot4ws13.col_values(4)
-    helm = bot4ws13.col_values(10)
-    bt_helm = bot4ws13.col_values(11)
-    next_item = bot4ws13.col_values(12)
-    last_received = bot4ws13.col_values(13) # last received and last polls are dates, like Dec 20, 2025
-    last_polls = bot4ws13.col_values(15)
+    dglist = await sheet_call(bot4ws13.col_values, 1)
+    mainlist = await sheet_call(bot4ws13.col_values, 2)
+    set_number = await sheet_call(bot4ws13.col_values, 4)
+    helm = await sheet_call(bot4ws13.col_values, 10)
+    bt_helm = await sheet_call(bot4ws13.col_values, 11)
+    next_item = await sheet_call(bot4ws13.col_values, 12)
+    last_received = await sheet_call(bot4ws13.col_values, 13) # last received and last polls are dates, like Dec 20, 2025
+    last_polls = await sheet_call(bot4ws13.col_values, 15)
     print(f"[DG] Loaded {len(dglist)-1} players from sheet")
     # remove the headers
     del dglist[0]
@@ -3431,9 +3595,9 @@ async def dg(ctx):
         # print(f"[DG] polls_since: no match found, returning {len(poll_dates)}")
         return len(poll_dates)
 
-    rbpp_list = bot5ws8.col_values(1)
-    rbpp_total_list = bot5ws8.col_values(7)
-    rbpp_percentage_list = bot5ws8.col_values(3)
+    rbpp_list = await bot5ws8.acol_values(1)
+    rbpp_total_list = await bot5ws8.acol_values(7)
+    rbpp_percentage_list = await bot5ws8.acol_values(3)
     del rbpp_list[0]
     del rbpp_percentage_list[0]
     del rbpp_total_list[0]
@@ -3453,8 +3617,8 @@ async def dg(ctx):
     # Build owner -> list of (parsed_date, raw_string) from UNFILTERED Doch Tracker (bot4ws12)
     # Scan columns F-K (item award dates: Gloves/Chest/Boots/Pants/Helm/BtHelm) AND M (Last received)
     # so we find the most recent award even if Last Received column wasn't updated.
-    all_dg_owners = bot4ws12.col_values(2)
-    item_cols = [bot4ws12.col_values(c) for c in (6, 7, 8, 9, 10, 11, 13)]
+    all_dg_owners = await sheet_call(bot4ws12.col_values, 2)
+    item_cols = [await sheet_call(bot4ws12.col_values, c) for c in (6, 7, 8, 9, 10, 11, 13)]
     del all_dg_owners[0]
     for c in item_cols:
         del c[0]
@@ -3589,6 +3753,7 @@ async def dg(ctx):
 
 @client.command()
 @dkp_only()
+@commands.has_any_role("General", "Guardian", "REDALiCE", "Helper")
 async def massdeduct(ctx, *message):
     """mass deduct command to be used in conjunction with bidgen. reply to the bidgen message or copy paste it in"""
     if ctx.message.reference is not None:
@@ -3601,7 +3766,8 @@ async def massdeduct(ctx, *message):
     # ignore the first line (expecting it to be the $bidgen and "generated bid commands")
     for line in lines[1:]:
         if line.startswith("$deduct"):
-            await ctx.send(internal_deduct(line))
+            result = await sheet_call(internal_deduct, line)
+            await ctx.send(result)
             await asyncio.sleep(15)  # Rate limit to 4 calls per minute (60s / 4 = 15s between calls)
     
 
@@ -3945,14 +4111,14 @@ async def oldwinnings(ctx, name, kp = None):
     """Displays a player's old loot winnings from Alice's spreadsheet"""
     if kp != None:
         kp = kp.upper()
-    all_rows = bot4ws14.get_all_values()
+    all_rows = await bot4ws14.aget_all_values()
     char_names = [row[2] for row in all_rows if len(row) >= 5 and row[2] != ""]
     realname, caps, spaces, suggestions = find_name(name, char_names)
     if realname == None:
         await ctx.send(not_found_message(name, suggestions))
         return
     # check if character exists in the current system
-    current_players = bot4ws9.col_values(1)
+    current_players = await bot4ws9.acol_values(1)
     in_current = any(realname.lower() == p.lower() for p in current_players)
     warning = "" if in_current else " (not in current system)"
     # collect matching rows
@@ -4067,15 +4233,13 @@ async def delete(ctx, *args):
     await ctx.send("Deleting " + " ".join(args))
 
 @client.command()
-@dkp_only()
 async def source(ctx):
-    """posts the link for the source code"""
+    """posts the link for the source code (available everywhere, no gate)"""
     await ctx.send("https://github.com/Haylia/Gwydion-DKP-bot")
 
 @client.command()
-@dkp_only()
 async def donate(ctx):
-    """posts the link for donations"""
+    """posts the link for donations (available everywhere, no gate)"""
     await ctx.send("https://www.paypal.me/liastarrrr")
 
 @client.command()
@@ -4121,14 +4285,14 @@ BOSS_ALIASES = {
     "bt": 141966, "bloodthorn": 141966, "bloodthorntheravenous": 141966,
     "gele": 102982, "gelebron": 102982,
     "base": 103027, "protbase": 103027, "proteusbase": 103027,
-    "dino": 142027, "dhiothu": 142027,
+    "dino": 142027, "dhiothu": 142027, "dhio": 142027,
     "hrung": 73708, "hrungnir": 73708,
     "mord": 73000, "mordris": 73000,
     "necro": 100002, "efnisien": 100002, "necromancer": 100002,
     "efnisienthenecromancer": 100002,
     "crom": 200490, "hellborne": 200490, "manikin": 200490,
     "cromhellborne": 200490, "cromshellborne": 200490,
-    "cromhellbornemanikin": 200490, "cromshellbornemanikin": 200490,
+    "cromhellbornemanikin": 200490, "cromshellbornemanikin": 200490, "mani": 200490,
 }
 
 CONFIRMED_BOSS_IDS = set(BOSS_NAMES.keys())
@@ -4185,7 +4349,7 @@ BOSS_POLL_ANCHOR_TIMES = [
 # Date ranges to exclude from all fight queries, stats, and auto-posts.
 # Inclusive on both ends. Edit this list to change which days are dropped.
 BOSS_EXCLUDED_DATE_RANGES = [
-    ("2025-10-15", "2025-11-01"),
+    ("2025-09-01", "2025-10-31"),
     ("2026-02-09", "2026-02-12"),
 ]
 
@@ -4959,13 +5123,17 @@ def find_detailed_fight_record(fight_id, max_pages=20, world_id=None):
 
 
 def get_best_boss_id_for_fight(fight_id, fight_data=None, world_id=None):
+    """Returns the BossId for `fight_id`, preferring a previously-saved value,
+    then the per-fight API response, then a live listing lookup. Returns any
+    non-zero BossId we can find — even if not in BOSS_NAMES — so non-Gwydion
+    worlds don't lose data for bosses we don't have friendly names for."""
     saved = get_saved_boss_id_for_fight(fight_id, world_id=world_id)
     if saved:
         return saved
     if fight_data:
         try:
             bid = int(fight_data.get("BossId", 0))
-            if bid in BOSS_NAMES:
+            if bid > 0:
                 return bid
         except Exception:
             pass
@@ -4973,7 +5141,7 @@ def get_best_boss_id_for_fight(fight_id, fight_data=None, world_id=None):
     if detailed:
         try:
             bid = int(detailed.get("BossId", 0))
-            if bid in BOSS_NAMES:
+            if bid > 0:
                 return bid
         except Exception:
             pass
@@ -4981,11 +5149,21 @@ def get_best_boss_id_for_fight(fight_id, fight_data=None, world_id=None):
 
 
 def _boss_fight_to_history_record(fight_id, detailed_fight, fight_data, world_id=None):
-    boss_id = int(detailed_fight.get("BossId", fight_data.get("BossId", 0)))
-    if boss_id not in BOSS_NAMES:
-        saved = get_saved_boss_id_for_fight(fight_id, world_id=world_id)
-        if saved:
-            boss_id = saved
+    # Prefer the listing-API BossId (more reliable), then the per-fight API,
+    # then our own history cache. Preserve any non-zero value — don't drop
+    # unknown bosses to 0.
+    boss_id = 0
+    try:
+        boss_id = int(detailed_fight.get("BossId", 0))
+    except Exception:
+        pass
+    if not boss_id:
+        try:
+            boss_id = int(fight_data.get("BossId", 0))
+        except Exception:
+            pass
+    if not boss_id:
+        boss_id = get_saved_boss_id_for_fight(fight_id, world_id=world_id)
     duration = int(fight_data.get("FightDurationSeconds", 0))
     total_damage = int(fight_data.get("TotalDamageDone", detailed_fight.get("TotalDamage", 0)))
     boss_hp = int(fight_data.get("BossHealth", 0))
@@ -5393,7 +5571,7 @@ async def boss_perform_auto_check():
             try:
                 posted = load_posted_fights(world_id=world_id)
                 try:
-                    fights = boss_get_detailed_fights(num_recs=100, page=1, world_id=world_id)
+                    fights = await sheet_call(boss_get_detailed_fights, num_recs=100, page=1, world_id=world_id)
                 except Exception:
                     logger.exception(f"Boss auto-check API failed for world {world_id}")
                     continue
@@ -5407,7 +5585,7 @@ async def boss_perform_auto_check():
                     fight_id = int(fight.get("FightId", 0))
                     # Fetch fight detail ONCE per fight, share across all guilds on this world.
                     try:
-                        data = boss_get_fight_data(fight_id, world_id=world_id)
+                        data = await sheet_call(boss_get_fight_data, fight_id, world_id=world_id)
                         boss_id = get_best_boss_id_for_fight(fight_id, data, world_id=world_id)
                         add_fight_to_history(fight_id, fight_data=data, world_id=world_id)
                     except Exception:
@@ -5670,7 +5848,7 @@ async def fights(ctx, per_page: int = 20):
     if world_id is None:
         return
     per_page = max(1, min(per_page, 25))
-    fights_list = _boss_collect_fights_for_listing(world_id=world_id)
+    fights_list = await sheet_call(_boss_collect_fights_for_listing, world_id=world_id)
     world_label = display_world(world_id)
     if not fights_list:
         await ctx.send(
@@ -5697,10 +5875,10 @@ async def sheet(ctx, *, target: str):
         target_clean = target.strip()
         if target_clean.isdigit():
             fight_id = int(target_clean)
-            data = boss_get_fight_data(fight_id, world_id=world_id)
-            boss_id = get_best_boss_id_for_fight(fight_id, data, world_id=world_id)
+            data = await sheet_call(boss_get_fight_data, fight_id, world_id=world_id)
+            boss_id = await sheet_call(get_best_boss_id_for_fight, fight_id, data, world_id=world_id)
         else:
-            boss_id, fight_id = boss_get_latest_boss_fight_id(target_clean, world_id=world_id)
+            boss_id, fight_id = await sheet_call(boss_get_latest_boss_fight_id, target_clean, world_id=world_id)
             if not boss_id:
                 await ctx.send(f"Unknown boss `{target}`. Try `$bossaliases`.")
                 return
@@ -5709,10 +5887,10 @@ async def sheet(ctx, *, target: str):
                     f"No recent {world_label} fight found for {boss_display_name(boss_id)}."
                 )
                 return
-            data = boss_get_fight_data(fight_id, world_id=world_id)
+            data = await sheet_call(boss_get_fight_data, fight_id, world_id=world_id)
         title = f"{boss_display_name(boss_id)} - Damage Chart"
-        image_path = create_boss_chart_image(fight_id, data, title, show_pilots=show_pilots)
-        add_fight_to_history(fight_id, fight_data=data, world_id=world_id)
+        image_path = await sheet_call(create_boss_chart_image, fight_id, data, title, show_pilots=show_pilots)
+        await sheet_call(add_fight_to_history, fight_id, fight_data=data, world_id=world_id)
         await ctx.send(
             f"Damage chart for fight **{fight_id}** ({world_label})",
             file=discord.File(image_path),
@@ -5776,6 +5954,7 @@ async def lbhelp(ctx):
         "`$bossreloadtraverser` — force-refresh the traverser cache",
         "`$bossrescrape [year|all]` — repair truncated cached fight JSONs",
         "`$bosspollnow` — force an immediate auto-check cycle",
+        "`$repairhistory [max_pages]` — re-fetch missing BossIds from the live API",
         "",
         "*DKP, roster, and bidding commands are Gwydion-Relentless-only and won't run elsewhere.*",
     ]
@@ -5855,7 +6034,7 @@ async def bossreloadtraverser(ctx):
         await ctx.send("You don't have permission to run this admin command.")
         return
     try:
-        history = boss_load_traverser_history(world_id=world_id, force=True)
+        history = await sheet_call(boss_load_traverser_history, world_id=world_id, force=True)
         cache = _boss_traverser_cache.get(int(world_id), {})
         await ctx.send(
             f"Reloaded traverser history: **{len(history)}** {display_world(world_id)} "
@@ -5949,7 +6128,7 @@ async def bossrescrape(ctx, scope: str = "2026"):
             f"&sortCol=1&sortDir=0&page=1&numRecs=2000"
         )
         try:
-            resp = requests.get(url, timeout=30)
+            resp = await sheet_call(requests.get, url, timeout=30)
             resp.raise_for_status()
             d = resp.json()
         except Exception:
@@ -5995,6 +6174,84 @@ async def bosspollnow(ctx):
     except Exception as e:
         logger.exception("Manual boss auto-check failed")
         await ctx.send(f"Auto-check failed: {e}")
+
+
+@client.command(aliases=['repairraidhistory', 'fixbossids'])
+async def repairhistory(ctx, max_pages: int = 20):
+    """Admin: re-fetch BossIds from the live listing API for any raid_history
+    entries in this server's world that currently have BossId 0. Scans up to
+    `max_pages` pages (default 20, ~10,000 fights) of the live listing. Older
+    entries saved before the bot recognised a particular boss get repaired."""
+    world_id = await _require_world_for_ctx(ctx)
+    if world_id is None:
+        return
+    entry = get_server_entry(ctx.guild.id)
+    if not is_server_setup_authorized(ctx.author, entry):
+        await ctx.send("You don't have permission to run this admin command.")
+        return
+    world_label = display_world(world_id)
+    history = load_raid_history(world_id=world_id)
+    bad_keys = [k for k, rec in history.items() if int(rec.get("BossId", 0) or 0) == 0]
+    if not bad_keys:
+        await ctx.send(
+            f"No BossId=0 entries to repair in {world_label} raid_history "
+            f"(scanned {len(history)} records)."
+        )
+        return
+    await ctx.send(
+        f"Found **{len(bad_keys)}** {world_label} entries with BossId=0. "
+        f"Scanning up to **{max_pages}** API page(s) (~{max_pages * 500} fights) "
+        f"to find their correct BossIds..."
+    )
+
+    # Build a FightId -> BossId map from the live listing API
+    fight_to_boss = {}
+    for page in range(1, max(1, int(max_pages)) + 1):
+        try:
+            fights = await sheet_call(
+                boss_get_detailed_fights,
+                num_recs=500, page=page, exclude_dates=False, world_id=world_id
+            )
+        except Exception:
+            logger.exception(f"repairhistory: API fetch failed on page {page}")
+            break
+        if not fights:
+            break
+        for f in fights:
+            try:
+                fid = int(f.get("FightId", 0))
+                bid = int(f.get("BossId", 0))
+            except Exception:
+                continue
+            if fid > 0 and bid > 0:
+                fight_to_boss[fid] = bid
+        await asyncio.sleep(0.15)
+
+    fixed = 0
+    not_found = 0
+    for key in bad_keys:
+        try:
+            fid = int(key)
+        except Exception:
+            not_found += 1
+            continue
+        bid = fight_to_boss.get(fid, 0)
+        if bid > 0:
+            history[key]["BossId"] = bid
+            history[key]["BossName"] = boss_display_name(bid)
+            fixed += 1
+        else:
+            not_found += 1
+
+    if fixed:
+        save_raid_history(history, world_id=world_id)
+
+    await ctx.send(
+        f"Repair complete for **{world_label}**.\n"
+        f"Repaired: **{fixed}** of **{len(bad_keys)}** entries. "
+        f"Could not resolve: **{not_found}** (live API didn't return those fights "
+        f"in the scanned window — try `$repairhistory 40` for a larger scan)."
+    )
 
 
 # ─── Player stat card ─────────────────────────────────────────────────────
