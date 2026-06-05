@@ -18,6 +18,7 @@ import difflib
 import cv2
 import numpy as np
 import asyncio
+import threading
 import traceback
 from dotenv import load_dotenv
 load_dotenv()
@@ -491,29 +492,42 @@ BOSS_DICTS = {
 BOSSES_FILE = "bosses.txt"
 
 def load_bosses():
-    """Load boss mappings from bosses.txt into the global dicts"""
+    """Load boss mappings from bosses.txt into the global dicts. Tolerant of a
+    missing or partially-corrupt file so a bad write can't stop the bot booting;
+    unparseable lines are skipped with a warning."""
     for d in BOSS_DICTS.values():
         d.clear()
     current_pool = None
-    with open(BOSSES_FILE, "r") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            if line.startswith("[") and line.endswith("]"):
-                current_pool = line[1:-1]
-            elif "=" in line and current_pool in BOSS_DICTS:
-                bossname, points = line.split("=", 1)
+    try:
+        with open(BOSSES_FILE, "r") as f:
+            lines = f.readlines()
+    except OSError as e:
+        logger.warning(f"Could not read {BOSSES_FILE}: {e} — boss mappings empty until reloaded")
+        return
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        if line.startswith("[") and line.endswith("]"):
+            current_pool = line[1:-1]
+        elif "=" in line and current_pool in BOSS_DICTS:
+            bossname, points = line.split("=", 1)
+            try:
                 BOSS_DICTS[current_pool][bossname.strip()] = int(points.strip())
+            except ValueError:
+                logger.warning(f"Skipping malformed boss line in {BOSSES_FILE}: {line!r}")
 
 def save_bosses():
-    """Save the current boss dicts back to bosses.txt"""
-    with open(BOSSES_FILE, "w") as f:
+    """Save the current boss dicts back to bosses.txt atomically (temp file +
+    os.replace) so a crash mid-write can't leave a corrupt/partial file."""
+    tmp = BOSSES_FILE + ".tmp"
+    with open(tmp, "w") as f:
         for pool in ["VKP", "GKP", "PKP", "AKP", "RBPPUNOX", "DPKP", "RBPP"]:
             f.write("[" + pool + "]\n")
             for bossname, points in BOSS_DICTS[pool].items():
                 f.write(bossname + "=" + str(points) + "\n")
             f.write("\n")
+    os.replace(tmp, BOSSES_FILE)
 
 load_bosses()
 print("loaded boss mappings from " + BOSSES_FILE)
@@ -535,7 +549,9 @@ OCR_API_KEY = os.getenv("OCR_API_KEY", "K89202162788957")
 BLACKLIST = {"total", "health", "damage", "dps"}
 
 bidslastupdate = time.time()
-_bids_dirty = True
+# Serializes bid read-modify-write across startbid/sendbid/cancelbid/bidloop so
+# concurrent calls can't clobber a row or hand out a duplicate auction id.
+_bid_lock = asyncio.Lock()
 
 guilds=[814048353603813376,1116453904922726544,1215443011400376391,920411637297598484]
 
@@ -625,6 +641,46 @@ async def sheet_call(fn, *args, **kwargs):
     """Run a blocking gspread / requests call in a worker thread so it
     does not stall the Discord event loop."""
     return await asyncio.to_thread(fn, *args, **kwargs)
+
+def safe_float(value, default=0.0):
+    """Parse a spreadsheet cell as float, tolerating blanks, '#DIV/0!' (and
+    other '#...' errors), trailing '%', and junk — returns `default` instead of
+    raising ValueError. Use for any column that gets mapped to numbers."""
+    try:
+        if value is None:
+            return default
+        s = str(value).strip().rstrip('%').strip()
+        if s == '' or s.startswith('#'):
+            return default
+        return float(s)
+    except (ValueError, TypeError):
+        return default
+
+def safe_int(value, default=0):
+    """Parse a spreadsheet cell as int, tolerating blanks/junk/'12.0'."""
+    try:
+        return int(safe_float(value, default))
+    except (ValueError, TypeError):
+        return default
+
+def pad_row(row, length):
+    """Right-pad a row (list) with '' to at least `length` cells so fixed-index
+    access past the last non-empty cell doesn't IndexError. gspread trims
+    trailing empties, so any row with blank trailing columns comes back short."""
+    row = list(row)
+    if len(row) < length:
+        row += [''] * (length - len(row))
+    return row
+
+def sanitize_cell(value):
+    """Neutralise spreadsheet formula injection for USER-SUPPLIED text written
+    with value_input_option='USER_ENTERED': if the value begins with = + - @,
+    prefix a single quote so Sheets stores it as literal text rather than
+    evaluating it as a formula. Do NOT use on values that are meant to be
+    formulas (e.g. the COUNTIFS strings written by $addmem)."""
+    if isinstance(value, str) and value[:1] in ('=', '+', '-', '@'):
+        return "'" + value
+    return value
 
 def toBool(string):
     string = string.capitalize()
@@ -793,12 +849,11 @@ def not_found_message(name, suggestions):
     
 @tasks.loop(seconds=60)
 async def bidloop():
-    global bidslastupdate, _bids_dirty
+    global bidslastupdate
     bidslastupdate = time.time()
     twelvehoursinseconds = 43200
     resultschannel = 1232811852811993169
     try:
-        _bids_dirty = False
         bidopentimes = await bot3ws12.acol_values(1)
         itemids = await bot3ws12.acol_values(2)
         itemnames = await bot3ws12.acol_values(3)
@@ -809,14 +864,20 @@ async def bidloop():
         useritemstatus = await bot3ws13.acol_values(7)
         combiuserlist = list(zip(useritemids,useritemstatus))
         for i in range(1, len(combilist)):
-            if combilist[i][2] == "Open" and float(time.time()) > float(combilist[i][0]) + twelvehoursinseconds:
-                await bot3ws12.aupdate_cell(int(combilist[i][1]) + 1, 5, "Closed")
-                for j in range(1, len(combiuserlist)):
-                    if combiuserlist[j][1] == "Open" and combiuserlist[j][0] == combilist[i][1]:
-                        await bot3ws13.aupdate_cell(j + 1, 7, "Closed")
-                cell = await bot3ws12.afind(combilist[i][1])
-                row_num = cell.row
-                bidrow = await bot3ws12.arow_values(row_num)
+            if combilist[i][2] == "Open" and float(time.time()) > safe_float(combilist[i][0]) + twelvehoursinseconds:
+                async with _bid_lock:
+                    # locate the auction by its id in column 2 (not a whole-sheet
+                    # scan that could match a price/number elsewhere) and use that
+                    # row for both the close-write and the results read.
+                    cell = await bot3ws12.afind(combilist[i][1], in_column=2)
+                    if cell is None:
+                        continue
+                    row_num = cell.row
+                    await bot3ws12.aupdate_cell(row_num, 5, "Closed")
+                    for j in range(1, len(combiuserlist)):
+                        if combiuserlist[j][1] == "Open" and combiuserlist[j][0] == combilist[i][1]:
+                            await bot3ws13.aupdate_cell(j + 1, 7, "Closed")
+                    bidrow = await bot3ws12.arow_values(row_num)
                 #cut off everything but the player name and the bids
                 bidrow = bidrow[5:]
                 # split the rest alternating between the player and their bid
@@ -826,7 +887,9 @@ async def bidloop():
                     player = bidrow.pop(0)
                     bid = bidrow.pop(0)
                     results.append([player, bid])
-                results.sort(key = lambda x: float(x[1]), reverse = True)
+                if not results:
+                    continue
+                results.sort(key = lambda x: safe_float(x[1]), reverse = True)
                 msgtosend = "The bid for " + combilist[i][3] + " has been closed. The highest bidder was " + results[0][0] + " with a bid of " + str(results[0][1]) + " " + combilist[i][4]
                 for k in range(1, len(results)):
                     msgtosend += "\n" + results[k][0] + " bid " + str(results[k][1]) + " " + combilist[i][4]
@@ -1207,19 +1270,26 @@ async def makeleaderboard(ctx):
 @dkp_only()
 async def startbid(ctx, item, startprice, kp, startbidder):
     """Starts a bid for a new item"""
-    global _bids_dirty
-    _bids_dirty = True
     kp = kp.upper()
     if kp not in ["VKP", "GKP", "PKP", "AKP", "RBPPUNOX", "DPKP"]:
         await ctx.send("Invalid kp type! Please use VKP, GKP, PKP, AKP, RBPPUNOX, DPKP")
         return
-    #get the bottom row for the id
-    id = len(await bot3ws12.acol_values(1))
     startprice = int(startprice)
-    bidrow = [time.time(), id, item, kp, "Open", startbidder, startprice]
-    await bot3ws12.aappend_row(bidrow)
-    userrow = [time.time(), str(ctx.author.id), id, item, startprice, kp, "Open", startbidder]
-    await bot3ws13.aappend_row(userrow)
+    # validate the bidder is a real roster name (the arg was free-form for testing)
+    roster_names = await acached_col_values(bot4ws1, 1, "roster_names")
+    real_bidder, caps, spaces, suggestions = find_name(startbidder, roster_names)
+    if real_bidder is None:
+        await ctx.send(not_found_message(startbidder, suggestions))
+        return
+    startbidder = real_bidder
+    # lock so two concurrent $startbid calls can't grab the same id
+    async with _bid_lock:
+        #get the bottom row for the id
+        id = len(await bot3ws12.acol_values(1))
+        bidrow = [time.time(), id, item, kp, "Open", startbidder, startprice]
+        await bot3ws12.aappend_row(bidrow)
+        userrow = [time.time(), str(ctx.author.id), id, item, startprice, kp, "Open", startbidder]
+        await bot3ws13.aappend_row(userrow)
     await ctx.send("Bid for " + item + " has started at " + str(startprice) + " " + kp + " by " + startbidder)
     await ctx.send("The ID for this bid is " + str(id) + ". Please use this number to bid on the item!")
 
@@ -1227,11 +1297,14 @@ async def startbid(ctx, item, startprice, kp, startbidder):
 @dkp_only()
 async def getitemname(ctx):
     """gets the item name from an image"""
+    if not ctx.message.attachments:
+        await ctx.send("Please attach an image to read the item name from.")
+        return
     image = ctx.message.attachments[0]
-    response = await sheet_call(requests.get, image.url)
+    response = await sheet_call(requests.get, image.url, timeout=25)
     img = Image.open(BytesIO(response.content))
-    processed = preprocessforgreen(img)
-    text = pytesseract.image_to_string(processed)
+    processed = await sheet_call(preprocessforgreen, img)
+    text = await sheet_call(pytesseract.image_to_string, processed)
     item_regex = r'(\b[A-Z][a-z]{1,}(?:\s+(?:of\s+the|of|the|and))?\s+[A-Z][a-z]{1,}((\s+(?:of\s+the|of|the|and))?\s+[A-Z][a-z]{1,})*)'
     extracted_items = re.findall(item_regex, text, re.DOTALL)
     if not extracted_items:
@@ -1259,64 +1332,93 @@ def preprocessforgreen(img):
 @dkp_only()
 async def sendbid(ctx, id, price, bidder):
     """command for sending a bid to the bid sheet"""
-    global _bids_dirty
-    _bids_dirty = True
     id = int(id)
     price = int(price)
-    bidrow = await bot3ws12.afind(str(id))
-    bidrownum = bidrow.row
-    bidrow = await bot3ws12.arow_values(bidrownum)
-    if bidrow[4] == "Open":
-        bidrow.append(bidder)
-        bidrow.append(price)
-        await bot3ws12.aupdate([bidrow], "A" + str(bidrownum), value_input_option='USER_ENTERED')
-        userrow = [time.time(), str(ctx.author.id), id, bidrow[2], price, bidrow[3], "Open", bidder]
-        await bot3ws13.aappend_row(userrow, value_input_option="raw")
-        await ctx.send("Bid for " + bidrow[2] + " has been placed at " + str(price) + " " + bidrow[3] + " by " + bidder)
-    else:
-        await ctx.send("This bid is closed!")
+    # validate the bidder is a real roster name (the arg was free-form for testing)
+    roster_names = await acached_col_values(bot4ws1, 1, "roster_names")
+    real_bidder, caps, spaces, suggestions = find_name(bidder, roster_names)
+    if real_bidder is None:
+        await ctx.send(not_found_message(bidder, suggestions))
+        return
+    bidder = real_bidder
+    async with _bid_lock:
+        cell = await bot3ws12.afind(str(id), in_column=2)
+        if cell is None:
+            await ctx.send("No bid found with ID " + str(id))
+            return
+        bidrownum = cell.row
+        bidrow = await bot3ws12.arow_values(bidrownum)
+        if bidrow[4] == "Open":
+            # reject bids the bidder can't afford in this item's KP pool, mirroring
+            # the check $deduct does when a won bid is processed (Current = col 7).
+            kp_pool = str(bidrow[3]).upper()
+            if kp_pool in KP_WORKSHEETS:
+                read_ws = KP_WORKSHEETS[kp_pool]["read"]
+                kp_cell = await read_ws.afind(bidder, in_column=1)
+                if kp_cell is None:
+                    await ctx.send(f"{bidder} has no {kp_pool} record, so can't bid in that pool.")
+                    return
+                current_pts = safe_float((await read_ws.acell_(kp_cell.row, 7)).value)
+                if price > current_pts:
+                    await ctx.send(f"{bidder} only has {current_pts:g} {kp_pool} — can't place a bid of {price}.")
+                    return
+            bidrow.append(bidder)
+            bidrow.append(price)
+            await bot3ws12.aupdate([[sanitize_cell(c) for c in bidrow]], "A" + str(bidrownum), value_input_option='USER_ENTERED')
+            userrow = [time.time(), str(ctx.author.id), id, bidrow[2], price, bidrow[3], "Open", bidder]
+            await bot3ws13.aappend_row(userrow, value_input_option="raw")
+            await ctx.send("Bid for " + bidrow[2] + " has been placed at " + str(price) + " " + bidrow[3] + " by " + bidder)
+        else:
+            await ctx.send("This bid is closed!")
 
 @client.command()
 @dkp_only()
 async def cancelbid(ctx, id, price, bidder):
     """command for cancelling a bid"""
-    global _bids_dirty
-    _bids_dirty = True
+    # normalise the bidder to the canonical roster name so it matches the stored bid
+    roster_names = await acached_col_values(bot4ws1, 1, "roster_names")
+    real_bidder, caps, spaces, suggestions = find_name(bidder, roster_names)
+    if real_bidder is None:
+        await ctx.send(not_found_message(bidder, suggestions))
+        return
+    bidder = real_bidder
     # check on the user bids sheet if the bid exists
-    userids = await bot3ws13.acol_values(2)
-    itemids = await bot3ws13.acol_values(3)
-    itemprices = await bot3ws13.acol_values(5)
-    toonnames = await bot3ws13.acol_values(8)
-    combili = list(zip(userids, itemids, itemprices, toonnames))
-    bidfound = False
-    for i in range(1, len(combili)):
-        if combili[i][0] == str(ctx.author.id) and combili[i][1] == id and combili[i][2] == price and combili[i][3] == bidder:
-            rownum = i + 1
-            await bot3ws13.adelete_rows(rownum)
-            bidfound = True
-    if bidfound:
-        #get the row for the item from the main sheet
-        bidrow = await bot3ws12.afind(str(id))
-        bidrownum = bidrow.row
-        bidrow = await bot3ws12.arow_values(bidrownum)
-        #remove the bidder price from the bid row
-        #check that the bidder and price are sequential on the row
-        print(bidder, price)
-        for i in range(5, len(bidrow)):
-            print(bidrow[i],bidrow[i+1])
-            if bidrow[i] == bidder and bidrow[i + 1] == price:
-                bidrow.pop(i)
-                bidrow.pop(i)
-                break
-        if(len(bidrow) <= 6):
-            await bot3ws12.aupdate_cell(bidrownum, 5, "Closed")
-            await ctx.send("The bid for " + bidrow[2] + " has been closed. " + bidder + " has cancelled their bid")
-        else:
-        #update the bid row
-            bidrow.append("")
-            bidrow.append("")
-            await bot3ws12.aupdate([bidrow], "A" + str(bidrownum), value_input_option='USER_ENTERED')
-        await ctx.send("Bid for " + id + " with bid " + price + " has been cancelled")
+    async with _bid_lock:
+        userids = await bot3ws13.acol_values(2)
+        itemids = await bot3ws13.acol_values(3)
+        itemprices = await bot3ws13.acol_values(5)
+        toonnames = await bot3ws13.acol_values(8)
+        combili = list(zip(userids, itemids, itemprices, toonnames))
+        bidfound = False
+        for i in range(1, len(combili)):
+            if combili[i][0] == str(ctx.author.id) and combili[i][1] == id and combili[i][2] == price and combili[i][3] == bidder:
+                rownum = i + 1
+                await bot3ws13.adelete_rows(rownum)
+                bidfound = True
+        if bidfound:
+            #get the row for the item from the main sheet (match id in column 2)
+            cell = await bot3ws12.afind(str(id), in_column=2)
+            if cell is None:
+                await ctx.send("Bid row not found for ID " + str(id))
+                return
+            bidrownum = cell.row
+            bidrow = await bot3ws12.arow_values(bidrownum)
+            #remove the bidder/price from the bid row; bidder/price pairs start
+            #at index 5, so step by 2 and stop one short to keep i+1 in range
+            for i in range(5, len(bidrow) - 1, 2):
+                if bidrow[i] == bidder and bidrow[i + 1] == price:
+                    bidrow.pop(i)
+                    bidrow.pop(i)
+                    break
+            if(len(bidrow) <= 6):
+                await bot3ws12.aupdate_cell(bidrownum, 5, "Closed")
+                await ctx.send("The bid for " + bidrow[2] + " has been closed. " + bidder + " has cancelled their bid")
+            else:
+            #update the bid row
+                bidrow.append("")
+                bidrow.append("")
+                await bot3ws12.aupdate([[sanitize_cell(c) for c in bidrow]], "A" + str(bidrownum), value_input_option='USER_ENTERED')
+            await ctx.send("Bid for " + str(id) + " with bid " + str(price) + " has been cancelled")
     
 
 
@@ -1464,6 +1566,9 @@ async def inputterinfo(ctx):
 @commands.has_any_role("General", "Guardian", "REDALiCE", "Helper")
 async def addmem(ctx, name, rank, main, level, cclass):
     """Adds a member to the Roster, KP Lists and loot list"""
+    if not re.fullmatch(r"[A-Za-z0-9 ]+", name or ""):
+        await ctx.send("Invalid character name — use only letters, numbers, and spaces (the name is built directly into sheet formulas).")
+        return
     cclass = cclass.capitalize()
     rank = rank.capitalize()
     main = toBool(main)
@@ -1527,6 +1632,7 @@ async def addmem(ctx, name, rank, main, level, cclass):
 async def rosteradmin(ctx, subcommand, name, params):
     """roster management for admins
     subcommands: rank, main"""
+    params = sanitize_cell(params)  # neutralise leading =/+/-/@ formula injection in user text
     user_list = await bot5ws1.acol_values(1)
     realname, caps, spaces, suggestions = find_name(name, user_list)
     if realname != None:
@@ -1558,6 +1664,7 @@ async def rosteradmin(ctx, subcommand, name, params):
 async def roster(ctx, subcommand, name, params):
     """Roster Management Command
     subcommands: dg, subclass, cgoffhand, dl, dlmain, dloffhand, edl, edlmain, edloffhand, setall, level, setmain, bulksetmain, faction"""
+    params = sanitize_cell(params)  # neutralise leading =/+/-/@ formula injection in user text
     user_list = await bot5ws1.acol_values(1)
     realname, caps, spaces, suggestions = find_name(name, user_list)
     if realname != None:
@@ -1708,7 +1815,7 @@ async def player(ctx, *name):
     if realname != None:
         cell = await bot4ws1.afind(realname, in_column=1)
         row_num = cell.row
-        embedvals = await bot4ws1.arow_values(row_num, value_render_option='UNFORMATTED_VALUE')
+        embedvals = pad_row(await bot4ws1.arow_values(row_num, value_render_option='UNFORMATTED_VALUE'), 16)
         embed = discord.Embed(title = realname, colour=discord.Color.orange())
         embed.add_field(name = "Rank", value = embedvals[1], inline = True)
         embed.add_field(name = "Main", value = embedvals[2], inline = True)
@@ -1763,7 +1870,7 @@ async def playerfull(ctx, *name):
     if realname != None:
         cell = await bot4ws1.afind(realname, in_column=1)
         row_num = cell.row
-        embedvals = await bot4ws1.arow_values(row_num, value_render_option='UNFORMATTED_VALUE')
+        embedvals = pad_row(await bot4ws1.arow_values(row_num, value_render_option='UNFORMATTED_VALUE'), 16)
         embed = discord.Embed(title = realname, colour=discord.Color.orange())
         embed.add_field(name = "Rank", value = embedvals[1], inline = True)
         embed.add_field(name = "Main", value = embedvals[2], inline = True)
@@ -1857,7 +1964,7 @@ async def characters(ctx, *name):
     # remove header
     mains_to_chars = list(mains_to_chars)[1:]
     # sort so that mains come first, then by level descending
-    mains_to_chars = sorted(mains_to_chars, key=lambda x: (x[0] != x[1], -int(x[2])))
+    mains_to_chars = sorted(mains_to_chars, key=lambda x: (x[0] != x[1], -safe_int(x[2])))
     realname, caps, spaces, suggestions = find_name(name, mains_list)
     if realname != None:
         #find all instances of main name in the character list, paginate every 20 and send
@@ -2029,7 +2136,7 @@ def _write_loot(ws, lootrow, item, cost_str):
     lootlist = ws.row_values(lootrow)
     costlist = ws.row_values(lootrow + 1)
     col = _loot_next_col(lootlist, costlist)
-    ws.update_cell(lootrow, col, item)
+    ws.update_cell(lootrow, col, sanitize_cell(item))
     ws.update_cell(lootrow + 1, col, cost_str)
 
 
@@ -2605,8 +2712,8 @@ async def compactloot(ctx, name):
         await ctx.send(realname + " has no loot entries to compact.")
         return
 
-    await bot3ws9.aupdate([packed_items], "B" + str(row_num), value_input_option='USER_ENTERED')
-    await bot3ws9.aupdate([packed_costs], "B" + str(row_num + 1), value_input_option='USER_ENTERED')
+    await bot3ws9.aupdate([[sanitize_cell(x) for x in packed_items]], "B" + str(row_num), value_input_option='USER_ENTERED')
+    await bot3ws9.aupdate([[sanitize_cell(x) for x in packed_costs]], "B" + str(row_num + 1), value_input_option='USER_ENTERED')
 
     logbody = ["compactloot", str(ctx.author.name), dt.now().strftime("%d/%m/%Y %H:%M:%S"), str([realname, len(pairs)])]
     await bot3ws11.aappend_row(logbody)
@@ -2734,8 +2841,8 @@ async def boss(ctx, bossname, toonlist):
             cell = await bot4ws1.afind(findt, in_column=1)
             row_num = cell.row
             #get the whole row
-            row = await bot3ws1.arow_values(row_num)
-            level = int(row[3])
+            row = pad_row(await bot3ws1.arow_values(row_num), 7)
+            level = safe_int(row[3])
             maintoon = row[2]
             maintoon = toBool(maintoon)
             mainchar = row[6]
@@ -2969,7 +3076,7 @@ async def bosshalf(ctx, bossname, toonlist):
         if findt is not None:
             cell = await bot3ws1.afind(findt, in_column=1)
             row_num = cell.row
-            level = int((await bot3ws1.acell_(row_num, 4)).value)
+            level = safe_int((await bot3ws1.acell_(row_num, 4)).value)
             maintoon = (await bot3ws1.acell_(row_num, 3)).value
             maintoon = toBool(maintoon)
             if bossname in akp_bosses:
@@ -3081,7 +3188,7 @@ async def pointleaderboard(ctx, kp, maxkp = 99999, number = 10):
     ws = KP_WORKSHEETS[kp]["read"]
     namelist = (await ws.acol_values(1))[1:]
     pointlist = (await ws.acol_values(7))[1:]
-    floatpointlist = list(map(float, pointlist))
+    floatpointlist = [safe_float(x) for x in pointlist]
     combined = list(zip(namelist, floatpointlist))
     sortedcombined = sorted(combined, key=lambda x: x[1], reverse=True)
     # remove the people who have more than maxkp
@@ -3116,11 +3223,10 @@ async def pointleaderboardlast30(ctx, kp, maxatt = 100, number = 10):
     namelist = (await ws.acol_values(1))[1:]
     pointlist = (await ws.acol_values(7))[1:]
     attlist = (await ws.acol_values(3))[1:]
-    floatpointlist = list(map(float, pointlist))
+    floatpointlist = [safe_float(x) for x in pointlist]
     # attlist is in the format "7.49%", so we need to convert it to a float and remove the percentage sign
     # attlist could also be '#DIV/0!' because my sheet math is no good, so we need to handle that
-    attlist = [x if x != '#DIV/0!' else '0%' for x in attlist]
-    floatattlist = [float(x.strip('%')) for x in attlist]
+    floatattlist = [safe_float(x) for x in attlist]
     combined = list(zip(namelist, floatpointlist, floatattlist))
     sortedcombined = sorted(combined, key=lambda x: x[2], reverse=True)
     sortedcombined = [x for x in sortedcombined if x[2] <= maxatt]
@@ -3242,8 +3348,12 @@ async def mainswap(ctx, oldname, newname):
 @client.command()
 @dkp_only()
 @commands.has_any_role("General", "REDALiCE")
-async def newowner(ctx, *charnames):
+async def newowner(ctx, confirmation, *charnames):
     """wipes the points on a character by adjusting them to zero, sets all the wins to [OLD] prefix, and sets the main to Blank"""
+    if confirmation != "confirmnewowner":
+        await ctx.send("⚠️ This permanently zeroes all KP pools and relabels loot as [OLD] for the named "
+                       "characters. If you're sure, re-run as: `$newowner confirmnewowner <char1> <char2> ...`")
+        return
     charnames = list(charnames)
     charnames = [x.strip() for x in charnames]
     sendlist = []
@@ -3344,7 +3454,7 @@ async def classpointleaderboard(ctx, kp, classname, maxkp = 99999, number = 10):
     ws = KP_WORKSHEETS[kp]["read"]
     namelist = (await ws.acol_values(1))[1:]
     pointlist = (await ws.acol_values(7))[1:]
-    floatpointlist = list(map(float, pointlist))
+    floatpointlist = [safe_float(x) for x in pointlist]
     combined = list(zip(namelist, floatpointlist))
     sortedcombined = sorted(combined, key=lambda x: x[1], reverse=True)
     sortedcombined = [x for x in sortedcombined if x[1] <= maxkp]
@@ -3376,7 +3486,7 @@ async def earnedleaderboard(ctx, kp, number = 10):
     ws = KP_WORKSHEETS[kp]["read"]
     namelist = (await ws.acol_values(1))[1:]
     pointlist = (await ws.acol_values(4))[1:]
-    floatpointlist = list(map(float, pointlist))
+    floatpointlist = [safe_float(x) for x in pointlist]
     combined = list(zip(namelist, floatpointlist))
     sortedcombined = sorted(combined, key=lambda x: x[1], reverse=True)
     total = min(number, len(sortedcombined))
@@ -4949,6 +5059,9 @@ def save_raid_history(history, world_id=None):
 # Cache keyed by world_id so different worlds don't trash each other's loaded
 # history. Each value: {"loaded_at", "file_count", "history", "mismatched"}.
 _boss_traverser_cache = {}
+# Guards reads/writes of the per-world cache buckets, since
+# boss_load_traverser_history runs in worker threads (via sheet_call).
+_boss_traverser_lock = threading.Lock()
 
 
 def _boss_traverser_cache_for(world_id):
@@ -4968,6 +5081,20 @@ def _boss_traverser_paths():
         if root and os.path.isdir(root):
             return os.path.join(root, "fights"), os.path.join(root, "fights_index.json")
     return None, None
+
+
+def _read_json_file(path):
+    """Blocking JSON read — call via sheet_call from async code."""
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def _boss_write_json_atomic(fp, data):
+    """Blocking atomic JSON write (temp + os.replace) — call via sheet_call."""
+    tmp = fp + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+    os.replace(tmp, fp)
 
 
 def boss_load_traverser_history(world_id=None, force=False):
@@ -4991,10 +5118,11 @@ def boss_load_traverser_history(world_id=None, force=False):
     except Exception:
         current_count = -1
     now = time.time()
-    stale = (now - cache["loaded_at"]) >= BOSS_TRAVERSER_CACHE_TTL
-    changed = current_count != cache["file_count"]
-    if not force and not stale and not changed and cache["history"]:
-        return cache["history"]
+    with _boss_traverser_lock:
+        stale = (now - cache["loaded_at"]) >= BOSS_TRAVERSER_CACHE_TTL
+        changed = current_count != cache["file_count"]
+        if not force and not stale and not changed and cache["history"]:
+            return cache["history"]
     try:
         with open(index_path, "r", encoding="utf-8") as f:
             index = json.load(f)
@@ -5090,10 +5218,11 @@ def boss_load_traverser_history(world_id=None, force=False):
             "BossRestoredHealth": int(detail.get("BossRestoredHealth", 0) or 0),
             "Players": players,
         }
-    cache["loaded_at"] = now
-    cache["file_count"] = current_count
-    cache["history"] = history
-    cache["mismatched"] = mismatched
+    with _boss_traverser_lock:
+        cache["loaded_at"] = now
+        cache["file_count"] = current_count
+        cache["history"] = history
+        cache["mismatched"] = mismatched
     logger.info(
         f"Loaded traverser history for world {world_id}: {len(history)} fights "
         f"({current_count} files on disk, {mismatched} skipped as wrong-world data)"
@@ -5581,7 +5710,7 @@ async def boss_perform_auto_check():
         total_posted = 0
         for world_id, guild_channels in targets.items():
             try:
-                posted = load_posted_fights(world_id=world_id)
+                posted = await sheet_call(load_posted_fights, world_id=world_id)
                 try:
                     fights = await sheet_call(boss_get_detailed_fights, num_recs=100, page=1, world_id=world_id)
                 except Exception:
@@ -5598,8 +5727,8 @@ async def boss_perform_auto_check():
                     # Fetch fight detail ONCE per fight, share across all guilds on this world.
                     try:
                         data = await sheet_call(boss_get_fight_data, fight_id, world_id=world_id)
-                        boss_id = get_best_boss_id_for_fight(fight_id, data, world_id=world_id)
-                        add_fight_to_history(fight_id, fight_data=data, world_id=world_id)
+                        boss_id = await sheet_call(get_best_boss_id_for_fight, fight_id, data, world_id=world_id)
+                        await sheet_call(add_fight_to_history, fight_id, fight_data=data, world_id=world_id)
                     except Exception:
                         logger.exception(
                             f"Failed to fetch fight {fight_id} (world {world_id}); skipping"
@@ -5616,8 +5745,8 @@ async def boss_perform_auto_check():
                             continue
                         try:
                             title = f"{boss_display_name(boss_id)} - Damage Chart"
-                            image_path = create_boss_chart_image(
-                                fight_id, data, title, show_pilots=show_pilots
+                            image_path = await sheet_call(
+                                create_boss_chart_image, fight_id, data, title, show_pilots=show_pilots
                             )
                             await channel.send(
                                 f"New **{boss_display_name(boss_id)}** raid detected. "
@@ -5684,7 +5813,7 @@ async def boss_perform_auto_check():
                     # guilds saw it). Any guild's post failure doesn't replay the
                     # whole world — prevents storms.
                     posted.add(fight_id)
-                    save_posted_fights(posted, world_id=world_id)
+                    await sheet_call(save_posted_fights, posted, world_id=world_id)
             except Exception:
                 logger.exception(f"Boss auto-check iteration failed for world {world_id}")
         return total_posted
@@ -5903,14 +6032,16 @@ async def sheet(ctx, *, target: str):
         title = f"{boss_display_name(boss_id)} - Damage Chart"
         image_path = await sheet_call(create_boss_chart_image, fight_id, data, title, show_pilots=show_pilots)
         await sheet_call(add_fight_to_history, fight_id, fight_data=data, world_id=world_id)
-        await ctx.send(
-            f"Damage chart for fight **{fight_id}** ({world_label})",
-            file=discord.File(image_path),
-        )
         try:
-            os.remove(image_path)
-        except Exception:
-            pass
+            await ctx.send(
+                f"Damage chart for fight **{fight_id}** ({world_label})",
+                file=discord.File(image_path),
+            )
+        finally:
+            try:
+                os.remove(image_path)
+            except Exception:
+                pass
     except Exception as e:
         logger.exception("sheet command failed")
         await ctx.send(f"Could not generate chart: {e}")
@@ -5961,6 +6092,7 @@ async def lbhelp(ctx):
         "`$historyinfo` — saved fight counts per boss",
         "`$fighthistory [N] <player> <boss>` — last N fights at a boss",
         "`$bests <boss> [Nd|Nw|Nm|Ny] [unique]` — top damage/DPS at a boss",
+        "`$statcard <player> [window] [boss]` — best damage/DPS per boss (PR card)",
         "",
         "**Admin (configured setup role):**",
         "`$bossreloadtraverser` — force-refresh the traverser cache",
@@ -5980,8 +6112,8 @@ async def bosspollstatus(ctx):
     if world_id is None:
         return
     world_label = display_world(world_id)
-    posted = load_posted_fights(world_id=world_id)
-    history = load_raid_history(world_id=world_id)
+    posted = await sheet_call(load_posted_fights, world_id=world_id)
+    history = await sheet_call(load_raid_history, world_id=world_id)
     entry = get_server_entry(ctx.guild.id)
     if not entry and is_gwydion_guild(ctx.guild.id):
         # Synthesize a virtual entry for Gwydion legacy guilds
@@ -6010,7 +6142,7 @@ async def bosspollstatus(ctx):
             f"(traverser may not have finished its first sweep)"
         )
     else:
-        traverser_history = boss_load_traverser_history(world_id=world_id)
+        traverser_history = await sheet_call(boss_load_traverser_history, world_id=world_id)
         cache = _boss_traverser_cache.get(int(world_id), {})
         traverser_count = cache.get("file_count", -1)
         mismatched = cache.get("mismatched", 0)
@@ -6077,8 +6209,7 @@ async def bossrescrape(ctx, scope: str = "2026"):
         await ctx.send("Traverser data not reachable from this host. See `$bosspollstatus`.")
         return
     try:
-        with open(index_path, "r", encoding="utf-8") as f:
-            idx = json.load(f)
+        idx = await sheet_call(_read_json_file, index_path)
     except Exception as e:
         await ctx.send(f"Could not read traverser index: {e}")
         return
@@ -6097,8 +6228,7 @@ async def bossrescrape(ctx, scope: str = "2026"):
         if not os.path.exists(fp):
             continue
         try:
-            with open(fp, "r", encoding="utf-8") as f:
-                d = json.load(f)
+            d = await sheet_call(_read_json_file, fp)
         except Exception:
             continue
         n = len(d.get("DetailsPerPlayer", []))
@@ -6153,17 +6283,15 @@ async def bossrescrape(ctx, scope: str = "2026"):
             still_wrong += 1
             await asyncio.sleep(0.15)
             continue
-        tmp = fp + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(d, f, indent=2)
-        os.replace(tmp, fp)
+        await sheet_call(_boss_write_json_atomic, fp, d)
         fixed += 1
         await asyncio.sleep(0.15)
     # Invalidate this world's cache so the next query reloads.
-    cache = _boss_traverser_cache.get(int(world_id))
-    if cache is not None:
-        cache["loaded_at"] = 0.0
-        cache["file_count"] = -1
+    with _boss_traverser_lock:
+        cache = _boss_traverser_cache.get(int(world_id))
+        if cache is not None:
+            cache["loaded_at"] = 0.0
+            cache["file_count"] = -1
     await ctx.send(
         f"Re-scrape complete (scope `{scope}`, {display_world(world_id)}).\n"
         f"Repaired: **{fixed}**, still wrong-world after retry: **{still_wrong}**, "
@@ -6202,7 +6330,7 @@ async def repairhistory(ctx, max_pages: int = 20):
         await ctx.send("You don't have permission to run this admin command.")
         return
     world_label = display_world(world_id)
-    history = load_raid_history(world_id=world_id)
+    history = await sheet_call(load_raid_history, world_id=world_id)
     bad_keys = [k for k, rec in history.items() if int(rec.get("BossId", 0) or 0) == 0]
     if not bad_keys:
         await ctx.send(
@@ -6256,7 +6384,7 @@ async def repairhistory(ctx, max_pages: int = 20):
             not_found += 1
 
     if fixed:
-        save_raid_history(history, world_id=world_id)
+        await sheet_call(save_raid_history, history, world_id=world_id)
 
     await ctx.send(
         f"Repair complete for **{world_label}**.\n"
@@ -6293,20 +6421,26 @@ def _boss_resolve_pilot_identity(query):
     return None, None, not_found_message(query, suggestions)
 
 
-def _boss_extract_statcard_args(args):
+def _boss_extract_statcard_args(args, roster_keys=None):
     """Parses '$statcard' arguments — window, boss alias, and player name can
     appear in any order. Returns (window_token, boss_id, player_name).
     A token that's a boss alias is only treated as a boss if it doesn't also
-    match a roster name (so a player named Crom still routes correctly)."""
+    match a roster name (so a player named Crom still routes correctly).
+
+    `roster_keys` is the set of normalized roster names preferred over a
+    boss-alias interpretation. If None (the default), the Gwydion roster is
+    fetched from Google Sheets. Non-Gwydion callers should pass an empty set to
+    skip the roster fetch entirely."""
     parts = args.strip().split()
     if not parts:
         return None, None, ""
-    try:
-        roster_rows = boss_get_pilot_toon_map()
-        roster_keys = {boss_normalize_name(r["Toon Name"]) for r in roster_rows}
-        roster_keys |= {boss_normalize_name(r["Pilot"]) for r in roster_rows}
-    except Exception:
-        roster_keys = set()
+    if roster_keys is None:
+        try:
+            roster_rows = boss_get_pilot_toon_map()
+            roster_keys = {boss_normalize_name(r["Toon Name"]) for r in roster_rows}
+            roster_keys |= {boss_normalize_name(r["Pilot"]) for r in roster_rows}
+        except Exception:
+            roster_keys = set()
     window_token = None
     boss_id = None
     remaining = []
@@ -6324,14 +6458,15 @@ def _boss_extract_statcard_args(args):
     return window_token, boss_id, " ".join(remaining)
 
 
-def _boss_collect_player_prs(toon_keys, cutoff_date=None, boss_id_filter=None):
+def _boss_collect_player_prs(toon_keys, cutoff_date=None, boss_id_filter=None, world_id=None):
     """Scans the traverser output (canonical) + raid_history.json (auto-poll cache)
     and returns {boss_id: {best_damage, best_dps, fights_counted}} for the given set
     of normalized toon name keys. Excluded dates are skipped. Traverser records win
     on collision. cutoff_date (date) restricts to fights on/after that date.
-    boss_id_filter (int) restricts to a single boss."""
-    merged = dict(load_raid_history())
-    merged.update(boss_load_traverser_history())
+    boss_id_filter (int) restricts to a single boss. world_id selects the CH world
+    (default: Gwydion)."""
+    merged = dict(load_raid_history(world_id=world_id))
+    merged.update(boss_load_traverser_history(world_id=world_id))
     per_boss = {}
     for rec in merged.values():
         if _boss_is_excluded_date(rec.get("DateOfKill", "")):
@@ -6493,7 +6628,6 @@ def create_boss_stat_card_image(display_name, mode_text, per_boss, history_count
 
 
 @client.command(aliases=['playerstats', 'statcards', 'pr'])
-@dkp_only()
 async def statcard(ctx, *, args: str):
     """Player stat card: best damage and best DPS per boss from historical data.
 
@@ -6506,10 +6640,19 @@ async def statcard(ctx, *, args: str):
 
     Window tokens: Nd, Nw, Nm, Ny, or 'all'. Months=30d, years=365d (approx).
     Boss tokens: any alias from `$bossaliases` (bt, gele, dino, etc.).
-    Player is matched as a single character first; falls back to pilot (all alts)
-    only if the name isn't a known toon."""
+    Runs on this server's configured CH world (set via `$setworld`). On Gwydion
+    servers the player is matched as a single character first, falling back to
+    pilot (all alts) only if the name isn't a known toon. On other servers the
+    name is treated as a literal toon name (face value, no roster lookup)."""
+    world_id = await _require_world_for_ctx(ctx)
+    if world_id is None:
+        return
+    is_gwydion = is_gwydion_guild(ctx.guild.id)
     try:
-        window_token, boss_id, player_name = _boss_extract_statcard_args(args)
+        # On non-Gwydion guilds, skip the roster fetch entirely.
+        window_token, boss_id, player_name = _boss_extract_statcard_args(
+            args, roster_keys=None if is_gwydion else set()
+        )
         if not player_name:
             await ctx.send(
                 "Usage: `$statcard <player> [window] [boss]` — window: `7d`/`30d`/`6m`/`all`. "
@@ -6523,16 +6666,22 @@ async def statcard(ctx, *, args: str):
             cutoff_date = dt.now(timezone.utc).date() - window_delta
             window_label = f"last {window_token} (since {cutoff_date.isoformat()})"
         boss_label = boss_display_name(boss_id) if boss_id else None
-        display_name, toon_keys, mode_text_or_msg = _boss_resolve_pilot_identity(player_name)
-        if not display_name:
-            await ctx.send(mode_text_or_msg)
-            return
-        per_boss = _boss_collect_player_prs(
-            toon_keys, cutoff_date=cutoff_date, boss_id_filter=boss_id
+        if is_gwydion:
+            display_name, toon_keys, mode_text_or_msg = _boss_resolve_pilot_identity(player_name)
+            if not display_name:
+                await ctx.send(mode_text_or_msg)
+                return
+        else:
+            # Face-value: the typed name IS the toon. No roster lookup.
+            display_name = player_name.strip()
+            toon_keys = {boss_normalize_name(display_name)}
+            mode_text_or_msg = "Toon only (face value)"
+        per_boss = await sheet_call(_boss_collect_player_prs,
+            toon_keys, cutoff_date=cutoff_date, boss_id_filter=boss_id, world_id=world_id
         )
         if not per_boss:
-            traverser_n = len(boss_load_traverser_history())
-            local_n = len(load_raid_history())
+            traverser_n = len(await sheet_call(boss_load_traverser_history, world_id=world_id))
+            local_n = len(await sheet_call(load_raid_history, world_id=world_id))
             scope = f"window `{window_label}`"
             if boss_label:
                 scope += f", boss `{boss_label}`"
@@ -6542,11 +6691,11 @@ async def statcard(ctx, *, args: str):
                 f"local=`{local_n}` fights. Try widening the window or check spelling."
             )
             return
-        merged = dict(load_raid_history())
-        merged.update(boss_load_traverser_history())
+        merged = dict(await sheet_call(load_raid_history, world_id=world_id))
+        merged.update(await sheet_call(boss_load_traverser_history, world_id=world_id))
         history_count = len(merged)
-        image_path = create_boss_stat_card_image(
-            display_name, mode_text_or_msg, per_boss, history_count,
+        image_path = await sheet_call(
+            create_boss_stat_card_image, display_name, mode_text_or_msg, per_boss, history_count,
             window_label=window_label, boss_label=boss_label,
         )
         reply_bits = [
@@ -6554,14 +6703,16 @@ async def statcard(ctx, *, args: str):
             f"{len(per_boss)} boss(es)" if not boss_label else boss_label,
             f"window: {window_label}",
         ]
-        await ctx.send(
-            " • ".join(reply_bits),
-            file=discord.File(image_path),
-        )
         try:
-            os.remove(image_path)
-        except Exception:
-            pass
+            await ctx.send(
+                " • ".join(reply_bits),
+                file=discord.File(image_path),
+            )
+        finally:
+            try:
+                os.remove(image_path)
+            except Exception:
+                pass
     except Exception as e:
         logger.exception("statcard command failed")
         await ctx.send(f"Could not generate stat card: {e}")
@@ -6695,7 +6846,7 @@ async def fighthistory(ctx, *, args: str):
             display_name = player_name.strip()
             toon_keys = {boss_normalize_name(display_name)}
             mode_text = "Toon only (face value)"
-        runs = _boss_collect_player_boss_history(toon_keys, boss_id, count, world_id=world_id)
+        runs = await sheet_call(_boss_collect_player_boss_history, toon_keys, boss_id, count, world_id=world_id)
         if not runs:
             await ctx.send(
                 f"No saved fights for `{display_name}` at "
@@ -6869,7 +7020,7 @@ async def bests(ctx, *, args: str):
         if window_delta is not None:
             cutoff_date = dt.now(timezone.utc).date() - window_delta
             window_label = f"last {window_token}"
-        top_dmg, top_dps = _boss_collect_top_performances(
+        top_dmg, top_dps = await sheet_call(_boss_collect_top_performances,
             boss_id, cutoff_date=cutoff_date, unique_only=unique_only, limit=5,
             world_id=world_id,
         )
@@ -6945,7 +7096,7 @@ async def historyinfo(ctx):
             await ctx.send(f"Could not read traverser index: {e}")
             return
 
-    local_count = len(load_raid_history(world_id=world_id))
+    local_count = len(await sheet_call(load_raid_history, world_id=world_id))
 
     this_world_detail_count = 0
     if fights_dir and os.path.isdir(fights_dir):
@@ -7141,8 +7292,8 @@ async def serverinfo(ctx):
     cid = entry.get("channel_id")
     role = entry.get("setup_role") or "(none — only Discord admins / Winston Admin / REDALiCE)"
     channel_str = f"<#{cid}>" if cid else "(none — auto-posting disabled)"
-    posted_count = len(load_posted_fights(wid)) if wid else 0
-    history_count = len(load_raid_history(wid)) if wid else 0
+    posted_count = len(await sheet_call(load_posted_fights, wid)) if wid else 0
+    history_count = len(await sheet_call(load_raid_history, wid)) if wid else 0
     lines = [
         f"**Leaderboard Configuration for {ctx.guild.name}**",
         f"World: **{display_world(wid)}** (id `{wid}`)",
