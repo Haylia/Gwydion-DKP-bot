@@ -4,3 +4,11 @@
 /paranoid-kp-bot-43a1e7152411.json
 /paranoid-kp-bot-513a901effbc.json
 /paranoid-kp-bot-b724a91cd608.json
+
+# Per-deployment runtime state (kept out of git so dev box doesn't fight prod)
+/server_config.json
+/posted_fights.json
+/raid_history.json
+/*.pre_migration_backup
+/*.tmp
+/bossranking_data/

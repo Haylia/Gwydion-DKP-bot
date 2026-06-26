@@ -8,6 +8,7 @@ import pandas as pd
 from datetime import datetime as dt, timezone, timedelta, time as dtime
 import time
 import ast
+import json
 import pytesseract
 from PIL import Image
 import requests
@@ -38,7 +39,7 @@ pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tessera
 
 # ─── Service-account spreadsheet access (opened concurrently) ──────────────
 # Five independent service accounts (each its own creds + gspread Client) share
-# the master spreadsheet; accounts 3 and 4 also open secondary sheets. gspread
+# the master spreadsheet; account 4 also opens secondary sheets. gspread
 # is blocking, so we open every account on its own thread — the dozen-odd HTTP
 # round-trips happen concurrently instead of serially. Within an account we pull
 # every tab in ONE metadata call via .worksheets() instead of one
@@ -52,10 +53,7 @@ _MAIN_SHEET = "https://docs.google.com/spreadsheets/d/1Izu2wSmi0aEQCWTvfLAXX0ucX
 _ACCOUNT_SPECS = [
     ("paranoid-kp-bot-43a1e7152411.json", [_MAIN_SHEET]),  # 1 general kp use (lia-paranoid)
     ("paranoid-kp-bot-513a901effbc.json", [_MAIN_SHEET]),  # 2 rbpp (lia-bkp-bot)
-    ("paranoid-kp-bot-29090cc5a87a.json", [                # 3 loot and logging (lia-dkp-bot)
-        _MAIN_SHEET,
-        "https://docs.google.com/spreadsheets/d/1GFWWkCs5jJNbgt8b_rizyOv8qIGdKh4550B5EaDtM_k/edit#gid=0",
-    ]),
+    ("paranoid-kp-bot-29090cc5a87a.json", [_MAIN_SHEET]),  # 3 loot and logging (lia-dkp-bot)
     ("paranoid-kp-bot-b724a91cd608.json", [                # 4 clan member reads (lia-leaderboard-bot)
         _MAIN_SHEET,
         "https://docs.google.com/spreadsheets/d/1EjAlbyeN5RnddzXNtP0X3-agTN7v4levuqoEGPujiEI/edit?gid=286347323#gid=286347323",
@@ -95,7 +93,6 @@ googleacc5, _open5 = _accounts[4]
 bot1sheet, _ws1 = _open1[0]
 bot2sheet, _ws2 = _open2[0]
 bot3sheet, _ws3 = _open3[0]
-bot3sheet2, _ws3b = _open3[1]
 bot4sheet, _ws4 = _open4[0]
 bot4sheet2, _ws4b = _open4[1]
 bot4sheet3, _ws4c = _open4[2]
@@ -104,7 +101,6 @@ bot5sheet, _ws5 = _open5[0]
 bot1ws1, bot1ws2, bot1ws3, bot1ws4, bot1ws5, bot1ws6, bot1ws7, bot1ws8, bot1ws9, bot1ws10, bot1ws11 = _ws1[:11]
 bot2ws1, bot2ws2, bot2ws3, bot2ws4, bot2ws5, bot2ws6, bot2ws7, bot2ws8, bot2ws9, bot2ws10, bot2ws11 = _ws2[:11]
 bot3ws1, bot3ws2, bot3ws3, bot3ws4, bot3ws5, bot3ws6, bot3ws7, bot3ws8, bot3ws9, bot3ws10, bot3ws11 = _ws3[:11]
-bot3ws12, bot3ws13 = _ws3b[0], _ws3b[1]
 bot4ws1, bot4ws2, bot4ws3, bot4ws4, bot4ws5, bot4ws6, bot4ws7, bot4ws8, bot4ws9, bot4ws10, bot4ws11 = _ws4[:11]
 bot4ws12, bot4ws13 = _ws4b[0], _ws4b[1]
 bot4ws14 = _ws4c[0]
@@ -154,7 +150,7 @@ def _parse_a1(label):
 
 # Global registry: maps a registry key -> list of CachingWorksheet instances.
 # For main spreadsheet worksheets: key = sheet_index (0-10).
-# For secondary worksheets: key = unique string like "bot3ws12".
+# For secondary worksheets: key = unique string like "bot4ws14".
 _CACHE_REGISTRY = {}
 
 def _invalidate_siblings(registry_key):
@@ -417,8 +413,6 @@ bot5ws10 = _wrap_ws(bot5ws10, 9); bot5ws11 = _wrap_ws(bot5ws11, 10)
 print("rate-limit fallback wrapping complete")
 
 # Wrap secondary spreadsheet worksheets (no sibling pool — single account each)
-bot3ws12 = CachingWorksheet(bot3ws12, registry_key="bot3ws12")
-bot3ws13 = CachingWorksheet(bot3ws13, registry_key="bot3ws13")
 # bot4ws12 and bot4ws13 left unwrapped — DG sheets always do fresh reads
 bot4ws14 = CachingWorksheet(bot4ws14, registry_key="bot4ws14")
 print("secondary worksheets wrapped")
@@ -847,57 +841,456 @@ def not_found_message(name, suggestions):
     return "Could not find player '" + name + "'."
             
     
+# ----- Bid tie-break roll-offs -----
+# Active tie-breaks live in a local JSON file so they survive a bot restart. Each
+# entry records the thread, the tied players, and their (first) d100 rolls. The
+# tiebreakloop background task closes each after 48h and pings @General with the
+# winner. See $tiebreak / $roll / tiebreakloop / _announce_tiebreak_result.
+TIEBREAKS_FILE = "tiebreaks.json"
+TIEBREAK_DURATION = 48 * 60 * 60  # 48 hours, in seconds
+_tiebreak_lock = asyncio.Lock()
+
+
+def _load_tiebreaks():
+    """Return the dict of active/closed tie-breaks (keyed by thread id as a string)."""
+    try:
+        with open(TIEBREAKS_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return {}
+    except Exception:
+        logger.exception("Could not read tiebreaks file; treating as empty")
+        return {}
+
+
+def _save_tiebreaks(data):
+    try:
+        with open(TIEBREAKS_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f)
+    except Exception:
+        logger.exception("Could not write tiebreaks file")
+
+
+# ----- Auto-gen for forum attendance posts -----
+# Posts in this forum channel get $gen run on them automatically once they are 24h
+# old, so nobody has to run it by hand. New posts are recorded via on_thread_create;
+# genloop posts the draft once each passes 24h. State lives in a local JSON file so
+# it survives restarts, and because recording is event-driven, pre-existing posts are
+# never touched. See on_thread_create / genloop / _process_due_gen_post.
+GEN_FORUM_CHANNEL_ID = 1180246887958315018
+GEN_POST_AGE = 24 * 60 * 60  # 1 day, in seconds
+GEN_POSTS_FILE = "gen_posts.json"
+_gen_lock = asyncio.Lock()
+
+
+def _load_gen_posts():
+    try:
+        with open(GEN_POSTS_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return {}
+    except Exception:
+        logger.exception("Could not read gen_posts file; treating as empty")
+        return {}
+
+
+def _save_gen_posts(data):
+    try:
+        with open(GEN_POSTS_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f)
+    except Exception:
+        logger.exception("Could not write gen_posts file")
+
+
+# ----- Approvable $gen drafts -----
+# A $gen draft (manual or auto) is posted with Approve / Dismiss buttons. Approving
+# awards the KP by running the existing boss / bosshalf logic. Pending drafts are
+# stored here so the buttons survive a restart (re-registered in on_ready) and so a
+# draft can be claimed atomically (no double-award). See GenApproveView.
+PENDING_GENS_FILE = "pending_gens.json"
+_pending_gen_lock = asyncio.Lock()
+
+
+def _load_pending_gens():
+    try:
+        with open(PENDING_GENS_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return {}
+    except Exception:
+        logger.exception("Could not read pending_gens file; treating as empty")
+        return {}
+
+
+def _save_pending_gens(data):
+    try:
+        with open(PENDING_GENS_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f)
+    except Exception:
+        logger.exception("Could not write pending_gens file")
+
+
+# ----- Bidding / auction storage -----
+# Auctions live in a local JSON file instead of Google Sheets. Pure data layer
+# (no Discord/gspread): the bid commands hold _bid_lock around each load -> mutate
+# -> save. One auction per id (monotonic _meta.next_id, so ids never gap/reuse);
+# the opening bid is stored as bids[0], so it counts in results, shows in $mybids
+# and is cancellable. File shape:
+#   {"_meta": {"next_id": N},
+#    "auctions": {"<id>": {"id","open_time","item","kp","status","close_time",
+#                          "bids": [{"time","user_id","toon","price"}, ...]}}}
+BIDS_FILE = "bids.json"
+BID_CLOSE_AGE = 12 * 60 * 60          # auctions auto-close 12h after opening
+BID_HISTORY_AGE = 7 * 24 * 60 * 60    # closed auctions are pruned 7 days after close
+
+
+def _bid_empty():
+    return {"_meta": {"next_id": 1}, "auctions": {}}
+
+
+def _load_bids():
+    """Return the bids store, or a freshly seeded one if the file is missing /
+    unreadable. Tolerates a hand-edited or partial file."""
+    try:
+        with open(BIDS_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        return _bid_empty()
+    except Exception:
+        logger.exception("Could not read bids file; treating as empty")
+        return _bid_empty()
+    if not isinstance(data, dict):
+        return _bid_empty()
+    data.setdefault("_meta", {}).setdefault("next_id", 1)
+    data.setdefault("auctions", {})
+    return data
+
+
+def _save_bids(data):
+    """Atomic write (tmp file + os.replace) so a crash mid-write can't leave a
+    corrupt / partial file -- this is points-adjacent state."""
+    tmp = BIDS_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+    os.replace(tmp, BIDS_FILE)
+
+
+def _bid_get_auction(data, auction_id):
+    """Return the auction dict for this id (int or str), or None."""
+    return data["auctions"].get(str(auction_id))
+
+
+def _bid_new_auction(data, item, kp, user_id, toon, price, now):
+    """Create a new auction whose first bid is the opening bid. Returns its id."""
+    aid = int(data["_meta"]["next_id"])
+    data["_meta"]["next_id"] = aid + 1
+    data["auctions"][str(aid)] = {
+        "id": aid,
+        "open_time": now,
+        "item": item,
+        "kp": kp,
+        "status": "Open",
+        "close_time": None,
+        "bids": [{"time": now, "user_id": str(user_id), "toon": toon, "price": int(price)}],
+    }
+    return aid
+
+
+def _bid_add(auction, user_id, toon, price, now):
+    """Append a bid to an open auction."""
+    auction["bids"].append(
+        {"time": now, "user_id": str(user_id), "toon": toon, "price": int(price)}
+    )
+
+
+def _bid_cancel(auction, user_id, toon, price, now):
+    """Remove the first bid matching (user_id, toon, price). If no bids remain the
+    auction is closed. Returns (removed: bool, closed: bool)."""
+    pid = str(user_id)
+    price = int(price)
+    for i, b in enumerate(auction["bids"]):
+        if b["user_id"] == pid and b["toon"] == toon and int(b["price"]) == price:
+            auction["bids"].pop(i)
+            break
+    else:
+        return False, False
+    if not auction["bids"]:
+        auction["status"] = "Closed"
+        auction["close_time"] = now
+        return True, True
+    return True, False
+
+
+def _bid_user_bids(data, user_id):
+    """Every (auction, bid) pair placed by this discord user id."""
+    pid = str(user_id)
+    out = []
+    for auc in data["auctions"].values():
+        for b in auc["bids"]:
+            if b["user_id"] == pid:
+                out.append((auc, b))
+    return out
+
+
+def _bid_close_due(data, now):
+    """Close every Open auction whose 12h window has elapsed. Returns the list of
+    newly-closed auctions (so the caller can announce each)."""
+    closed = []
+    for auc in data["auctions"].values():
+        if auc["status"] == "Open" and now > auc["open_time"] + BID_CLOSE_AGE:
+            auc["status"] = "Closed"
+            auc["close_time"] = now
+            closed.append(auc)
+    return closed
+
+
+def _bid_prune(data, now):
+    """Drop closed auctions older than BID_HISTORY_AGE. Returns the count removed."""
+    drop = [
+        k for k, a in data["auctions"].items()
+        if a["status"] == "Closed"
+        and a.get("close_time")
+        and now > a["close_time"] + BID_HISTORY_AGE
+    ]
+    for k in drop:
+        del data["auctions"][k]
+    return len(drop)
+
+
+def _bid_results(auction):
+    """Bids sorted highest-price-first as a list of (toon, price), for announcing."""
+    return sorted(
+        ((b["toon"], int(b["price"])) for b in auction["bids"]),
+        key=lambda x: x[1],
+        reverse=True,
+    )
+
+
 @tasks.loop(seconds=60)
 async def bidloop():
     global bidslastupdate
     bidslastupdate = time.time()
-    twelvehoursinseconds = 43200
     resultschannel = 1232811852811993169
     try:
-        bidopentimes = await bot3ws12.acol_values(1)
-        itemids = await bot3ws12.acol_values(2)
-        itemnames = await bot3ws12.acol_values(3)
-        itemkp = await bot3ws12.acol_values(4)
-        bidstatus = await bot3ws12.acol_values(5)
-        combilist = list(zip(bidopentimes, itemids, bidstatus, itemnames, itemkp))
-        useritemids = await bot3ws13.acol_values(3)
-        useritemstatus = await bot3ws13.acol_values(7)
-        combiuserlist = list(zip(useritemids,useritemstatus))
-        for i in range(1, len(combilist)):
-            if combilist[i][2] == "Open" and float(time.time()) > safe_float(combilist[i][0]) + twelvehoursinseconds:
-                async with _bid_lock:
-                    # locate the auction by its id in column 2 (not a whole-sheet
-                    # scan that could match a price/number elsewhere) and use that
-                    # row for both the close-write and the results read.
-                    cell = await bot3ws12.afind(combilist[i][1], in_column=2)
-                    if cell is None:
-                        continue
-                    row_num = cell.row
-                    await bot3ws12.aupdate_cell(row_num, 5, "Closed")
-                    for j in range(1, len(combiuserlist)):
-                        if combiuserlist[j][1] == "Open" and combiuserlist[j][0] == combilist[i][1]:
-                            await bot3ws13.aupdate_cell(j + 1, 7, "Closed")
-                    bidrow = await bot3ws12.arow_values(row_num)
-                #cut off everything but the player name and the bids
-                bidrow = bidrow[5:]
-                # split the rest alternating between the player and their bid
-                length = len(bidrow)
-                results = []
-                for k in range(length//2):
-                    player = bidrow.pop(0)
-                    bid = bidrow.pop(0)
-                    results.append([player, bid])
-                if not results:
-                    continue
-                results.sort(key = lambda x: safe_float(x[1]), reverse = True)
-                msgtosend = "The bid for " + combilist[i][3] + " has been closed. The highest bidder was " + results[0][0] + " with a bid of " + str(results[0][1]) + " " + combilist[i][4]
-                for k in range(1, len(results)):
-                    msgtosend += "\n" + results[k][0] + " bid " + str(results[k][1]) + " " + combilist[i][4]
-                await client.get_channel(resultschannel).send(msgtosend)
-
-    except Exception as e:
+        # Mutate + persist under the lock, then announce outside it (network I/O),
+        # mirroring tiebreakloop so a slow send can't hold the lock. Restart-safe:
+        # state lives in bids.json, so a crash between close and announce just
+        # re-announces next tick (the auction stays Closed and prunes after 7d).
+        due = []
+        async with _bid_lock:
+            data = _load_bids()
+            now = time.time()
+            due = _bid_close_due(data, now)
+            pruned = _bid_prune(data, now)
+            if due or pruned:
+                _save_bids(data)
+        for auc in due:
+            ranked = _bid_results(auc)
+            if not ranked:
+                continue
+            msgtosend = ("The bid for " + auc["item"] + " has been closed. The highest bidder was "
+                         + ranked[0][0] + " with a bid of " + str(ranked[0][1]) + " " + auc["kp"])
+            for player, bid in ranked[1:]:
+                msgtosend += "\n" + player + " bid " + str(bid) + " " + auc["kp"]
+            channel = client.get_channel(resultschannel)
+            if channel is not None:
+                await channel.send(msgtosend)
+    except Exception:
         logger.exception("Error in bidloop")
 
+
+
+@tasks.loop(seconds=60)
+async def tiebreakloop():
+    """Closes tie-breaks whose 48h window has elapsed and announces the winner,
+    pinging @General. Mirrors bidloop's persist-then-resolve pattern so it's
+    restart-safe. Also prunes closed entries older than a week."""
+    try:
+        due = []
+        async with _tiebreak_lock:
+            data = _load_tiebreaks()
+            now = time.time()
+            changed = False
+            for tid, tb in list(data.items()):
+                start = safe_float(tb.get("start", 0))
+                if tb.get("status") == "open" and now > start + TIEBREAK_DURATION:
+                    tb["status"] = "closed"
+                    due.append(tb)
+                    changed = True
+                elif tb.get("status") == "closed" and now > start + 7 * 24 * 3600:
+                    del data[tid]
+                    changed = True
+            if changed:
+                _save_tiebreaks(data)
+        # Announce outside the lock (network I/O).
+        for tb in due:
+            try:
+                await _announce_tiebreak_result(tb)
+            except Exception:
+                logger.exception("Failed to announce a tie-break result")
+    except Exception:
+        logger.exception("Error in tiebreakloop")
+
+
+async def _announce_tiebreak_result(tb):
+    """Post the outcome of a finished tie-break in its thread (or the parent
+    channel if the thread is gone), pinging the @General role."""
+    item = tb.get("item", "the item")
+    rolls = tb.get("rolls", {})
+    players = tb.get("players", {})
+    dest = client.get_channel(tb.get("thread_id")) or client.get_channel(tb.get("channel_id"))
+    if dest is None:
+        logger.warning(f"Tie-break for {item}: thread/channel gone, cannot announce")
+        return
+    # Look up the @General role to ping.
+    guild = client.get_guild(tb.get("guild_id"))
+    general = None
+    if guild:
+        for r in guild.roles:
+            if r.name.lower() == "general":
+                general = r
+                break
+    ping = general.mention if general else "@General"
+    allowed = discord.AllowedMentions(roles=[general]) if general else discord.AllowedMentions.none()
+
+    if not rolls:
+        await dest.send(
+            f"{ping} the tie-break for **{item}** ended after 48h but **nobody rolled**. "
+            f"Please re-run it or decide manually.",
+            allowed_mentions=allowed,
+        )
+        return
+
+    best = max(rolls.values())
+    winners = [uid for uid, v in rolls.items() if v == best]
+    # Build a results breakdown: rollers high->low, then forfeits.
+    lines = [f"• {players.get(uid, 'Unknown')}: **{v}**"
+             for uid, v in sorted(rolls.items(), key=lambda kv: kv[1], reverse=True)]
+    lines += [f"• {players[p]}: *did not roll (forfeit)*" for p in players if p not in rolls]
+    breakdown = "\n".join(lines)
+
+    if len(winners) == 1:
+        await dest.send(
+            f"{ping} the tie-break for **{item}** is over!\n"
+            f"**Winner: {players.get(winners[0], 'Unknown')}** with a roll of **{best}**.\n\n{breakdown}",
+            allowed_mentions=allowed,
+        )
+    else:
+        tied = ", ".join(players.get(u, "Unknown") for u in winners)
+        await dest.send(
+            f"{ping} the tie-break for **{item}** is **still tied** — {tied} each rolled **{best}**.\n"
+            f"Please run a new `$tiebreak` between them.\n\n{breakdown}",
+            allowed_mentions=allowed,
+        )
+
+
+@client.event
+async def on_thread_create(thread):
+    """Record new forum posts in the attendance channel so genloop can auto-run
+    $gen on them once they're 24h old. Other threads (boss/tie-break) are ignored."""
+    try:
+        if getattr(thread, "parent_id", None) != GEN_FORUM_CHANNEL_ID:
+            return
+        async with _gen_lock:
+            data = _load_gen_posts()
+            tid = str(thread.id)
+            if tid not in data:
+                created = thread.created_at.timestamp() if thread.created_at else time.time()
+                data[tid] = {"created": created, "processed": False}
+                _save_gen_posts(data)
+    except Exception:
+        logger.exception("Error recording forum post for auto-gen")
+
+
+@tasks.loop(minutes=10)
+async def genloop():
+    """Auto-runs $gen on forum attendance posts once they pass 24h old. Claims each
+    due post (marks it processed) before running so a slow run can't double-post.
+    Processed posts are kept as tombstones so the startup backfill won't re-draft them."""
+    try:
+        due = []
+        async with _gen_lock:
+            data = _load_gen_posts()
+            now = time.time()
+            changed = False
+            for tid, info in list(data.items()):
+                if tid.startswith("_"):
+                    continue  # skip meta keys like _baseline
+                created = safe_float(info.get("created", 0))
+                if not info.get("processed") and now >= created + GEN_POST_AGE:
+                    info["processed"] = True  # claim it now so we don't run twice
+                    due.append(tid)
+                    changed = True
+            if changed:
+                _save_gen_posts(data)
+        for tid in due:
+            try:
+                await _process_due_gen_post(tid)
+            except Exception:
+                logger.exception(f"Auto-gen failed for thread {tid}")
+    except Exception:
+        logger.exception("Error in genloop")
+
+
+async def _process_due_gen_post(tid):
+    """Fetch a due forum post and run the shared $gen logic on it in auto mode."""
+    thread = client.get_channel(int(tid))
+    if thread is None:
+        try:
+            thread = await client.fetch_channel(int(tid))
+        except Exception:
+            logger.warning(f"Auto-gen: could not fetch thread {tid}")
+            return
+    if not isinstance(thread, discord.Thread):
+        return
+    # A post may have auto-archived by the 24h mark; unarchive so we can post.
+    if thread.archived:
+        try:
+            await thread.edit(archived=False)
+        except Exception:
+            pass
+    await _generate_attendance(thread, is_auto=True)
+
+
+async def _backfill_forum_posts():
+    """On startup, catch forum posts missed while the bot was offline. The first run
+    only records a baseline timestamp (so the pre-feature backlog is left alone); later
+    runs record any post created since the baseline that we aren't already tracking, and
+    genloop drafts each at its 24h mark (or on the next tick if already past)."""
+    forum = client.get_channel(GEN_FORUM_CHANNEL_ID)
+    if forum is None:
+        logger.warning(f"Auto-gen backfill: forum channel {GEN_FORUM_CHANNEL_ID} not found")
+        return
+    async with _gen_lock:
+        data = _load_gen_posts()
+        meta = data.get("_baseline")
+        if meta is None:
+            data["_baseline"] = {"ts": time.time()}
+            _save_gen_posts(data)
+            return  # first run: baseline established, leave the existing backlog alone
+        baseline = safe_float(meta.get("ts", 0))
+    # Gather active + recently-archived posts in the forum.
+    threads = list(getattr(forum, "threads", []) or [])
+    try:
+        async for t in forum.archived_threads(limit=200):
+            threads.append(t)
+    except Exception:
+        logger.exception("Auto-gen backfill: could not list archived threads")
+    async with _gen_lock:
+        data = _load_gen_posts()
+        added = 0
+        for t in threads:
+            tid = str(t.id)
+            if tid in data:
+                continue
+            created = t.created_at.timestamp() if getattr(t, "created_at", None) else None
+            if created is None or created < baseline:
+                continue
+            data[tid] = {"created": created, "processed": False}
+            added += 1
+        if added:
+            _save_gen_posts(data)
+            logger.info(f"Auto-gen backfill: recorded {added} outstanding forum post(s)")
 
 
 @client.event
@@ -913,6 +1306,33 @@ async def on_ready():
         else:
             print(f"Warning: Could not find guild with ID {g}")
     bidloop.start()
+    if not tiebreakloop.is_running():
+        tiebreakloop.start()
+    try:
+        await _backfill_forum_posts()
+    except Exception:
+        logger.exception("Auto-gen backfill failed")
+    if not genloop.is_running():
+        genloop.start()
+    # Re-attach Approve/Dismiss buttons to pending $gen drafts so they keep working
+    # across restarts; drop drafts older than 30 days that were never actioned.
+    try:
+        async with _pending_gen_lock:
+            pdata = _load_pending_gens()
+            now = time.time()
+            kept = {t: e for t, e in pdata.items()
+                    if now - safe_float(e.get("created", now)) < 30 * 24 * 60 * 60}
+            if len(kept) != len(pdata):
+                _save_pending_gens(kept)
+        for token, info in kept.items():
+            mid = info.get("message_id")
+            if mid:
+                try:
+                    client.add_view(GenApproveView(token), message_id=mid)
+                except Exception:
+                    logger.exception("Could not re-register a gen approve view")
+    except Exception:
+        logger.exception("Could not restore pending gens on startup")
     # --- Boss Leaderboard auto-poller (UTC-anchored) ---
     try:
         _migrate_state_files_if_needed()
@@ -925,11 +1345,19 @@ async def on_ready():
                 worlds_to_seed.add(int(_entry.get("world_id", 0)))
             except Exception:
                 continue
+        # Seed every tracked world too, so a newly-tracked world doesn't replay its
+        # whole recent API page (and spike the API) on the first refresh cycle.
+        try:
+            worlds_to_seed |= await sheet_call(boss_get_tracked_world_ids)
+        except Exception:
+            logger.exception("Could not enumerate tracked worlds for seeding")
         existing_world_keys = _world_keys_in_posted_file()
         had_state = bool(existing_world_keys)
-        for _wid in worlds_to_seed:
+        # Offloaded to a worker thread each: seeding an unseeded world makes a
+        # blocking API call, and there can now be ~26 of them on first deploy.
+        for _wid in sorted(worlds_to_seed):
             if _wid > 0:
-                initialize_posted_fights_if_needed(world_id=_wid)
+                await sheet_call(initialize_posted_fights_if_needed, world_id=_wid)
         if had_state:
             try:
                 count = await boss_perform_auto_check()
@@ -1167,7 +1595,8 @@ async def on_command_error(ctx, error):
         await ctx.send("Winston is crying himself to sleep (google sheets may have been rate limited, there was an error, or reda sucks at programming)")
         print(error)
     elif isinstance(error, commands.CommandNotFound):
-        await ctx.send("command doesn't exist. yet? try $information for text based help or $help for a full list of commands. If what you want isn't there, DM reda to get it added!")
+        # Unknown commands are silently ignored (no reply).
+        return
     elif isinstance(error, commands.NoPrivateMessage):
         await ctx.send("This command can't be used in DMs")
     else:
@@ -1206,7 +1635,7 @@ async def makeleaderboard(ctx):
     print(f"DEBUG: Total attachments/urls to process: {len(attachments)}")
 
     if not attachments:
-        await ctx.send("❌ Please attach one or more screenshots (or reply to a message with images).")
+        await ctx.send("Please attach one or more screenshots (or reply to a message with images).")
         return
 
     try:
@@ -1225,11 +1654,11 @@ async def makeleaderboard(ctx):
                                 temp_files.append(fname)
                                 print(f"DEBUG: Downloaded URL image to {fname}")
                             else:
-                                await ctx.send(f"⚠ Could not download image: {a} (status {resp.status})")
+                                await ctx.send(f"Could not download image: {a} (status {resp.status})")
                     except Exception as e:
                         print(f"ERROR: Error downloading image URL: {a}")
                         traceback.print_exc()
-                        await ctx.send(f"⚠ Error downloading image: {a} — {e}")
+                        await ctx.send(f"Error downloading image: {a} — {e}")
                 else:
                     # Attachment object
                     await a.save(fname)
@@ -1254,7 +1683,7 @@ async def makeleaderboard(ctx):
     except Exception as e:
         print("ERROR: makeleaderboard failed")
         traceback.print_exc()
-        await ctx.send(f"⚠ Error: {str(e)}")
+        await ctx.send(f"Error: {str(e)}")
 
     finally:
         for f in temp_files:
@@ -1284,12 +1713,9 @@ async def startbid(ctx, item, startprice, kp, startbidder):
     startbidder = real_bidder
     # lock so two concurrent $startbid calls can't grab the same id
     async with _bid_lock:
-        #get the bottom row for the id
-        id = len(await bot3ws12.acol_values(1))
-        bidrow = [time.time(), id, item, kp, "Open", startbidder, startprice]
-        await bot3ws12.aappend_row(bidrow)
-        userrow = [time.time(), str(ctx.author.id), id, item, startprice, kp, "Open", startbidder]
-        await bot3ws13.aappend_row(userrow)
+        data = _load_bids()
+        id = _bid_new_auction(data, item, kp, ctx.author.id, startbidder, startprice, time.time())
+        _save_bids(data)
     await ctx.send("Bid for " + item + " has started at " + str(startprice) + " " + kp + " by " + startbidder)
     await ctx.send("The ID for this bid is " + str(id) + ". Please use this number to bid on the item!")
 
@@ -1342,34 +1768,30 @@ async def sendbid(ctx, id, price, bidder):
         return
     bidder = real_bidder
     async with _bid_lock:
-        cell = await bot3ws12.afind(str(id), in_column=2)
-        if cell is None:
+        data = _load_bids()
+        auction = _bid_get_auction(data, id)
+        if auction is None:
             await ctx.send("No bid found with ID " + str(id))
             return
-        bidrownum = cell.row
-        bidrow = await bot3ws12.arow_values(bidrownum)
-        if bidrow[4] == "Open":
-            # reject bids the bidder can't afford in this item's KP pool, mirroring
-            # the check $deduct does when a won bid is processed (Current = col 7).
-            kp_pool = str(bidrow[3]).upper()
-            if kp_pool in KP_WORKSHEETS:
-                read_ws = KP_WORKSHEETS[kp_pool]["read"]
-                kp_cell = await read_ws.afind(bidder, in_column=1)
-                if kp_cell is None:
-                    await ctx.send(f"{bidder} has no {kp_pool} record, so can't bid in that pool.")
-                    return
-                current_pts = safe_float((await read_ws.acell_(kp_cell.row, 7)).value)
-                if price > current_pts:
-                    await ctx.send(f"{bidder} only has {current_pts:g} {kp_pool} — can't place a bid of {price}.")
-                    return
-            bidrow.append(bidder)
-            bidrow.append(price)
-            await bot3ws12.aupdate([[sanitize_cell(c) for c in bidrow]], "A" + str(bidrownum), value_input_option='USER_ENTERED')
-            userrow = [time.time(), str(ctx.author.id), id, bidrow[2], price, bidrow[3], "Open", bidder]
-            await bot3ws13.aappend_row(userrow, value_input_option="raw")
-            await ctx.send("Bid for " + bidrow[2] + " has been placed at " + str(price) + " " + bidrow[3] + " by " + bidder)
-        else:
+        if auction["status"] != "Open":
             await ctx.send("This bid is closed!")
+            return
+        # reject bids the bidder can't afford in this item's KP pool, mirroring
+        # the check $deduct does when a won bid is processed (Current = col 7).
+        kp_pool = str(auction["kp"]).upper()
+        if kp_pool in KP_WORKSHEETS:
+            read_ws = KP_WORKSHEETS[kp_pool]["read"]
+            kp_cell = await read_ws.afind(bidder, in_column=1)
+            if kp_cell is None:
+                await ctx.send(f"{bidder} has no {kp_pool} record, so can't bid in that pool.")
+                return
+            current_pts = safe_float((await read_ws.acell_(kp_cell.row, 7)).value)
+            if price > current_pts:
+                await ctx.send(f"{bidder} only has {current_pts:g} {kp_pool} — can't place a bid of {price}.")
+                return
+        _bid_add(auction, ctx.author.id, bidder, price, time.time())
+        _save_bids(data)
+    await ctx.send("Bid for " + auction["item"] + " has been placed at " + str(price) + " " + auction["kp"] + " by " + bidder)
 
 @client.command()
 @dkp_only()
@@ -1382,43 +1804,20 @@ async def cancelbid(ctx, id, price, bidder):
         await ctx.send(not_found_message(bidder, suggestions))
         return
     bidder = real_bidder
-    # check on the user bids sheet if the bid exists
     async with _bid_lock:
-        userids = await bot3ws13.acol_values(2)
-        itemids = await bot3ws13.acol_values(3)
-        itemprices = await bot3ws13.acol_values(5)
-        toonnames = await bot3ws13.acol_values(8)
-        combili = list(zip(userids, itemids, itemprices, toonnames))
-        bidfound = False
-        for i in range(1, len(combili)):
-            if combili[i][0] == str(ctx.author.id) and combili[i][1] == id and combili[i][2] == price and combili[i][3] == bidder:
-                rownum = i + 1
-                await bot3ws13.adelete_rows(rownum)
-                bidfound = True
-        if bidfound:
-            #get the row for the item from the main sheet (match id in column 2)
-            cell = await bot3ws12.afind(str(id), in_column=2)
-            if cell is None:
-                await ctx.send("Bid row not found for ID " + str(id))
-                return
-            bidrownum = cell.row
-            bidrow = await bot3ws12.arow_values(bidrownum)
-            #remove the bidder/price from the bid row; bidder/price pairs start
-            #at index 5, so step by 2 and stop one short to keep i+1 in range
-            for i in range(5, len(bidrow) - 1, 2):
-                if bidrow[i] == bidder and bidrow[i + 1] == price:
-                    bidrow.pop(i)
-                    bidrow.pop(i)
-                    break
-            if(len(bidrow) <= 6):
-                await bot3ws12.aupdate_cell(bidrownum, 5, "Closed")
-                await ctx.send("The bid for " + bidrow[2] + " has been closed. " + bidder + " has cancelled their bid")
-            else:
-            #update the bid row
-                bidrow.append("")
-                bidrow.append("")
-                await bot3ws12.aupdate([[sanitize_cell(c) for c in bidrow]], "A" + str(bidrownum), value_input_option='USER_ENTERED')
-            await ctx.send("Bid for " + str(id) + " with bid " + str(price) + " has been cancelled")
+        data = _load_bids()
+        auction = _bid_get_auction(data, id)
+        if auction is None:
+            await ctx.send("Bid row not found for ID " + str(id))
+            return
+        removed, closed = _bid_cancel(auction, ctx.author.id, bidder, price, time.time())
+        if not removed:
+            await ctx.send("No matching bid found to cancel")
+            return
+        _save_bids(data)
+        if closed:
+            await ctx.send("The bid for " + auction["item"] + " has been closed. " + bidder + " has cancelled their bid")
+        await ctx.send("Bid for " + str(id) + " with bid " + str(price) + " has been cancelled")
     
 
 
@@ -1434,17 +1833,14 @@ async def bidtimeinfo(ctx):
 @dkp_only()
 async def mybids(ctx):
     """Shows the bids you have placed"""
-    user = ctx.author.id
-    userids = await bot3ws13.acol_values(2)
-    userbids = []
-    for i in range(len(userids)):
-        if userids[i] == str(user):
-            userbids.append(await bot3ws13.arow_values(i + 1))
+    async with _bid_lock:
+        data = _load_bids()
+        userbids = _bid_user_bids(data, ctx.author.id)
     if not userbids:
         await ctx.send("You have no bids placed")
     else:
-        for i in range(len(userbids)):
-            await ctx.send("You have bid " + str(userbids[i][4]) + " " + userbids[i][5] + " on " + userbids[i][3] + ", Auction ID: " + str(userbids[i][2]) + ", Bidder: " + userbids[i][7] + ", Status: " + userbids[i][6])
+        for auction, bid in userbids:
+            await ctx.send("You have bid " + str(bid["price"]) + " " + auction["kp"] + " on " + auction["item"] + ", Auction ID: " + str(auction["id"]) + ", Bidder: " + bid["toon"] + ", Status: " + auction["status"])
 
 
 @client.command()
@@ -1453,27 +1849,160 @@ async def bidinfo(ctx, id):
     """Shows the info for a bid"""
     try:
         id = int(id)
-        # bidrow = bot3ws12.find(str(id))
-        # search column 2 for the id
-        bidrow = await bot3ws12.afind(str(id), in_column=2)
-        if bidrow:
-            bidrownum = bidrow.row
-            bidrow = await bot3ws12.arow_values(bidrownum)
-            timeleft = float(bidrow[0]) + 43200 - time.time()
-            hoursleft = timeleft // 3600
-            minutesleft = (timeleft % 3600) // 60
-            timeleft = str(int(hoursleft)) + " hours and " + str(int(minutesleft)) + " minutes"
-            await ctx.send("Bid ID " + str(bidrow[1]) + " for " + bidrow[2] + " is currently " + bidrow[4] + " with a starting bid of " + str(bidrow[6]) + " " + bidrow[3])
-            if timeleft.startswith("-"):
-                timeleft = timeleft[1:]
-                await ctx.send("This bid for " + bidrow[2] + " ended " + timeleft + " ago")
-            else:
-                await ctx.send("This bid was opened at " + bidrow[0] + " and has " + timeleft + " left")
-        else:
+    except (TypeError, ValueError):
+        await ctx.send("Please give a numeric bid ID, e.g. `$bidinfo 12`")
+        return
+    try:
+        async with _bid_lock:
+            data = _load_bids()
+            auction = _bid_get_auction(data, id)
+        if not auction:
             await ctx.send("No bid with that ID exists")
-    except Exception as e:
-        print(e)
-        await ctx.send(e)
+            return
+        opentime = auction["open_time"]
+        startprice = auction["bids"][0]["price"] if auction["bids"] else 0
+        timeleft = float(opentime) + BID_CLOSE_AGE - time.time()
+        hoursleft = timeleft // 3600
+        minutesleft = (timeleft % 3600) // 60
+        timeleft = str(int(hoursleft)) + " hours and " + str(int(minutesleft)) + " minutes"
+        await ctx.send("Bid ID " + str(auction["id"]) + " for " + auction["item"] + " is currently " + auction["status"] + " with a starting bid of " + str(startprice) + " " + auction["kp"])
+        if timeleft.startswith("-"):
+            timeleft = timeleft[1:]
+            await ctx.send("This bid for " + auction["item"] + " ended " + timeleft + " ago")
+        else:
+            await ctx.send("This bid was opened at " + str(opentime) + " and has " + timeleft + " left")
+    except Exception:
+        logger.exception("Error in $bidinfo")
+        await ctx.send("Something went wrong looking up that bid. Please try again.")
+
+
+@client.command(aliases=["dice"])
+# No @dkp_only() here: $roll is a generic dice roller meant to work in every server
+# the bot is in (and in DMs). It touches no Gwydion data; the tie-break handling only
+# activates inside a registered $tiebreak thread, which can still only exist in Gwydion.
+async def roll(ctx, sides: int = 100):
+    """Rolls a die. Defaults to 100 sides; pass a number to change it (e.g. $roll 20).
+    The result and die size come from Winston, so they can't be edited or hidden after the fact.
+    Inside a $tiebreak thread, a tied player's first d100 roll is locked in as their tie-break roll."""
+    if sides < 2:
+        await ctx.send("A die needs at least 2 sides!")
+        return
+    if sides > 1000000:
+        await ctx.send("That die has too many sides! Please pick 1,000,000 or fewer.")
+        return
+    result = random.randint(1, sides)
+    # Echo the die size so the roll is tied to a stated number of sides. The bot's
+    # message can't be edited by players, so they can't roll a d100 and later claim
+    # it was a different die (or hide the size of the die they rolled).
+    await ctx.send(f"{ctx.author.mention} rolled a **{result}** on a **{sides}-sided** die (d{sides})")
+    # If this happened in an active tie-break thread, record/lock it for that player.
+    await _handle_tiebreak_roll(ctx, sides, result)
+
+
+async def _handle_tiebreak_roll(ctx, sides, result):
+    """Record a $roll as a player's tie-break entry when it happens in an active
+    tie-break thread. Only tagged players count, only a d100 counts, and only the
+    first roll is kept (re-rolls are rejected). Posts a status line to the thread,
+    and settles the tie-break immediately once everyone has rolled."""
+    if not isinstance(ctx.channel, discord.Thread):
+        return
+    tid = str(ctx.channel.id)
+    reply = None
+    finished = None  # set to the tie-break dict if this roll completes it
+    async with _tiebreak_lock:
+        data = _load_tiebreaks()
+        tb = data.get(tid)
+        if not tb or tb.get("status") != "open":
+            return
+        uid = str(ctx.author.id)
+        if uid not in tb["players"]:
+            reply = "That roll isn't part of this tie-break — only the tagged players count."
+        elif sides != 100:
+            reply = (f"Tie-break rolls must be a **d100** — just type `$roll` with no "
+                     f"number, {ctx.author.mention}.")
+        elif uid in tb["rolls"]:
+            reply = (f"Your tie-break roll is already locked at **{tb['rolls'][uid]}** — "
+                     f"this one doesn't count, {ctx.author.mention}.")
+        else:
+            tb["rolls"][uid] = result
+            outstanding = [tb["players"][p] for p in tb["players"] if p not in tb["rolls"]]
+            reply = f"Locked in **{result}** for {ctx.author.mention} on **{tb['item']}**."
+            if outstanding:
+                reply += "\nStill waiting on: " + ", ".join(outstanding)
+            else:
+                # Everyone has rolled — close and settle now instead of waiting 48h.
+                reply += "\nEveryone has rolled — settling the tie-break now!"
+                tb["status"] = "closed"
+                finished = tb
+            _save_tiebreaks(data)
+    if reply:
+        await ctx.send(reply)
+    if finished is not None:
+        await _announce_tiebreak_result(finished)
+
+
+@client.command(aliases=["rolloff", "tb"])
+@dkp_only()
+@commands.has_any_role("General", "Guardian", "REDALiCE")
+async def tiebreak(ctx, players: commands.Greedy[discord.Member], *, item: str = None):
+    """Starts a 48-hour d100 roll-off in a new thread to break a bidding tie.
+    Usage: $tiebreak @player1 @player2 [@player3 ...] <item name>
+    Each tagged player runs $roll (d100) in the thread; highest first roll wins.
+    After 48h the bot pings @General with the result."""
+    if isinstance(ctx.channel, discord.Thread):
+        await ctx.send("Please run `$tiebreak` in a normal channel, not inside a thread.")
+        return
+    # De-dupe the tagged players, preserving order.
+    unique, seen = [], set()
+    for m in players:
+        if m.id not in seen:
+            seen.add(m.id)
+            unique.append(m)
+    players = unique
+    if len(players) < 2:
+        await ctx.send("Tag at least **two** players to roll off.\n"
+                       "Usage: `$tiebreak @player1 @player2 <item name>`")
+        return
+    if not item or not item.strip():
+        await ctx.send("Please include the item name after the players.\n"
+                       "Usage: `$tiebreak @player1 @player2 <item name>`")
+        return
+    item = item.strip()
+    # Create the roll-off thread anchored to the command message.
+    try:
+        thread = await ctx.message.create_thread(
+            name=f"Tie-break: {item}"[:100],
+            auto_archive_duration=4320,  # 3 days, so it outlives the 48h window
+        )
+    except Exception:
+        logger.exception("Could not create tie-break thread")
+        await ctx.send("Couldn't create the thread — do I have the *Create Public Threads* permission here?")
+        return
+    # Persist the active tie-break so it survives a bot restart.
+    async with _tiebreak_lock:
+        data = _load_tiebreaks()
+        data[str(thread.id)] = {
+            "guild_id": ctx.guild.id,
+            "channel_id": ctx.channel.id,
+            "thread_id": thread.id,
+            "item": item,
+            "players": {str(m.id): m.display_name for m in players},
+            "rolls": {},
+            "start": time.time(),
+            "status": "open",
+        }
+        _save_tiebreaks(data)
+    mentions = " ".join(m.mention for m in players)
+    await thread.send(
+        f"**Tie-break roll-off for {item}**\n"
+        f"{mentions} — you're tied! Each of you run `$roll` (a d100) **right here** in this thread.\n"
+        f"• Highest roll wins.\n"
+        f"• Your **first** d100 roll is locked in — re-rolls and other dice won't count.\n"
+        f"• Closes in **48 hours**. If you haven't rolled by then, you forfeit.\n"
+        f"Good luck!",
+        allowed_mentions=discord.AllowedMentions(users=players),
+    )
+    await ctx.send(f"Tie-break thread for **{item}** started: {thread.mention}")
 
 
 @client.command()
@@ -3351,7 +3880,7 @@ async def mainswap(ctx, oldname, newname):
 async def newowner(ctx, confirmation, *charnames):
     """wipes the points on a character by adjusting them to zero, sets all the wins to [OLD] prefix, and sets the main to Blank"""
     if confirmation != "confirmnewowner":
-        await ctx.send("⚠️ This permanently zeroes all KP pools and relabels loot as [OLD] for the named "
+        await ctx.send("This permanently zeroes all KP pools and relabels loot as [OLD] for the named "
                        "characters. If you're sure, re-run as: `$newowner confirmnewowner <char1> <char2> ...`")
         return
     charnames = list(charnames)
@@ -3504,13 +4033,177 @@ async def earnedleaderboard(ctx, kp, number = 10):
     if total > 0:
         await ctx.send(embed=embed)
 
+class _ApproveCtx:
+    """Minimal ctx shim so the boss / bosshalf command callbacks can be driven from
+    an Approve button. Those commands only use ctx.send and ctx.author.name."""
+
+    def __init__(self, channel, author):
+        self.channel = channel
+        self.author = author
+
+    async def send(self, *args, **kwargs):
+        return await self.channel.send(*args, **kwargs)
+
+
+# Roles allowed to approve/dismiss attendance — same set that can run $boss/$bosshalf.
+GEN_APPROVE_ROLES = {"General", "Guardian", "REDALiCE", "Helper"}
+
+
+class GenApproveView(discord.ui.View):
+    """Approve / Dismiss buttons on a $gen attendance draft. Approving awards the KP
+    by running the existing boss / bosshalf logic via _ApproveCtx. Persistent
+    (timeout=None) and restart-safe through pending_gens.json; the draft is claimed
+    before awarding so two clicks can't double-award. Unpermissioned clicks do
+    nothing but get a private notice."""
+
+    def __init__(self, token):
+        super().__init__(timeout=None)
+        self.token = token
+        self.btn_approve = discord.ui.Button(
+            label="Approve & award", style=discord.ButtonStyle.success,
+            custom_id=f"genapprove:{token}")
+        self.btn_dismiss = discord.ui.Button(
+            label="Dismiss", style=discord.ButtonStyle.secondary,
+            custom_id=f"gendismiss:{token}")
+        self.btn_approve.callback = self._approve
+        self.btn_dismiss.callback = self._dismiss
+        self.add_item(self.btn_approve)
+        self.add_item(self.btn_dismiss)
+
+    def _authorized(self, user):
+        return any(getattr(r, "name", None) in GEN_APPROVE_ROLES
+                   for r in getattr(user, "roles", []))
+
+    async def _claim(self):
+        """Atomically remove and return this draft's stored data (None if already gone)."""
+        async with _pending_gen_lock:
+            data = _load_pending_gens()
+            entry = data.pop(self.token, None)
+            if entry is not None:
+                _save_pending_gens(data)
+            return entry
+
+    async def _finish(self, interaction, note):
+        for b in self.children:
+            b.disabled = True
+        try:
+            await interaction.message.edit(
+                content=interaction.message.content + "\n" + note, view=self)
+        except Exception:
+            logger.exception("Could not disable gen approve buttons")
+
+    async def _approve(self, interaction):
+        if not self._authorized(interaction.user):
+            await interaction.response.send_message(
+                "You don't have permission to approve attendance.", ephemeral=True)
+            return
+        entry = await self._claim()
+        if entry is None:
+            await interaction.response.send_message(
+                "This draft was already approved or dismissed.", ephemeral=True)
+            return
+        await interaction.response.defer()
+        await self._finish(interaction, f"Approved by {interaction.user.name} — awarding now.")
+        await _award_attendance_entry(entry, interaction.channel, interaction.user)
+
+    async def _dismiss(self, interaction):
+        if not self._authorized(interaction.user):
+            await interaction.response.send_message(
+                "You don't have permission to dismiss this.", ephemeral=True)
+            return
+        entry = await self._claim()
+        if entry is None:
+            await interaction.response.send_message(
+                "This draft was already approved or dismissed.", ephemeral=True)
+            return
+        await interaction.response.defer()
+        await self._finish(interaction, f"Dismissed by {interaction.user.name}.")
+
+
+async def _award_attendance_entry(entry, channel, author):
+    """Run the boss / bosshalf logic for a claimed $gen draft — shared by the Approve
+    button and the $approve command. The entry must already be removed from
+    pending_gens (claimed) so it can never be awarded twice."""
+    fake = _ApproveCtx(channel, author)
+    bossname = entry.get("bossname", "BOSSNAME")
+    full = entry.get("full") or []
+    half = entry.get("half") or []
+    try:
+        if full:
+            await boss.callback(fake, bossname, ", ".join(full))
+        if half:
+            await bosshalf.callback(fake, bossname, ", ".join(half))
+    except Exception:
+        logger.exception("Awarding attendance failed")
+        await channel.send("Something went wrong awarding the attendance — please run it manually.")
+
+
+async def _close_draft_message(channel, message_id, note):
+    """Remove a draft message's buttons and append a note (used after $approve)."""
+    if not message_id:
+        return
+    try:
+        msg = await channel.fetch_message(message_id)
+        await msg.edit(content=(msg.content or "") + "\n" + note, view=None)
+    except Exception:
+        logger.exception("Could not close draft message")
+
+
+@client.command()
+@dkp_only()
+@commands.has_any_role("General", "Guardian", "REDALiCE", "Helper")
+async def approve(ctx):
+    """Approves the pending attendance draft in this thread — a button-free alternative
+    to the Approve button (in case the button has expired). Reply to a specific draft
+    message to approve that exact one."""
+    target_mid = None
+    if ctx.message.reference and ctx.message.reference.message_id:
+        target_mid = ctx.message.reference.message_id
+    async with _pending_gen_lock:
+        data = _load_pending_gens()
+        token = None
+        if target_mid is not None:
+            for tk, e in data.items():
+                if e.get("message_id") == target_mid:
+                    token = tk
+                    break
+        else:
+            # most-recently-created pending draft in this channel
+            candidates = [(tk, e) for tk, e in data.items()
+                          if e.get("channel_id") == ctx.channel.id]
+            candidates.sort(key=lambda ke: safe_float(ke[1].get("created", 0)), reverse=True)
+            if candidates:
+                token = candidates[0][0]
+        entry = data.pop(token) if token is not None else None
+        if entry is not None:
+            _save_pending_gens(data)
+    if entry is None:
+        await ctx.send("No pending attendance draft to approve here. Run `$approve` in the "
+                       "post's thread, or reply to the draft message with `$approve`.")
+        return
+    await _close_draft_message(ctx.channel, entry.get("message_id"),
+                               f"Approved by {ctx.author.name} via $approve.")
+    await _award_attendance_entry(entry, ctx.channel, ctx.author)
+
+
 @client.command(aliases=["generate"])
 @dkp_only()
 async def gen(ctx):
     """Generates boss and bosshalf commands based on the channel content before the gen command"""
-    channel = ctx.channel
+    await _generate_attendance(ctx.channel)
+
+
+async def _generate_attendance(channel, is_auto=False):
+    """Core of $gen, shared by the command and the 24h forum auto-gen. When is_auto
+    is True it skips if a human already ran $gen here (returns False), stays silent
+    on posts with no recognisable names, and prefixes the drafts with a note."""
     messages = [message async for message in channel.history(limit=100)]
     messages.reverse()
+    # For the auto-run, don't duplicate a $gen a human already ran in this post.
+    if is_auto:
+        for m in messages:
+            if m.content.lower().startswith("$gen"):
+                return False
     # i expect this to be called in a thread, if so, get the thread title
     thread_title = None
     if isinstance(channel, discord.Thread):
@@ -3587,14 +4280,45 @@ async def gen(ctx):
                 break
     if bossname is None:
         bossname = "BOSSNAME"    
-    if len(charnames) > 0:
-        msg = "$boss " + bossname + " \"" + ', '.join(charnames) + "\"\n"
-        await ctx.send(msg)
-    if len(charhalfnames) > 0:
-        msg = "$bosshalf " + bossname + " \"" + ', '.join(charhalfnames) + "\"\n"
-        await ctx.send(msg)
-    if len(missingnames) > 0:
-        await ctx.send("Could not find the following names: " + ', '.join(missingnames))
+    # Nothing actionable: stay silent on the auto-run (avoids spamming non-attendance
+    # posts); on a manual run still report any names we couldn't match.
+    if not (charnames or charhalfnames):
+        if not is_auto and missingnames:
+            await channel.send("Could not find the following names: " + ', '.join(missingnames))
+        return True
+    # Build the draft text (the backticked commands double as a copy-paste fallback).
+    header = ("Auto-generated attendance (this post is 1 day old) — review and approve:"
+              if is_auto else "Attendance draft — review and approve:")
+    lines = [header]
+    if charnames:
+        lines.append("`$boss " + bossname + " \"" + ', '.join(charnames) + "\"`")
+    if charhalfnames:
+        lines.append("`$bosshalf " + bossname + " \"" + ', '.join(charhalfnames) + "\"`")
+    if missingnames:
+        lines.append("Could not find: " + ', '.join(missingnames))
+    text = "\n".join(lines)
+    # If the boss couldn't be inferred from the title, an Approve button would award
+    # nothing useful — post the draft for manual handling instead.
+    if bossname == "BOSSNAME":
+        await channel.send(text + "\n(Couldn't detect the boss from the title — set the "
+                           "boss name and run the command manually.)")
+        return True
+    # Attach Approve / Dismiss buttons and remember the draft so it survives restarts.
+    token = uuid.uuid4().hex
+    msg = await channel.send(text, view=GenApproveView(token))
+    async with _pending_gen_lock:
+        data = _load_pending_gens()
+        data[token] = {
+            "channel_id": channel.id,
+            "message_id": msg.id,
+            "guild_id": getattr(getattr(channel, "guild", None), "id", None),
+            "bossname": bossname,
+            "full": charnames,
+            "half": charhalfnames,
+            "created": time.time(),
+        }
+        _save_pending_gens(data)
+    return True
 
 
 @client.command()
@@ -4222,13 +4946,13 @@ async def spreadsheet(ctx):
     await ctx.send("https://docs.google.com/spreadsheets/d/1Izu2wSmi0aEQCWTvfLAXX0ucXR2223ILzFxTiQXcl80/edit#gid=393681553")
 
 @client.command()
-@dkp_only()
+@dkp_read()
 async def oldwins(ctx):
     """Links Alice's old wins spreadsheet"""
     await ctx.send("https://docs.google.com/spreadsheets/d/1FbfNkF9SkD0A8a61ChoKvcG88yC2vpaHL8ffm37TSb8/edit?gid=1217357805#gid=1217357805")
 
 @client.command(aliases=["oldloot"])
-@dkp_only()
+@dkp_read()
 async def oldwinnings(ctx, name, kp = None):
     """Displays a player's old loot winnings from Alice's spreadsheet"""
     if kp != None:
@@ -4308,31 +5032,26 @@ $kpsite - links the KP site
 $lbhelp - boss leaderboard commands (also available in other servers)""")
     
 @client.command()
-@dkp_only()
 async def ban(ctx, name):
     """Bans a player"""
     await ctx.send(name + " has been banned")
 
 @client.command()
-@dkp_only()
 async def kick(ctx, name):
     """Kicks a player"""
     await ctx.send(name + " has been kicked")
 
 @client.command()
-@dkp_only()
 async def demote(ctx, name):
     """Demotes a player"""
     await ctx.send(name + " has been demoted")
 
 @client.command()
-@dkp_only()
 async def promote(ctx, name):
     """Promotes a player"""
     await ctx.send(name + " has been promoted")
 
 @client.command()
-@dkp_only()
 async def sudo(ctx):
     """pretends to break"""
     await ctx.send("Logging in as Super Admin")
@@ -4343,13 +5062,11 @@ async def sudo(ctx):
         await ctx.send("Error: you're a silly goose")
 
 @client.command()
-@dkp_only()
 async def unban(ctx, name):
     """Unbans a player"""
     await ctx.send(name + " has been unbanned")
 
 @client.command()
-@dkp_only()
 async def delete(ctx, *args):
     """Deletes something"""
     await ctx.send("Deleting " + " ".join(args))
@@ -4801,6 +5518,70 @@ async def _require_world_for_ctx(ctx):
         )
         return None
     return wid
+
+
+# Optional world-override token for read-only query commands. Lets a user point a
+# query at a world other than their server's configured one, e.g.
+#   $bests dino w:arawn      $statcard redalice 30d w:gwydion      $lh 5 x bt world:7
+# A prefixed token ('w:' / 'world:') is used rather than a bare world name so it
+# never collides with player names, boss aliases, or fight counts.
+_BOSS_WORLD_TOKEN_RE = re.compile(r"^(?:w|world):(.+)$", re.IGNORECASE)
+
+
+def _boss_extract_world_token(args):
+    """Pulls an optional 'w:<world>' / 'world:<world>' override out of a query
+    command's args. <world> is a CH world name or numeric id (via resolve_world).
+    Returns (world_id_or_None, world_label_or_None, remaining_args_str, error_or_None).
+    Only the first token is honoured. If present but unresolvable, returns an error
+    message so the caller can reject the command."""
+    parts = args.strip().split()
+    world_id = None
+    world_label = None
+    error = None
+    remaining = []
+    for token in parts:
+        m = _BOSS_WORLD_TOKEN_RE.match(token)
+        if m and world_id is None and error is None:
+            wid, _name = resolve_world(m.group(1))
+            if not wid:
+                error = (
+                    f"Unknown world `{m.group(1)}` in `{token}`. Use a CH world name "
+                    f"(see `$listworlds`) or a numeric id — e.g. `w:arawn` or `w:7`."
+                )
+            else:
+                world_id = int(wid)
+                world_label = display_world(world_id)
+            continue
+        remaining.append(token)
+    return world_id, world_label, " ".join(remaining), error
+
+
+async def _boss_resolve_query_world(ctx, args):
+    """Resolves the world a read-only query command should read, honouring an
+    optional 'w:<world>' override token in `args`.
+
+    Returns (world_id, world_label, remaining_args, use_roster), or None if a
+    usage/error message was already sent (the caller should just return).
+
+    The override never bypasses the DM / server-setup gate (so ctx.guild is always
+    valid afterwards) — it only changes which world's data is read. `use_roster` is
+    True only when the effective world is Gwydion AND the caller is in a Gwydion
+    guild, because the pilot<->toon roster is Gwydion's and is meaningless for
+    other worlds (there, names are taken at face value)."""
+    override_world, override_label, remaining, world_err = _boss_extract_world_token(args)
+    if world_err:
+        await ctx.send(world_err)
+        return None
+    base_world = await _require_world_for_ctx(ctx)
+    if base_world is None:
+        return None
+    world_id = override_world if override_world is not None else base_world
+    world_label = override_label if override_world is not None else display_world(world_id)
+    use_roster = (
+        is_gwydion_guild(getattr(getattr(ctx, "guild", None), "id", None))
+        and world_id == GWYDION_WORLD_ID
+    )
+    return world_id, world_label, remaining, use_roster
 
 
 # ─── BossRanking API ──────────────────────────────────────────────────────
@@ -5662,6 +6443,59 @@ def create_boss_chart_image(fight_id, data, title, show_pilots=True):
 _boss_poll_lock = asyncio.Lock()
 
 
+# Tracked worlds = every world the bot keeps fresh for cross-world comparisons,
+# even with no Discord server configured for it. Discovered from the named CH
+# world list, the on-disk traverser snapshot (so dead/merged worlds are included),
+# any saved per-world state, and configured guilds. Cached because the traverser
+# directory scan is the only mildly expensive part and worlds rarely change.
+_BOSS_FIGHT_FILE_RE = re.compile(r"^fight_(\d+)_\d+\.json$")
+_BOSS_TRACKED_WORLDS_TTL = 3600  # seconds
+_boss_tracked_worlds_cache = {"ids": set(), "loaded_at": 0.0}
+_boss_tracked_worlds_lock = threading.Lock()
+
+
+def boss_get_tracked_world_ids(force=False):
+    """Returns the set of world IDs the bot should keep refreshed (persist-only)
+    every poll cycle, so $bests / $statcard / $fighthistory have current data for
+    cross-world comparisons. Union of:
+      - CH_WORLDS (the named worlds),
+      - every world present in the traverser snapshot (includes dead/merged ones),
+      - worlds with saved posted-fight state,
+      - configured-guild worlds.
+    Cached for _BOSS_TRACKED_WORLDS_TTL seconds. Blocking (does a directory scan);
+    call via sheet_call from async code."""
+    now = time.time()
+    with _boss_tracked_worlds_lock:
+        cached = _boss_tracked_worlds_cache["ids"]
+        fresh = (now - _boss_tracked_worlds_cache["loaded_at"]) < _BOSS_TRACKED_WORLDS_TTL
+        if not force and cached and fresh:
+            return set(cached)
+    ids = {int(w) for w in CH_WORLDS.values()}
+    fights_dir, _index_path = _boss_traverser_paths()
+    if fights_dir and os.path.isdir(fights_dir):
+        try:
+            for fn in os.listdir(fights_dir):
+                m = _BOSS_FIGHT_FILE_RE.match(fn)
+                if m:
+                    ids.add(int(m.group(1)))
+        except Exception:
+            logger.exception("tracked-world discovery: traverser scan failed")
+    ids |= _world_keys_in_posted_file()
+    try:
+        for _gid, _entry in get_all_configured_guilds():
+            try:
+                ids.add(int(_entry.get("world_id", 0)))
+            except Exception:
+                continue
+    except Exception:
+        logger.exception("tracked-world discovery: configured-guild scan failed")
+    ids = {w for w in ids if w > 0}
+    with _boss_tracked_worlds_lock:
+        _boss_tracked_worlds_cache["ids"] = set(ids)
+        _boss_tracked_worlds_cache["loaded_at"] = now
+    return ids
+
+
 def _collect_auto_post_targets():
     """Returns {world_id: [(guild_id, channel_id, show_pilots), ...]}.
 
@@ -5692,6 +6526,12 @@ def _collect_auto_post_targets():
         targets.setdefault(GWYDION_WORLD_ID, []).append(
             (None, GWYDION_AUTO_POST_CHANNEL_ID, True)
         )
+    # Refresh-only worlds: keep every tracked world's raid history current even
+    # when no Discord server is configured for it, so cross-world comparisons have
+    # fresh data. An empty channel list makes boss_perform_auto_check persist new
+    # fights to raid_history without posting anything to a channel.
+    for _wid in boss_get_tracked_world_ids():
+        targets.setdefault(int(_wid), [])
     return targets
 
 
@@ -5728,7 +6568,10 @@ async def boss_perform_auto_check():
                     try:
                         data = await sheet_call(boss_get_fight_data, fight_id, world_id=world_id)
                         boss_id = await sheet_call(get_best_boss_id_for_fight, fight_id, data, world_id=world_id)
-                        await sheet_call(add_fight_to_history, fight_id, fight_data=data, world_id=world_id)
+                        # Pass the listing row we already have as detailed_fight so
+                        # add_fight_to_history doesn't re-scan up to 20 API pages to
+                        # rediscover it — matters now that ~26 worlds are polled.
+                        await sheet_call(add_fight_to_history, fight_id, detailed_fight=fight, fight_data=data, world_id=world_id)
                     except Exception:
                         logger.exception(
                             f"Failed to fetch fight {fight_id} (world {world_id}); skipping"
@@ -6092,13 +6935,16 @@ async def lbhelp(ctx):
         "`$historyinfo` — saved fight counts per boss",
         "`$fighthistory [N] <player> <boss>` — last N fights at a boss",
         "`$bests <boss> [Nd|Nw|Nm|Ny] [unique]` — top damage/DPS at a boss",
+        "`$bestsall <boss> [window] [unique]` — top damage/DPS across ALL worlds",
         "`$statcard <player> [window] [boss]` — best damage/DPS per boss (PR card)",
+        "*Tip: add `w:<world>` to `$bests` / `$statcard` / `$fighthistory` to query another world, e.g. `$bests dino w:arawn`.*",
         "",
         "**Admin (configured setup role):**",
         "`$bossreloadtraverser` — force-refresh the traverser cache",
         "`$bossrescrape [year|all]` — repair truncated cached fight JSONs",
         "`$bosspollnow` — force an immediate auto-check cycle",
         "`$repairhistory [max_pages]` — re-fetch missing BossIds from the live API",
+        "`$backfillworlds [all|world] [pages]` — pull recent fights for all worlds (cross-world comparisons)",
         "",
         "*DKP, roster, and bidding commands are Gwydion-Relentless-only and won't run elsewhere.*",
     ]
@@ -6394,6 +7240,136 @@ async def repairhistory(ctx, max_pages: int = 20):
     )
 
 
+@client.command(aliases=['backfillall', 'gapfill'])
+async def backfillworlds(ctx, scope: str = "all", max_pages: int = 4):
+    """Admin: one-time throttled backfill of recent fights into raid_history for
+    tracked worlds, closing the gap between the static traverser snapshot and now.
+
+    Usage:
+      $backfillworlds                 — all tracked worlds, 4 listing pages each
+      $backfillworlds all 6           — all worlds, 6 pages (~3000 fights/world scanned)
+      $backfillworlds arawn           — just Arawn
+      $backfillworlds 7 5             — world 7, 5 pages
+
+    Only fights NOT already in the traverser snapshot or raid_history get a detail
+    fetch, so re-running is cheap. Detail fetches are throttled and validated
+    against the listing's damage total to drop wrong-world API responses. Runs
+    under the poll lock, so a scheduled auto-check is skipped while it works."""
+    entry = get_server_entry(ctx.guild.id) if ctx.guild else None
+    if not is_server_setup_authorized(ctx.author, entry):
+        await ctx.send("You don't have permission to run this admin command.")
+        return
+    try:
+        max_pages = max(1, min(int(max_pages), 20))
+    except Exception:
+        max_pages = 4
+    if str(scope).strip().lower() in ("all", "*", "tracked"):
+        world_ids = sorted(await sheet_call(boss_get_tracked_world_ids))
+        scope_label = f"all {len(world_ids)} tracked world(s)"
+    else:
+        wid, _name = resolve_world(scope)
+        if not wid:
+            await ctx.send(
+                f"Unknown world `{scope}`. Use `all`, a world id, or a name from `$listworlds`."
+            )
+            return
+        world_ids = [int(wid)]
+        scope_label = display_world(wid)
+    if not world_ids:
+        await ctx.send("No worlds to backfill.")
+        return
+    MAX_FETCH = 4000  # safety cap on detail fetches across the whole run
+    await ctx.send(
+        f"Backfilling **{scope_label}** — up to **{max_pages}** listing page(s) each, "
+        f"fetching only fights missing from the snapshot + history. Throttled; this can "
+        f"take several minutes. I'll report progress."
+    )
+    total_added = 0
+    total_fetched = 0
+    total_skipped_wrongworld = 0
+    summary_lines = []
+    async with _boss_poll_lock:
+        for i, wid in enumerate(world_ids, 1):
+            if total_fetched >= MAX_FETCH:
+                summary_lines.append(f"(stopped at the {MAX_FETCH}-fetch safety cap)")
+                break
+            try:
+                existing = set((await sheet_call(boss_load_traverser_history, world_id=wid)).keys())
+                existing |= set((await sheet_call(load_raid_history, world_id=wid)).keys())
+            except Exception:
+                logger.exception(f"backfill: could not load existing history for world {wid}")
+                existing = set()
+            added_here = 0
+            for page in range(1, max_pages + 1):
+                if total_fetched >= MAX_FETCH:
+                    break
+                try:
+                    fights = await sheet_call(
+                        boss_get_detailed_fights, num_recs=500, page=page,
+                        exclude_dates=True, world_id=wid,
+                    )
+                except Exception:
+                    logger.exception(f"backfill: listing fetch failed (world {wid}, page {page})")
+                    break
+                if not fights:
+                    break
+                for f in fights:
+                    if total_fetched >= MAX_FETCH:
+                        break
+                    try:
+                        fid = int(f.get("FightId", 0))
+                        bid = int(f.get("BossId", 0))
+                    except Exception:
+                        continue
+                    if fid <= 0 or bid not in CONFIRMED_BOSS_IDS:
+                        continue
+                    if str(fid) in existing:
+                        continue
+                    try:
+                        data = await sheet_call(boss_get_fight_data, fid, world_id=wid)
+                        total_fetched += 1
+                        # Wrong-world guard: the listing row is world-filtered, but
+                        # board=fight sometimes returns another world's fight. The
+                        # listing's TotalDamage is authoritative for (fid, world).
+                        idx_dmg = int(f.get("TotalDamage", 0) or 0)
+                        pf_dmg = int(data.get("TotalDamageDone", 0) or 0)
+                        if idx_dmg > 0 and pf_dmg != idx_dmg:
+                            total_skipped_wrongworld += 1
+                            continue
+                        ok = await sheet_call(
+                            add_fight_to_history, fid,
+                            detailed_fight=f, fight_data=data, world_id=wid,
+                        )
+                        if ok:
+                            added_here += 1
+                            existing.add(str(fid))
+                    except Exception:
+                        logger.exception(f"backfill: fight {fid} (world {wid}) failed")
+                    await asyncio.sleep(0.4)
+                await asyncio.sleep(0.2)
+            total_added += added_here
+            if added_here:
+                summary_lines.append(f"{display_world(wid)} +{added_here}")
+            # Heartbeat every 5 worlds so a long run doesn't look hung.
+            if i % 5 == 0 and i < len(world_ids):
+                await ctx.send(
+                    f"… {i}/{len(world_ids)} worlds — **{total_added}** added so far "
+                    f"({total_fetched} detail fetches)."
+                )
+    msg = [
+        f"Backfill complete for {scope_label}.",
+        f"Added **{total_added}** new fight(s) from **{total_fetched}** detail fetch(es).",
+    ]
+    if total_skipped_wrongworld:
+        msg.append(f"Skipped **{total_skipped_wrongworld}** wrong-world API response(s).")
+    if summary_lines:
+        msg.append("Per world: " + "  •  ".join(summary_lines))
+    out = "\n".join(msg)
+    if len(out) > 1900:
+        out = out[:1900] + " …(truncated)"
+    await ctx.send(out)
+
+
 # ─── Player stat card ─────────────────────────────────────────────────────
 
 def _boss_resolve_pilot_identity(query):
@@ -6640,18 +7616,17 @@ async def statcard(ctx, *, args: str):
 
     Window tokens: Nd, Nw, Nm, Ny, or 'all'. Months=30d, years=365d (approx).
     Boss tokens: any alias from `$bossaliases` (bt, gele, dino, etc.).
-    Runs on this server's configured CH world (set via `$setworld`). On Gwydion
-    servers the player is matched as a single character first, falling back to
-    pilot (all alts) only if the name isn't a known toon. On other servers the
-    name is treated as a literal toon name (face value, no roster lookup)."""
-    world_id = await _require_world_for_ctx(ctx)
-    if world_id is None:
+    Defaults to this server's configured CH world; add `w:<world>` to target another
+    (e.g. `$statcard redalice w:arawn`). Roster-aware pilot/toon matching applies on
+    the Gwydion world; on any other world the name is taken at face value."""
+    resolved = await _boss_resolve_query_world(ctx, args)
+    if resolved is None:
         return
-    is_gwydion = is_gwydion_guild(ctx.guild.id)
+    world_id, world_label, args, use_roster = resolved
     try:
-        # On non-Gwydion guilds, skip the roster fetch entirely.
+        # Roster lookup only makes sense for Gwydion's world; otherwise face value.
         window_token, boss_id, player_name = _boss_extract_statcard_args(
-            args, roster_keys=None if is_gwydion else set()
+            args, roster_keys=None if use_roster else set()
         )
         if not player_name:
             await ctx.send(
@@ -6666,7 +7641,7 @@ async def statcard(ctx, *, args: str):
             cutoff_date = dt.now(timezone.utc).date() - window_delta
             window_label = f"last {window_token} (since {cutoff_date.isoformat()})"
         boss_label = boss_display_name(boss_id) if boss_id else None
-        if is_gwydion:
+        if use_roster:
             display_name, toon_keys, mode_text_or_msg = _boss_resolve_pilot_identity(player_name)
             if not display_name:
                 await ctx.send(mode_text_or_msg)
@@ -6682,7 +7657,7 @@ async def statcard(ctx, *, args: str):
         if not per_boss:
             traverser_n = len(await sheet_call(boss_load_traverser_history, world_id=world_id))
             local_n = len(await sheet_call(load_raid_history, world_id=world_id))
-            scope = f"window `{window_label}`"
+            scope = f"world `{world_label}`, window `{window_label}`"
             if boss_label:
                 scope += f", boss `{boss_label}`"
             await ctx.send(
@@ -6700,6 +7675,7 @@ async def statcard(ctx, *, args: str):
         )
         reply_bits = [
             f"Stat card for **{display_name}**",
+            f"world: {world_label}",
             f"{len(per_boss)} boss(es)" if not boss_label else boss_label,
             f"window: {window_label}",
         ]
@@ -6813,17 +7789,18 @@ async def fighthistory(ctx, *, args: str):
       $fighthistory 20 redalice BT             — last 20 Bloodthorn for REDALiCE
       $fighthistory redalice 10 dhiothu        — any order works
 
-    Boss aliases via `$bossaliases`. On Gwydion servers the player can be a pilot
-    or toon name (roster-aware). On other servers the name is treated as a literal
-    toon name (face value, no roster lookup)."""
-    world_id = await _require_world_for_ctx(ctx)
-    if world_id is None:
+    Boss aliases via `$bossaliases`. Defaults to this server's configured world; add
+    `w:<world>` to target another (e.g. `$fighthistory 5 redalice bt w:arawn`).
+    Roster-aware pilot/toon matching applies on the Gwydion world; on any other world
+    the name is treated as a literal toon name (face value, no roster lookup)."""
+    resolved = await _boss_resolve_query_world(ctx, args)
+    if resolved is None:
         return
-    is_gwydion = is_gwydion_guild(ctx.guild.id)
+    world_id, world_label, args, use_roster = resolved
     try:
-        # On non-Gwydion guilds, skip the roster fetch entirely
+        # Roster lookup only makes sense for Gwydion's world; otherwise face value.
         count, boss_id, player_name = _boss_extract_last_args(
-            args, roster_keys=None if is_gwydion else set()
+            args, roster_keys=None if use_roster else set()
         )
         if not boss_id:
             await ctx.send(
@@ -6836,7 +7813,7 @@ async def fighthistory(ctx, *, args: str):
                 "Usage: `$fighthistory [N] <player> <boss>` — player name required."
             )
             return
-        if is_gwydion:
+        if use_roster:
             display_name, toon_keys, mode_text = _boss_resolve_pilot_identity(player_name)
             if not display_name:
                 await ctx.send(mode_text)
@@ -6850,7 +7827,7 @@ async def fighthistory(ctx, *, args: str):
         if not runs:
             await ctx.send(
                 f"No saved fights for `{display_name}` at "
-                f"**{boss_display_name(boss_id)}**."
+                f"**{boss_display_name(boss_id)}** on **{world_label}**."
             )
             return
         damages = [r["Damage"] for r in runs]
@@ -6859,7 +7836,7 @@ async def fighthistory(ctx, *, args: str):
         avg_dps = sum(dpses) / len(dpses)
         embed = discord.Embed(
             title=f"{display_name} — Last {len(runs)} {boss_display_name(boss_id)} run(s)",
-            description=f"Mode: {mode_text}",
+            description=f"World: {world_label}  •  Mode: {mode_text}",
             colour=discord.Color.orange(),
         )
         summary_lines = [
@@ -7002,10 +7979,13 @@ async def bests(ctx, *, args: str):
       $bests <boss> unique            — one entry per toon (their best)
       $bests <boss> 30d unique        — both filters; any order
 
-    Window tokens: Nd, Nw, Nm, Ny, all. Boss is required — try `$bossaliases`."""
-    world_id = await _require_world_for_ctx(ctx)
-    if world_id is None:
+    Window tokens: Nd, Nw, Nm, Ny, all. Boss is required — try `$bossaliases`.
+    Defaults to this server's configured world; add `w:<world>` to target another
+    (e.g. `$bests dino w:arawn`). For every world at once, use `$bestsall`."""
+    resolved = await _boss_resolve_query_world(ctx, args)
+    if resolved is None:
         return
+    world_id, world_label, args, _use_roster = resolved
     try:
         boss_id, window_token, unique_only, leftover = _boss_extract_bests_args(args)
         if not boss_id:
@@ -7026,7 +8006,8 @@ async def bests(ctx, *, args: str):
         )
         if not top_dmg:
             await ctx.send(
-                f"No fights found for **{boss_display_name(boss_id)}** in window `{window_label}`."
+                f"No fights found for **{boss_display_name(boss_id)}** on "
+                f"**{world_label}** in window `{window_label}`."
             )
             return
         scope = (
@@ -7035,7 +8016,7 @@ async def bests(ctx, *, args: str):
         )
         embed = discord.Embed(
             title=f"{boss_display_name(boss_id)} — Top Performances",
-            description=scope,
+            description=f"World: {world_label}  •  " + scope,
             colour=discord.Color.orange(),
         )
 
@@ -7062,6 +8043,180 @@ async def bests(ctx, *, args: str):
     except Exception as e:
         logger.exception("bests command failed")
         await ctx.send(f"Could not compute top performances: {e}")
+
+
+def _boss_evict_traverser_world(world_id):
+    """Drops a world's cached traverser history so Python can reclaim it. Used by
+    $bestsall to keep peak memory at ~one world while scanning all ~26 (the full
+    set is ~130 MB on disk → far more as live dicts, too much to hold at once)."""
+    try:
+        wid = int(world_id)
+    except Exception:
+        return
+    with _boss_traverser_lock:
+        bucket = _boss_traverser_cache.get(wid)
+        if bucket is not None:
+            bucket["history"] = {}
+            bucket["loaded_at"] = 0.0
+            bucket["file_count"] = -1
+
+
+def _boss_collect_top_performances_global(boss_id, cutoff_date=None, unique_only=False,
+                                          limit=10, world_ids=None, keep_cached=None):
+    """Cross-world version of _boss_collect_top_performances. Each returned entry
+    carries a 'World' (id). Worlds are processed one at a time and each world's
+    traverser cache is evicted afterwards — unless it was already warm before we
+    ran or is listed in `keep_cached` — so peak memory stays ~one world rather than
+    all of them. unique_only dedups per (world, toon). Returns (top_dmg, top_dps)."""
+    if world_ids is None:
+        world_ids = boss_get_tracked_world_ids()
+    keep_cached = {int(w) for w in (keep_cached or set())}
+    entries = []
+    for wid in sorted(int(w) for w in world_ids):
+        with _boss_traverser_lock:
+            b = _boss_traverser_cache.get(wid)
+            was_cached = bool(b and b.get("history"))
+        merged = dict(load_raid_history(world_id=wid))
+        merged.update(boss_load_traverser_history(world_id=wid))
+        for rec in merged.values():
+            if _boss_is_excluded_date(rec.get("DateOfKill", "")):
+                continue
+            if cutoff_date is not None:
+                kd = _boss_parse_kill_date(rec.get("DateOfKill", ""))
+                if not kd or kd < cutoff_date:
+                    continue
+            try:
+                if int(rec.get("BossId", 0)) != boss_id:
+                    continue
+            except Exception:
+                continue
+            try:
+                duration = int(rec.get("FightDurationSeconds", 0))
+            except Exception:
+                duration = 0
+            for p in rec.get("Players", []):
+                name = str(p.get("Name", "")).strip()
+                if not name:
+                    continue
+                try:
+                    damage = int(p.get("DamageDealt", 0))
+                except Exception:
+                    damage = 0
+                if damage <= 0:
+                    continue
+                dps = damage / duration if duration else 0
+                entries.append({
+                    "Name": name,
+                    "Class": str(p.get("ClassName", "")).strip(),
+                    "Damage": damage,
+                    "DPS": dps,
+                    "FightId": int(rec.get("FightId", 0)),
+                    "Date": rec.get("DateOfKill", ""),
+                    "World": wid,
+                })
+        merged = None
+        # Free this world's history unless it was already warm before we touched it
+        # (don't evict the caller's own world out from under other commands) or it's
+        # explicitly kept.
+        if wid not in keep_cached and not was_cached:
+            _boss_evict_traverser_world(wid)
+    if unique_only:
+        best_dmg = {}
+        best_dps = {}
+        for e in entries:
+            k = (e["World"], e["Name"])
+            if k not in best_dmg or e["Damage"] > best_dmg[k]["Damage"]:
+                best_dmg[k] = e
+            if k not in best_dps or e["DPS"] > best_dps[k]["DPS"]:
+                best_dps[k] = e
+        top_dmg = sorted(best_dmg.values(), key=lambda x: -x["Damage"])[:limit]
+        top_dps = sorted(best_dps.values(), key=lambda x: -x["DPS"])[:limit]
+    else:
+        top_dmg = sorted(entries, key=lambda x: -x["Damage"])[:limit]
+        top_dps = sorted(entries, key=lambda x: -x["DPS"])[:limit]
+    return top_dmg, top_dps
+
+
+@client.command(aliases=['topall', 'bestall', 'globalbests', 'allbests'])
+async def bestsall(ctx, *, args: str = ""):
+    """Top performances at a boss across EVERY tracked world at once — top 10 by
+    damage and top 10 by DPS, each labelled with its world.
+
+    Usage:
+      $bestsall <boss>                — top 10, all time, all worlds
+      $bestsall <boss> 30d            — last 30 days only
+      $bestsall <boss> unique         — one entry per (world, toon)
+      $bestsall <boss> 30d unique     — both filters; any order
+
+    Scans all tracked worlds, so the first run takes a few seconds. Window tokens:
+    Nd/Nw/Nm/Ny/all. Boss is required — try `$bossaliases`. For a single world, use
+    `$bests <boss>` (optionally `$bests <boss> w:<world>`)."""
+    # Same DM / server-setup gate as the other query commands; the world is "all".
+    base_world = await _require_world_for_ctx(ctx)
+    if base_world is None:
+        return
+    try:
+        boss_id, window_token, unique_only, leftover = _boss_extract_bests_args(args)
+        if not boss_id:
+            await ctx.send(
+                "Usage: `$bestsall <boss> [window] [unique]` — boss alias is required. "
+                "Run `$bossaliases` for the list."
+            )
+            return
+        window_delta = _boss_parse_window(window_token) if window_token else None
+        cutoff_date = None
+        window_label = "all time"
+        if window_delta is not None:
+            cutoff_date = dt.now(timezone.utc).date() - window_delta
+            window_label = f"last {window_token}"
+        world_ids = sorted(await sheet_call(boss_get_tracked_world_ids))
+        await ctx.send(
+            f"Scanning **{len(world_ids)}** worlds for **{boss_display_name(boss_id)}** "
+            f"top performances — this can take a few seconds…"
+        )
+        top_dmg, top_dps = await sheet_call(
+            _boss_collect_top_performances_global,
+            boss_id, cutoff_date=cutoff_date, unique_only=unique_only, limit=10,
+            world_ids=world_ids, keep_cached={base_world},
+        )
+        if not top_dmg:
+            await ctx.send(
+                f"No fights found for **{boss_display_name(boss_id)}** on any tracked "
+                f"world in window `{window_label}`."
+            )
+            return
+        scope = (
+            f"All {len(world_ids)} worlds  •  Window: {window_label}  •  "
+            f"{'Unique per (world, toon)' if unique_only else 'All entries'}"
+        )
+        embed = discord.Embed(
+            title=f"{boss_display_name(boss_id)} — Top Performances (all worlds)",
+            description=scope,
+            colour=discord.Color.gold(),
+        )
+
+        def _fmt_class(cls):
+            return f" *({cls})*" if cls else ""
+
+        # Compact one line per entry so 10 rows fit Discord's 1024-char field limit.
+        dmg_lines = [
+            f"**{i}.** {e['Name'][:20]}{_fmt_class(e['Class'])} — "
+            f"**{e['Damage']:,}** dmg · {e['DPS']:,.0f} DPS · {display_world(e['World'])}"
+            for i, e in enumerate(top_dmg, 1)
+        ]
+        dps_lines = [
+            f"**{i}.** {e['Name'][:20]}{_fmt_class(e['Class'])} — "
+            f"**{e['DPS']:,.1f}** DPS · {e['Damage']:,} dmg · {display_world(e['World'])}"
+            for i, e in enumerate(top_dps, 1)
+        ]
+        embed.add_field(name="Top 10 by Damage", value="\n".join(dmg_lines), inline=False)
+        embed.add_field(name="Top 10 by DPS", value="\n".join(dps_lines), inline=False)
+        if leftover:
+            embed.set_footer(text=f"Ignored extra args: {' '.join(leftover)}")
+        await ctx.send(embed=embed)
+    except Exception as e:
+        logger.exception("bestsall command failed")
+        await ctx.send(f"Could not compute cross-world top performances: {e}")
 
 
 @client.command(aliases=['fighthistoryinfo', 'savedfights'])
