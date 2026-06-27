@@ -839,8 +839,18 @@ def not_found_message(name, suggestions):
     if suggestions:
         return "Could not find player '" + name + "'. Did you mean: " + ", ".join(suggestions) + "?"
     return "Could not find player '" + name + "'."
-            
-    
+
+
+def _atomic_write_json(path, data, indent=None):
+    """Write `data` as JSON to `path` atomically (tmp file + os.replace) so a crash
+    mid-write can't leave a corrupt / partial file. Shared by all the local
+    JSON-state savers (tiebreaks, gen posts, pending gens, bids)."""
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=indent)
+    os.replace(tmp, path)
+
+
 # ----- Bid tie-break roll-offs -----
 # Active tie-breaks live in a local JSON file so they survive a bot restart. Each
 # entry records the thread, the tied players, and their (first) d100 rolls. The
@@ -865,20 +875,19 @@ def _load_tiebreaks():
 
 def _save_tiebreaks(data):
     try:
-        with open(TIEBREAKS_FILE, "w", encoding="utf-8") as f:
-            json.dump(data, f)
+        _atomic_write_json(TIEBREAKS_FILE, data)
     except Exception:
         logger.exception("Could not write tiebreaks file")
 
 
 # ----- Auto-gen for forum attendance posts -----
-# Posts in this forum channel get $gen run on them automatically once they are 24h
+# Posts in this forum channel get $gen run on them automatically once they are 12h
 # old, so nobody has to run it by hand. New posts are recorded via on_thread_create;
-# genloop posts the draft once each passes 24h. State lives in a local JSON file so
+# genloop posts the draft once each passes 12h. State lives in a local JSON file so
 # it survives restarts, and because recording is event-driven, pre-existing posts are
 # never touched. See on_thread_create / genloop / _process_due_gen_post.
 GEN_FORUM_CHANNEL_ID = 1180246887958315018
-GEN_POST_AGE = 24 * 60 * 60  # 1 day, in seconds
+GEN_POST_AGE = 12 * 60 * 60  # 12 hours, in seconds
 GEN_POSTS_FILE = "gen_posts.json"
 _gen_lock = asyncio.Lock()
 
@@ -896,8 +905,7 @@ def _load_gen_posts():
 
 def _save_gen_posts(data):
     try:
-        with open(GEN_POSTS_FILE, "w", encoding="utf-8") as f:
-            json.dump(data, f)
+        _atomic_write_json(GEN_POSTS_FILE, data)
     except Exception:
         logger.exception("Could not write gen_posts file")
 
@@ -924,8 +932,7 @@ def _load_pending_gens():
 
 def _save_pending_gens(data):
     try:
-        with open(PENDING_GENS_FILE, "w", encoding="utf-8") as f:
-            json.dump(data, f)
+        _atomic_write_json(PENDING_GENS_FILE, data)
     except Exception:
         logger.exception("Could not write pending_gens file")
 
@@ -967,12 +974,9 @@ def _load_bids():
 
 
 def _save_bids(data):
-    """Atomic write (tmp file + os.replace) so a crash mid-write can't leave a
-    corrupt / partial file -- this is points-adjacent state."""
-    tmp = BIDS_FILE + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2)
-    os.replace(tmp, BIDS_FILE)
+    """Atomic write so a crash mid-write can't leave a corrupt / partial file --
+    this is points-adjacent state."""
+    _atomic_write_json(BIDS_FILE, data, indent=2)
 
 
 def _bid_get_auction(data, auction_id):
@@ -980,8 +984,10 @@ def _bid_get_auction(data, auction_id):
     return data["auctions"].get(str(auction_id))
 
 
-def _bid_new_auction(data, item, kp, user_id, toon, price, now):
-    """Create a new auction whose first bid is the opening bid. Returns its id."""
+def _bid_new_auction(data, item, kp, user_id, toon, price, now, channel_id=None):
+    """Create a new auction whose first bid is the opening bid. Returns its id.
+    `channel_id` records the thread/channel $startbid ran in, so first-time bids
+    can post an 'interested' notice back there."""
     aid = int(data["_meta"]["next_id"])
     data["_meta"]["next_id"] = aid + 1
     data["auctions"][str(aid)] = {
@@ -991,6 +997,7 @@ def _bid_new_auction(data, item, kp, user_id, toon, price, now):
         "kp": kp,
         "status": "Open",
         "close_time": None,
+        "channel_id": int(channel_id) if channel_id is not None else None,
         "bids": [{"time": now, "user_id": str(user_id), "toon": toon, "price": int(price)}],
     }
     return aid
@@ -1001,6 +1008,13 @@ def _bid_add(auction, user_id, toon, price, now):
     auction["bids"].append(
         {"time": now, "user_id": str(user_id), "toon": toon, "price": int(price)}
     )
+
+
+def _bid_is_first_bid(auction, toon):
+    """True if `toon` has not yet bid on this auction. Call BEFORE adding the new
+    bid, to decide whether to post the one-time 'interested' notice. The opening
+    bidder counts as already-bid (they're in bids[0])."""
+    return not any(b["toon"] == toon for b in auction["bids"])
 
 
 def _bid_cancel(auction, user_id, toon, price, now):
@@ -1187,9 +1201,11 @@ async def _announce_tiebreak_result(tb):
 @client.event
 async def on_thread_create(thread):
     """Record new forum posts in the attendance channel so genloop can auto-run
-    $gen on them once they're 24h old. Other threads (boss/tie-break) are ignored."""
+    $gen on them once they're 12h old. Other threads (boss/tie-break) are ignored."""
     try:
-        if getattr(thread, "parent_id", None) != GEN_FORUM_CHANNEL_ID:
+        parent = getattr(thread, "parent_id", None)
+        if parent != GEN_FORUM_CHANNEL_ID:
+            print(f"GENPOST: thread {thread.id} created in parent {parent} (not the gen forum {GEN_FORUM_CHANNEL_ID}); ignoring")
             return
         async with _gen_lock:
             data = _load_gen_posts()
@@ -1198,13 +1214,16 @@ async def on_thread_create(thread):
                 created = thread.created_at.timestamp() if thread.created_at else time.time()
                 data[tid] = {"created": created, "processed": False}
                 _save_gen_posts(data)
+                print(f"GENPOST: recorded new forum post {tid} (created={created:.0f}); will auto-gen at +{GEN_POST_AGE/3600:.0f}h")
+            else:
+                print(f"GENPOST: forum post {tid} already tracked; not re-recording")
     except Exception:
         logger.exception("Error recording forum post for auto-gen")
 
 
 @tasks.loop(minutes=10)
 async def genloop():
-    """Auto-runs $gen on forum attendance posts once they pass 24h old. Claims each
+    """Auto-runs $gen on forum attendance posts once they pass 12h old. Claims each
     due post (marks it processed) before running so a slow run can't double-post.
     Processed posts are kept as tombstones so the startup backfill won't re-draft them."""
     try:
@@ -1212,15 +1231,24 @@ async def genloop():
         async with _gen_lock:
             data = _load_gen_posts()
             now = time.time()
+            tracked = [k for k in data if not k.startswith("_")]
+            pending = [k for k in tracked if not data[k].get("processed")]
+            print(f"GENLOOP: tick — {len(tracked)} tracked post(s), {len(pending)} unprocessed, threshold={GEN_POST_AGE/3600:.0f}h")
             changed = False
             for tid, info in list(data.items()):
                 if tid.startswith("_"):
                     continue  # skip meta keys like _baseline
+                if info.get("processed"):
+                    continue
                 created = safe_float(info.get("created", 0))
-                if not info.get("processed") and now >= created + GEN_POST_AGE:
+                age_h = (now - created) / 3600
+                if now >= created + GEN_POST_AGE:
                     info["processed"] = True  # claim it now so we don't run twice
                     due.append(tid)
                     changed = True
+                    print(f"GENLOOP: post {tid} is due (age={age_h:.1f}h >= {GEN_POST_AGE/3600:.0f}h) -> drafting")
+                else:
+                    print(f"GENLOOP: post {tid} not yet due (age={age_h:.1f}h < {GEN_POST_AGE/3600:.0f}h)")
             if changed:
                 _save_gen_posts(data)
         for tid in due:
@@ -1236,19 +1264,24 @@ async def _process_due_gen_post(tid):
     """Fetch a due forum post and run the shared $gen logic on it in auto mode."""
     thread = client.get_channel(int(tid))
     if thread is None:
+        print(f"GENLOOP: thread {tid} not in cache, fetching from API...")
         try:
             thread = await client.fetch_channel(int(tid))
         except Exception:
             logger.warning(f"Auto-gen: could not fetch thread {tid}")
+            print(f"GENLOOP: could not fetch thread {tid} (deleted? no access?) — skipping")
             return
     if not isinstance(thread, discord.Thread):
+        print(f"GENLOOP: channel {tid} is not a Thread ({type(thread).__name__}) — skipping")
         return
-    # A post may have auto-archived by the 24h mark; unarchive so we can post.
+    # A post may have auto-archived by the 12h mark; unarchive so we can post.
     if thread.archived:
+        print(f"GENLOOP: thread {tid} is archived, unarchiving to post")
         try:
             await thread.edit(archived=False)
         except Exception:
-            pass
+            logger.exception(f"Auto-gen: could not unarchive thread {tid}")
+    print(f"GENLOOP: running auto-gen on thread {tid} ('{getattr(thread, 'name', '?')}')")
     await _generate_attendance(thread, is_auto=True)
 
 
@@ -1256,41 +1289,56 @@ async def _backfill_forum_posts():
     """On startup, catch forum posts missed while the bot was offline. The first run
     only records a baseline timestamp (so the pre-feature backlog is left alone); later
     runs record any post created since the baseline that we aren't already tracking, and
-    genloop drafts each at its 24h mark (or on the next tick if already past)."""
+    genloop drafts each at its 12h mark (or on the next tick if already past)."""
+    print("GENBACKFILL: starting restart look-back for missed forum posts")
     forum = client.get_channel(GEN_FORUM_CHANNEL_ID)
     if forum is None:
         logger.warning(f"Auto-gen backfill: forum channel {GEN_FORUM_CHANNEL_ID} not found")
+        print(f"GENBACKFILL: forum channel {GEN_FORUM_CHANNEL_ID} not found (not cached / no access) — aborting")
         return
+    print(f"GENBACKFILL: forum channel found ('{getattr(forum, 'name', '?')}')")
     async with _gen_lock:
         data = _load_gen_posts()
         meta = data.get("_baseline")
         if meta is None:
             data["_baseline"] = {"ts": time.time()}
             _save_gen_posts(data)
+            print("GENBACKFILL: first run — recorded baseline timestamp, leaving existing backlog alone")
             return  # first run: baseline established, leave the existing backlog alone
         baseline = safe_float(meta.get("ts", 0))
+    print(f"GENBACKFILL: baseline={baseline:.0f}; only posts created after this are eligible")
     # Gather active + recently-archived posts in the forum.
     threads = list(getattr(forum, "threads", []) or [])
+    active_count = len(threads)
     try:
         async for t in forum.archived_threads(limit=200):
             threads.append(t)
     except Exception:
         logger.exception("Auto-gen backfill: could not list archived threads")
+        print("GENBACKFILL: WARNING could not list archived threads (missing perms?) — only active threads scanned")
+    print(f"GENBACKFILL: scanning {len(threads)} thread(s) ({active_count} active, {len(threads) - active_count} archived)")
     async with _gen_lock:
         data = _load_gen_posts()
         added = 0
         for t in threads:
             tid = str(t.id)
-            if tid in data:
-                continue
             created = t.created_at.timestamp() if getattr(t, "created_at", None) else None
-            if created is None or created < baseline:
+            if tid in data:
+                print(f"GENBACKFILL: post {tid} already tracked — skip")
+                continue
+            if created is None:
+                print(f"GENBACKFILL: post {tid} has no created_at — skip")
+                continue
+            if created < baseline:
+                print(f"GENBACKFILL: post {tid} created {created:.0f} < baseline {baseline:.0f} (pre-baseline) — skip")
                 continue
             data[tid] = {"created": created, "processed": False}
             added += 1
+            print(f"GENBACKFILL: recorded missed post {tid} (created={created:.0f})")
         if added:
             _save_gen_posts(data)
             logger.info(f"Auto-gen backfill: recorded {added} outstanding forum post(s)")
+        print(f"GENBACKFILL: done — recorded {added} missed post(s)")
 
 
 @client.event
@@ -1712,9 +1760,12 @@ async def startbid(ctx, item, startprice, kp, startbidder):
         return
     startbidder = real_bidder
     # lock so two concurrent $startbid calls can't grab the same id
+    # remember the thread/channel this was started in, so first-time bids can post
+    # an "interested" notice back here.
+    origin_channel_id = ctx.channel.id if ctx.channel else None
     async with _bid_lock:
         data = _load_bids()
-        id = _bid_new_auction(data, item, kp, ctx.author.id, startbidder, startprice, time.time())
+        id = _bid_new_auction(data, item, kp, ctx.author.id, startbidder, startprice, time.time(), origin_channel_id)
         _save_bids(data)
     await ctx.send("Bid for " + item + " has started at " + str(startprice) + " " + kp + " by " + startbidder)
     await ctx.send("The ID for this bid is " + str(id) + ". Please use this number to bid on the item!")
@@ -1758,8 +1809,12 @@ def preprocessforgreen(img):
 @dkp_only()
 async def sendbid(ctx, id, price, bidder):
     """command for sending a bid to the bid sheet"""
-    id = int(id)
-    price = int(price)
+    try:
+        id = int(id)
+        price = int(price)
+    except (TypeError, ValueError):
+        await ctx.send("Usage: `$sendbid <bid-id> <amount> <toon>` — id and amount must be numbers.")
+        return
     # validate the bidder is a real roster name (the arg was free-form for testing)
     roster_names = await acached_col_values(bot4ws1, 1, "roster_names")
     real_bidder, caps, spaces, suggestions = find_name(bidder, roster_names)
@@ -1789,14 +1844,36 @@ async def sendbid(ctx, id, price, bidder):
             if price > current_pts:
                 await ctx.send(f"{bidder} only has {current_pts:g} {kp_pool} — can't place a bid of {price}.")
                 return
+        # First bid by this toon on this auction? If so, flag a one-time
+        # "interested" notice for the originating thread (sent after the lock).
+        first_time = _bid_is_first_bid(auction, bidder)
         _bid_add(auction, ctx.author.id, bidder, price, time.time())
         _save_bids(data)
-    await ctx.send("Bid for " + auction["item"] + " has been placed at " + str(price) + " " + auction["kp"] + " by " + bidder)
+        item_name = auction["item"]
+        kp_name = auction["kp"]
+        origin_channel_id = auction.get("channel_id")
+    await ctx.send("Bid for " + item_name + " has been placed at " + str(price) + " " + kp_name + " by " + bidder)
+    # Announce interest on the original thread the auction was started from.
+    if first_time and origin_channel_id:
+        try:
+            channel = client.get_channel(origin_channel_id)
+            if channel is None:
+                channel = await client.fetch_channel(origin_channel_id)
+            if channel is not None:
+                await channel.send(f"{bidder} is interested in this item")
+        except Exception:
+            logger.exception("Could not post 'interested' notice for auction %s", id)
 
 @client.command()
 @dkp_only()
 async def cancelbid(ctx, id, price, bidder):
     """command for cancelling a bid"""
+    try:
+        id = int(id)
+        price = int(price)
+    except (TypeError, ValueError):
+        await ctx.send("Usage: `$cancelbid <bid-id> <amount> <toon>` — id and amount must be numbers.")
+        return
     # normalise the bidder to the canonical roster name so it matches the stored bid
     roster_names = await acached_col_values(bot4ws1, 1, "roster_names")
     real_bidder, caps, spaces, suggestions = find_name(bidder, roster_names)
@@ -1861,6 +1938,7 @@ async def bidinfo(ctx, id):
             return
         opentime = auction["open_time"]
         startprice = auction["bids"][0]["price"] if auction["bids"] else 0
+        opened_str = dt.fromtimestamp(float(opentime), tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
         timeleft = float(opentime) + BID_CLOSE_AGE - time.time()
         hoursleft = timeleft // 3600
         minutesleft = (timeleft % 3600) // 60
@@ -1870,7 +1948,7 @@ async def bidinfo(ctx, id):
             timeleft = timeleft[1:]
             await ctx.send("This bid for " + auction["item"] + " ended " + timeleft + " ago")
         else:
-            await ctx.send("This bid was opened at " + str(opentime) + " and has " + timeleft + " left")
+            await ctx.send("This bid was opened at " + opened_str + " and has " + timeleft + " left")
     except Exception:
         logger.exception("Error in $bidinfo")
         await ctx.send("Something went wrong looking up that bid. Please try again.")

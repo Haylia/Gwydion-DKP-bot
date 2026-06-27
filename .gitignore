@@ -9,6 +9,7 @@
 /server_config.json
 /posted_fights.json
 /raid_history.json
+/bids.json
 /*.pre_migration_backup
 /*.tmp
 /bossranking_data/
