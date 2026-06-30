@@ -4397,20 +4397,28 @@ def _in_window(when, now, days):
     return when >= now - timedelta(days=days)
 
 
-def _is_raid_row(boss, pool):
+def _is_half_row(boss):
+    """A half-point attendance row — $bosshalf tags its boss name with ' HALF'."""
+    return "HALF" in str(boss).upper()
+
+
+def _is_raid_row(boss, pool, include_half=True):
     """One Bosses row counts as a single raid when it's the RBPP row of a full raid
-    or the combined ' HALF' row of a half raid; other per-pool rows are skipped."""
-    return str(pool).strip().upper() == "RBPP" or "HALF" in str(boss).upper()
+    or the combined ' HALF' row of a half raid; other per-pool rows are skipped.
+    With include_half=False, half-point raids are excluded entirely."""
+    if _is_half_row(boss):
+        return include_half
+    return str(pool).strip().upper() == "RBPP"
 
 
-def _attendance_counts(boss_rows, now, days):
+def _attendance_counts(boss_rows, now, days, include_half=True):
     """-> (dict name -> raids attended, total raids) over the window."""
     counts = {}
     total = 0
     for row in boss_rows:
         if len(row) < 4 or not _in_window(_parse_sheet_dt(row[0]), now, days):
             continue
-        if not _is_raid_row(row[1], row[2]):
+        if not _is_raid_row(row[1], row[2], include_half):
             continue
         total += 1
         for name in _parse_attendees(row[3]):
@@ -4418,35 +4426,39 @@ def _attendance_counts(boss_rows, now, days):
     return counts, total
 
 
-def _player_attendance(boss_rows, player, now, days):
-    """-> (attended, total_raids, dict boss -> count) for one player over the
-    window. Matching is case-insensitive on the canonical roster name."""
+def _player_attendance(boss_rows, player, now, days, include_half=True):
+    """-> (attended, total_raids, dict boss -> (attended, held)) for one player
+    over the window. 'held' is how many of that boss were run in the window;
+    'attended' is how many the player was in — so the breakdown shows misses too.
+    Matching is case-insensitive on the canonical roster name."""
     target = (player or "").strip().lower()
     attended = 0
     total = 0
-    per_boss = {}
+    per_boss = {}   # boss -> [attended, held]
     for row in boss_rows:
         if len(row) < 4 or not _in_window(_parse_sheet_dt(row[0]), now, days):
             continue
-        if not _is_raid_row(row[1], row[2]):
+        if not _is_raid_row(row[1], row[2], include_half):
             continue
         total += 1
+        boss = str(row[1]).strip()
+        rec = per_boss.setdefault(boss, [0, 0])
+        rec[1] += 1
         if target in [n.lower() for n in _parse_attendees(row[3])]:
             attended += 1
-            boss = str(row[1]).strip()
-            per_boss[boss] = per_boss.get(boss, 0) + 1
-    return attended, total, per_boss
+            rec[0] += 1
+    return attended, total, {b: (a, h) for b, (a, h) in per_boss.items()}
 
 
-def _boss_activity(boss_rows, now, days):
+def _boss_activity(boss_rows, now, days, include_half=True):
     """-> dict boss -> (raids, avg_attendees) over the window. The ' HALF' suffix
-    is kept so half raids show separately."""
+    is kept so half raids show separately (unless include_half=False)."""
     raids = {}
     att = {}
     for row in boss_rows:
         if len(row) < 4 or not _in_window(_parse_sheet_dt(row[0]), now, days):
             continue
-        if not _is_raid_row(row[1], row[2]):
+        if not _is_raid_row(row[1], row[2], include_half):
             continue
         boss = str(row[1]).strip()
         raids[boss] = raids.get(boss, 0) + 1
@@ -4496,7 +4508,7 @@ class StatsView(discord.ui.View):
 
     kind: 'attendance' | 'command' | 'player' | 'boss'."""
     def __init__(self, invoker, kind, rows, now, *, player=None,
-                 allowed=None, scope_label=None, days=30):
+                 allowed=None, scope_label=None, days=30, include_half=True):
         super().__init__(timeout=300)
         self.invoker = invoker
         self.kind = kind
@@ -4506,6 +4518,7 @@ class StatsView(discord.ui.View):
         self.allowed = allowed
         self.scope_label = scope_label
         self.days = days
+        self.include_half = include_half
         self.message = None
         self.win_sel = discord.ui.Select(
             placeholder="Time window…",
@@ -4515,11 +4528,21 @@ class StatsView(discord.ui.View):
                      for lbl, d in STATS_WINDOWS])
         self.win_sel.callback = self._pick_window
         self.add_item(self.win_sel)
+        # Half-raid toggle only matters for the boss-attendance views.
+        self.half_btn = None
+        if kind in ("attendance", "player", "boss"):
+            self.half_btn = discord.ui.Button(
+                label=self._half_label(), style=discord.ButtonStyle.secondary)
+            self.half_btn.callback = self._toggle_half
+            self.add_item(self.half_btn)
+
+    def _half_label(self):
+        return "Half raids: included" if self.include_half else "Half raids: excluded"
 
     async def interaction_check(self, interaction):
         if interaction.user.id != self.invoker.id:
             await interaction.response.send_message(
-                "Only the person who ran this can change the window.", ephemeral=True)
+                "Only the person who ran this can change it.", ephemeral=True)
             return False
         return True
 
@@ -4530,13 +4553,19 @@ class StatsView(discord.ui.View):
             opt.default = (opt.value == v)
         await interaction.response.edit_message(embed=self.build_embed(), view=self)
 
+    async def _toggle_half(self, interaction):
+        self.include_half = not self.include_half
+        self.half_btn.label = self._half_label()
+        await interaction.response.edit_message(embed=self.build_embed(), view=self)
+
     def build_embed(self):
         days = self.days
         wl = _stats_window_label(days)
+        half_note = "" if self.include_half else " · half raids excluded"
         if self.kind == "attendance":
-            counts, total = _attendance_counts(self.rows, self.now, days)
+            counts, total = _attendance_counts(self.rows, self.now, days, self.include_half)
             e = discord.Embed(title=f"Attendance — {wl}", colour=discord.Color.orange())
-            e.description = f"{total} raids recorded in this window."
+            e.description = f"{total} raids recorded in this window.{half_note}"
             e.add_field(name="Most raids attended", value=_rank_block(counts, 20), inline=False)
             return e
         if self.kind == "command":
@@ -4550,18 +4579,22 @@ class StatsView(discord.ui.View):
                 e.add_field(name="By command", value=_rank_block(per_cmd, 15), inline=False)
             return e
         if self.kind == "player":
-            attended, total, per_boss = _player_attendance(self.rows, self.player, self.now, days)
+            attended, total, per_boss = _player_attendance(self.rows, self.player, self.now, days, self.include_half)
             pct = (attended / total * 100) if total else 0
             e = discord.Embed(title=f"{self.player} — attendance — {wl}",
                               colour=discord.Color.orange())
-            e.description = f"Attended {attended} of {total} raids ({pct:.0f}%)."
-            e.add_field(name="By boss", value=_rank_block(per_boss, 25), inline=False)
+            e.description = f"Attended {attended} of {total} raids ({pct:.0f}%).{half_note}"
+            ordered = sorted(per_boss.items(), key=lambda kv: (-kv[1][1], kv[0].lower()))
+            lines = [f"{b} — {a}/{h} ({(a / h * 100 if h else 0):.0f}%)"
+                     for b, (a, h) in ordered[:25]]
+            e.add_field(name="By boss (attended / held)",
+                        value="\n".join(lines) or "(none)", inline=False)
             return e
         if self.kind == "boss":
-            activity = _boss_activity(self.rows, self.now, days)
+            activity = _boss_activity(self.rows, self.now, days, self.include_half)
             ordered = sorted(activity.items(), key=lambda kv: (-kv[1][0], kv[0].lower()))
             e = discord.Embed(title=f"Boss activity — {wl}", colour=discord.Color.orange())
-            e.description = f"{sum(v[0] for v in activity.values())} raids recorded in this window."
+            e.description = f"{sum(v[0] for v in activity.values())} raids recorded in this window.{half_note}"
             lines = [f"{i + 1}. {b} — {c} raids, avg {a:.1f} attendees"
                      for i, (b, (c, a)) in enumerate(ordered[:20])]
             e.add_field(name="By boss", value="\n".join(lines) or "(none)", inline=False)
@@ -4596,6 +4629,25 @@ async def attendancestats(ctx, *name):
         view = StatsView(ctx.author, "player", rows, now, player=realname)
     else:
         view = StatsView(ctx.author, "attendance", rows, now)
+    view.message = await ctx.send(embed=view.build_embed(), view=view)
+
+
+@client.command(aliases=['playerbosses', 'attendancebyboss', 'abp'])
+@dkp_read()
+async def bossbreakdown(ctx, *name):
+    """A player's per-boss attendance breakdown (attended / held + %), with a
+    rolling-window dropdown that includes All time. e.g. `$bossbreakdown Liaa`."""
+    name = " ".join(name).strip()
+    if not name:
+        await ctx.send("Usage: `$bossbreakdown <player name>`")
+        return
+    user_list = await acached_col_values(bot4ws1, 1, "roster_names")
+    realname, caps, spaces, suggestions = find_name(name, user_list)
+    if realname is None:
+        await ctx.send(not_found_message(name, suggestions))
+        return
+    rows = await bot4ws10.aget_all_values()
+    view = StatsView(ctx.author, "player", rows, dt.now(), player=realname)
     view.message = await ctx.send(embed=view.build_embed(), view=view)
 
 
