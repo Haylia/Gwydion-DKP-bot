@@ -240,6 +240,45 @@ def test_parse_a1():
     print("ok: _parse_a1 maps A1 notation to (row, col)")
 
 
+def test_parse_kp_snapshot():
+    ns = load(["_parse_kp_snapshot", "safe_float"])
+    parse = ns["_parse_kp_snapshot"]
+    rows = [
+        ["Player Name", "Last Raid", "Att %", "Earned", "Spent", "Adj", "Current"],  # header
+        ["Alice", "2026-06-01", "80%", "100", "10", "0", "90"],   # row 2
+        ["Bob",   "",           "",    "",    "",   "",  ""],       # row 3, blank Earned -> 0.0
+        ["Carol", "x",          "y",   "55.5"],                     # row 4, short row (no cols 5-7)
+        ["",      "",           "",    "9"],                        # blank name -> skipped
+    ]
+    snap = parse(rows)
+    assert snap["Alice"] == (2, 100.0)
+    assert snap["Bob"] == (3, 0.0)
+    assert snap["Carol"] == (4, 55.5)
+    assert "" not in snap
+    assert set(snap) == {"Alice", "Bob", "Carol"}
+    # the awarded value is just earned + points, computed at the call site
+    row, earned = snap["Alice"]
+    assert (row, earned + 125) == (2, 225.0)
+    print("ok: _parse_kp_snapshot maps name -> (row, earned), tolerates blanks/short rows")
+
+
+def test_col_letters():
+    ns = load(["_col_letters", "_parse_a1"])
+    cl, pa = ns["_col_letters"], ns["_parse_a1"]
+    assert cl(1) == "A"
+    assert cl(26) == "Z"
+    assert cl(27) == "AA"
+    assert cl(28) == "AB"
+    assert cl(52) == "AZ"      # the case the old inline math got wrong (gave 'B@')
+    assert cl(53) == "BA"
+    assert cl(702) == "ZZ"
+    assert cl(703) == "AAA"
+    # round-trips with the inverse parser for a spread of columns
+    for col in (1, 2, 26, 27, 52, 100, 256, 702, 703):
+        assert pa(f"{cl(col)}1") == (1, col)
+    print("ok: _col_letters converts 1-based columns to letters (incl. multiples of 26)")
+
+
 # ─── role / setup authorization (fake member objects) ──────────────────────
 
 class _FakeRole:
@@ -281,6 +320,149 @@ def test_role_and_setup_auth():
     print("ok: _member_has_role_named / is_server_setup_authorized")
 
 
+def test_roster_ui_field_tables():
+    """The $roster / $rosteradmin guided menus are driven by static field tables
+    whose keys must match the subcommands the cores actually handle — a typo'd key
+    would render a dropdown option that silently hits the core's 'invalid
+    subcommand' branch. Guard the keys, kinds and the rank/class lists."""
+    ns = load(["RANKS", "CLASSES", "ROSTER_FIELDS", "ROSTERADMIN_FIELDS"])
+    assert ns["RANKS"] == ["General", "Guardian", "Clansman", "Recruit", "Chieftain"]
+    assert ns["CLASSES"] == ["Warrior", "Rogue", "Mage", "Druid", "Ranger"]
+    roster_subcommands = {
+        "dg", "removealt", "setmain", "bulksetmain", "level", "class", "subclass",
+        "cgoffhand", "dl", "dlmain", "dloffhand", "edl", "edlmain", "edloffhand",
+        "setall", "faction",
+    }
+    admin_subcommands = {"rank", "main"}
+    valid_kinds = {"bool", "class", "rank", "text", "names", "none"}
+    for fields, allowed in ((ns["ROSTER_FIELDS"], roster_subcommands),
+                            (ns["ROSTERADMIN_FIELDS"], admin_subcommands)):
+        keys = [k for k, _, _ in fields]
+        assert len(keys) == len(set(keys)), "duplicate field key in UI table"
+        for key, label, kind in fields:
+            assert key in allowed, f"UI field '{key}' is not a handled subcommand"
+            assert kind in valid_kinds, f"UI field '{key}' has bad kind '{kind}'"
+            assert label and isinstance(label, str)
+    print("ok: roster UI field tables map to real subcommands / valid kinds")
+
+
+def test_activity_stats_helpers():
+    """Pure aggregation behind $attendancestats / $bossstats / $commandstats:
+    timestamp + attendee parsing, rolling-window filtering, the RBPP/HALF raid
+    rule, and per-user/per-boss counting."""
+    from datetime import datetime as dtt
+    ns = load([
+        "_parse_sheet_dt", "_parse_attendees", "_in_window", "_is_raid_row",
+        "_attendance_counts", "_player_attendance", "_boss_activity",
+        "_command_counts", "_rank_block",
+    ])
+
+    psd = ns["_parse_sheet_dt"]
+    assert psd("30/06/2026 14:23:05") == dtt(2026, 6, 30, 14, 23, 5)
+    assert psd("30/06/2026") == dtt(2026, 6, 30)
+    serial = (dtt(2026, 6, 30) - dtt(1899, 12, 30)).days   # Google date serial
+    assert psd(serial).date() == date(2026, 6, 30)
+    assert psd("") is None and psd(None) is None and psd("Datetime") is None
+
+    pa = ns["_parse_attendees"]
+    assert pa("['Liaa', 'Bob Smith']") == ["Liaa", "Bob Smith"]
+    assert pa("[]") == [] and pa("") == []
+
+    raid = ns["_is_raid_row"]
+    assert raid("Crom", "RBPP") is True
+    assert raid("Crom HALF", "['AKP']") is True
+    assert raid("Crom", "VKP") is False   # non-RBPP pool row of a full raid
+
+    now = dtt(2026, 6, 30, 12, 0, 0)
+    rows = [
+        ["Datetime", "Boss", "KP Pool", "Attendees"],                        # header
+        ["29/06/2026 20:00:00", "Crom", "RBPP", "['Liaa', 'Bob']"],          # 1d
+        ["29/06/2026 20:00:01", "Crom", "VKP",  "['Liaa', 'Bob']"],          # same raid, skipped
+        ["20/06/2026 20:00:00", "Bane", "RBPP", "['Liaa']"],                 # 10d
+        ["01/01/2026 20:00:00", "Crom", "RBPP", "['Bob']"],                  # ~half year
+        ["28/06/2026 21:00:00", "Gele HALF", "['AKP']", "['Liaa', 'Cara']"], # half raid, 2d
+    ]
+    counts, total = ns["_attendance_counts"](rows, now, 7)
+    assert total == 2                                  # VKP row excluded
+    assert counts == {"Liaa": 2, "Bob": 1, "Cara": 1}
+    counts30, total30 = ns["_attendance_counts"](rows, now, 30)
+    assert total30 == 3 and counts30["Liaa"] == 3 and counts30["Bob"] == 1
+    _, total_all = ns["_attendance_counts"](rows, now, None)
+    assert total_all == 4
+
+    attended, tot, per_boss = ns["_player_attendance"](rows, "Liaa", now, 30)
+    assert attended == 3 and tot == 3
+    assert per_boss == {"Crom": 1, "Bane": 1, "Gele HALF": 1}
+
+    activity = ns["_boss_activity"](rows, now, 30)
+    assert activity["Crom"][0] == 1 and abs(activity["Crom"][1] - 2.0) < 1e-9
+
+    logs = [
+        ["Command", "Command user", "Time", "Params"],   # header
+        ["boss", "Alice", "30/06/2026 09:00:00", "x"],
+        ["roster", "Alice", "29/06/2026 09:00:00", "x"],
+        ["player", "Bob", "29/06/2026 09:00:00", "x"],    # not an officer command
+        ["boss", "Bob", "01/05/2026 09:00:00", "x"],      # ~60d, out of 7d
+    ]
+    pu, pc, t = ns["_command_counts"](logs, now, 7)
+    assert t == 3 and pu == {"Alice": 2, "Bob": 1}
+    assert pc == {"boss": 1, "roster": 1, "player": 1}
+    puA, pcA, tA = ns["_command_counts"](logs, now, 7, allowed={"boss", "roster"})
+    assert tA == 2 and puA == {"Alice": 2} and "player" not in pcA
+
+    rb = ns["_rank_block"]
+    assert rb({}) == "(none)"
+    block = rb({"A": 1, "B": 3, "C": 3}).splitlines()
+    assert block == ["1. B — 3", "2. C — 3", "3. A — 1"]   # tie -> alpha, then lower
+    print("ok: activity stats helpers (parse, window, attendance, commands, rank)")
+
+
+def test_leaderboard_rank():
+    """Pure filter+sort behind the leaderboard dropdowns: points-desc for most
+    kinds (with maxkp cap), attendance-desc for last30 (points>0, maxatt cap)."""
+    ns = load(["_rank_leaderboard", "_fmt_lb_value"])
+    rank = ns["_rank_leaderboard"]
+    rows = [("Alice", 100.0, 20.0), ("Bob", 250.0, 5.0), ("Cara", 0.0, 90.0)]
+
+    cur = rank(rows, "current")
+    assert [r[0] for r in cur] == ["Bob", "Alice", "Cara"]          # points desc
+    assert [r[0] for r in rank(rows, "current", maxkp=150)] == ["Alice", "Cara"]  # Bob capped out
+
+    l30 = rank(rows, "last30")
+    assert [r[0] for r in l30] == ["Alice", "Bob"]                  # att desc, Cara dropped (0 points)
+    assert [r[0] for r in rank(rows, "last30", maxatt=10)] == ["Bob"]  # Alice over att cap
+
+    fmt = ns["_fmt_lb_value"]
+    assert fmt(("Bob", 250.0, 5.0), "current") == "250.0"
+    assert fmt(("Bob", 250.0, 5.0), "last30") == "250.0 (5.0%)"
+    print("ok: leaderboard rank/format (points vs attendance, caps)")
+
+
+def test_refund_helpers():
+    """Loot-cost parsing and refundable-item filtering behind the $refunditem
+    dropdown."""
+    ns = load(["_parse_loot_cost", "_refundable_items"])
+    plc = ns["_parse_loot_cost"]
+    assert plc("755.0 DPKP") == (755.0, "DPKP")
+    assert plc("100 VKP") == (100.0, "VKP")
+    assert plc("") is None and plc("nonsense") is None and plc("abc DPKP") is None
+
+    loot = ["Liaa", "Sword", "[REFUNDED] Shield", "", "Helm"]
+    cost = ["Costs", "100 VKP", "50 VKP", "", "75 GKP"]
+    items = ns["_refundable_items"](loot, cost)
+    assert items == [(1, "Sword", "100 VKP"), (4, "Helm", "75 GKP")]  # skips refunded + blank
+    print("ok: refund cost parse + refundable-item filtering")
+
+
+def test_world_lookup_and_exclusions():
+    """Cerridwen (57) is resolvable by name and Apple (1004) is excluded."""
+    ns = load(["CH_WORLDS", "EXCLUDED_WORLD_IDS", "normalize_world_name"])
+    assert ns["CH_WORLDS"].get("cerridwen") == 57
+    assert 1004 in ns["EXCLUDED_WORLD_IDS"]
+    assert 57 not in ns["EXCLUDED_WORLD_IDS"]
+    print("ok: Cerridwen 57 present, Apple 1004 excluded")
+
+
 _TESTS = [
     test_safe_float_and_int,
     test_pad_row,
@@ -296,7 +478,14 @@ _TESTS = [
     test_boss_window_parsing,
     test_boss_date_parsing,
     test_parse_a1,
+    test_col_letters,
+    test_parse_kp_snapshot,
     test_role_and_setup_auth,
+    test_roster_ui_field_tables,
+    test_activity_stats_helpers,
+    test_leaderboard_rank,
+    test_refund_helpers,
+    test_world_lookup_and_exclusions,
 ]
 
 

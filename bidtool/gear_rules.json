@@ -1,0 +1,16 @@
+{
+  "_comment": "Item eligibility rules for the Gwydion bid tool, seeded from the Relentless clan rules doc. Each rule applies when an item name contains any string in 'match' (case-insensitive) OR the item's pool is in 'match_pool'. When several rules apply, the STRICTEST wins: numeric requirements take the max, is_helm is ORed, categories are collected. min_rbpp_pct is a PERCENT (15 = 15%). min_rbpp_earned is lifetime RBPP (RBPP sheet 'Earned' column). Edit freely; the tool reloads it each run.",
+  "weekly_cap": 4,
+  "rules": [
+    {"label": "void+",        "match": ["void", "voidsworn"],              "min_rbpp_earned": 250, "category": "void+"},
+    {"label": "dark+",        "match": ["dark", "darksworn"],              "min_rbpp_earned": 100, "category": "dark+"},
+    {"label": "condemned",    "match": ["condemned"],                      "min_rbpp_pct": 15},
+    {"label": "defiled",      "match": ["defiled"],                        "min_rbpp_pct": 25},
+    {"label": "BT helm",      "match": ["bloodfang"],                      "min_rbpp_pct": 25, "min_rbpp_earned": 250, "is_helm": true, "category": "BT helm"},
+    {"label": "imperial/godly","match": ["imperial", "eidolic", "godly"],  "category": "Imperial/Godly"},
+    {"label": "helm",         "match": ["helm", "coif", "circlet"],        "is_helm": true},
+    {"label": "dino",         "match_pool": ["DPKP"],                       "min_rbpp_pct": 15, "category": "Dino"},
+    {"label": "EDL",          "match": ["exalted", "edl"],                  "min_level": 205},
+    {"label": "DL",           "match": ["dragonlord"],                      "min_level": 170}
+  ]
+}

@@ -148,6 +148,16 @@ def _parse_a1(label):
         col = col * 26 + (ord(ch) - ord('A') + 1)
     return int(row_str), col
 
+
+def _col_letters(col):
+    """Convert a 1-based column number to its spreadsheet letters (1->A, 26->Z,
+    27->AA, 52->AZ, ...). Handles the >26 / multiple-of-26 cases correctly."""
+    s = ''
+    while col > 0:
+        col, rem = divmod(col - 1, 26)
+        s = chr(ord('A') + rem) + s
+    return s
+
 # Global registry: maps a registry key -> list of CachingWorksheet instances.
 # For main spreadsheet worksheets: key = sheet_index (0-10).
 # For secondary worksheets: key = unique string like "bot4ws14".
@@ -882,12 +892,15 @@ def _save_tiebreaks(data):
 
 # ----- Auto-gen for forum attendance posts -----
 # Posts in this forum channel get $gen run on them automatically once they are 12h
-# old, so nobody has to run it by hand. New posts are recorded via on_thread_create;
-# genloop posts the draft once each passes 12h. State lives in a local JSON file so
-# it survives restarts, and because recording is event-driven, pre-existing posts are
-# never touched. See on_thread_create / genloop / _process_due_gen_post.
+# old, so nobody has to run it by hand. New posts are recorded live via
+# on_thread_create; on restart, _backfill_forum_posts scans a bounded recent window
+# (GEN_BACKFILL_LOOKBACK) to catch any made while the bot was offline. genloop posts
+# the draft once each passes 12h. State lives in a local JSON file so it survives
+# restarts; already-recorded posts (incl. processed tombstones) are never re-drafted.
+# See on_thread_create / genloop / _process_due_gen_post / _backfill_forum_posts.
 GEN_FORUM_CHANNEL_ID = 1180246887958315018
 GEN_POST_AGE = 12 * 60 * 60  # 12 hours, in seconds
+GEN_BACKFILL_LOOKBACK = 48 * 60 * 60  # on restart, look back this far for missed posts
 GEN_POSTS_FILE = "gen_posts.json"
 _gen_lock = asyncio.Lock()
 
@@ -1286,10 +1299,12 @@ async def _process_due_gen_post(tid):
 
 
 async def _backfill_forum_posts():
-    """On startup, catch forum posts missed while the bot was offline. The first run
-    only records a baseline timestamp (so the pre-feature backlog is left alone); later
-    runs record any post created since the baseline that we aren't already tracking, and
-    genloop drafts each at its 12h mark (or on the next tick if already past)."""
+    """On every startup, catch forum posts missed while the bot was offline. Scans a
+    bounded recent window (GEN_BACKFILL_LOOKBACK) and records any post created within
+    it that we aren't already tracking; genloop then drafts each at its 12h mark (or on
+    the next tick if already past). The window keeps us from re-drafting ancient backlog
+    while still catching genuinely-missed recent posts. Already-tracked posts (including
+    processed tombstones) are skipped, so nothing is drafted twice."""
     print("GENBACKFILL: starting restart look-back for missed forum posts")
     forum = client.get_channel(GEN_FORUM_CHANNEL_ID)
     if forum is None:
@@ -1297,16 +1312,8 @@ async def _backfill_forum_posts():
         print(f"GENBACKFILL: forum channel {GEN_FORUM_CHANNEL_ID} not found (not cached / no access) — aborting")
         return
     print(f"GENBACKFILL: forum channel found ('{getattr(forum, 'name', '?')}')")
-    async with _gen_lock:
-        data = _load_gen_posts()
-        meta = data.get("_baseline")
-        if meta is None:
-            data["_baseline"] = {"ts": time.time()}
-            _save_gen_posts(data)
-            print("GENBACKFILL: first run — recorded baseline timestamp, leaving existing backlog alone")
-            return  # first run: baseline established, leave the existing backlog alone
-        baseline = safe_float(meta.get("ts", 0))
-    print(f"GENBACKFILL: baseline={baseline:.0f}; only posts created after this are eligible")
+    cutoff = time.time() - GEN_BACKFILL_LOOKBACK
+    print(f"GENBACKFILL: looking back {GEN_BACKFILL_LOOKBACK/3600:.0f}h (ignoring posts created before {cutoff:.0f})")
     # Gather active + recently-archived posts in the forum.
     threads = list(getattr(forum, "threads", []) or [])
     active_count = len(threads)
@@ -1329,12 +1336,12 @@ async def _backfill_forum_posts():
             if created is None:
                 print(f"GENBACKFILL: post {tid} has no created_at — skip")
                 continue
-            if created < baseline:
-                print(f"GENBACKFILL: post {tid} created {created:.0f} < baseline {baseline:.0f} (pre-baseline) — skip")
+            if created < cutoff:
+                print(f"GENBACKFILL: post {tid} created {created:.0f} older than {GEN_BACKFILL_LOOKBACK/3600:.0f}h window — skip")
                 continue
             data[tid] = {"created": created, "processed": False}
             added += 1
-            print(f"GENBACKFILL: recorded missed post {tid} (created={created:.0f})")
+            print(f"GENBACKFILL: recorded missed post {tid} (created={created:.0f}, age={(time.time()-created)/3600:.1f}h)")
         if added:
             _save_gen_posts(data)
             logger.info(f"Auto-gen backfill: recorded {added} outstanding forum post(s)")
@@ -2168,24 +2175,39 @@ async def inputterinfo(ctx):
      embed.add_field(name = "Command usage for adding half points", value = "$bosshalf <bossname> <list of characters> \n remember to put the list of characters in quotes", inline=False)
      await ctx.send(embed=embed)
 
-@client.command(aliases=["addmember", "registermember", "registermem", "am"])
-@dkp_only()
-@commands.has_any_role("General", "Guardian", "REDALiCE", "Helper")
-async def addmem(ctx, name, rank, main, level, cclass):
-    """Adds a member to the Roster, KP Lists and loot list"""
+# ---------------------------------------------------------------------------
+# Roster / member shared logic + guided interfaces
+#
+# The $addmem, $roster and $rosteradmin commands each keep their original
+# text-argument behaviour (so existing usage and scripts are unchanged) but
+# also accept a *bare* invocation ($addmem with no args, etc.) which posts a
+# guided menu of dropdowns + buttons. Both paths funnel into the same `_*_core`
+# coroutines below, so there is one source of truth for the actual sheet writes.
+# The cores take a `send` async callable (ctx.send for the text path,
+# interaction.followup.send for the UI) and the invoking user's name for the
+# audit log, instead of a Discord `ctx`.
+# ---------------------------------------------------------------------------
+RANKS = ["General", "Guardian", "Clansman", "Recruit", "Chieftain"]
+CLASSES = ["Warrior", "Rogue", "Mage", "Druid", "Ranger"]
+
+
+async def _addmem_core(send, author_name, name, rank, main, level, cclass):
+    """Add a member to the Roster, all 7 KP lists and the loot list. `main`,
+    `level` and `cclass` arrive as strings (same as the text command) and are
+    coerced/validated here. Shared by the $addmem command and AddMemView."""
     if not re.fullmatch(r"[A-Za-z0-9 ]+", name or ""):
-        await ctx.send("Invalid character name — use only letters, numbers, and spaces (the name is built directly into sheet formulas).")
+        await send("Invalid character name — use only letters, numbers, and spaces (the name is built directly into sheet formulas).")
         return
     cclass = cclass.capitalize()
     rank = rank.capitalize()
     main = toBool(main)
     level = int(level)
     user_list = await bot5ws1.acol_values(1)
-    if cclass not in ["Warrior", "Rogue", "Mage", "Druid", "Ranger"]:
-        await ctx.send("Invalid class! Please use Warrior, Rogue, Mage, Druid, or Ranger")
+    if cclass not in CLASSES:
+        await send("Invalid class! Please use Warrior, Rogue, Mage, Druid, or Ranger")
         return
-    if rank not in ["General", "Guardian", "Clansman", "Recruit", "Chieftain"]:
-        await ctx.send("Invalid rank! Please use General, Guardian, Clansman, Recruit, or Chieftain")
+    if rank not in RANKS:
+        await send("Invalid rank! Please use General, Guardian, Clansman, Recruit, or Chieftain")
         return
     realname, caps, spaces, suggestions = find_name(name, user_list)
     if realname == None:
@@ -2227,18 +2249,157 @@ async def addmem(ctx, name, rank, main, level, cclass):
             maintext = "Main"
         else:
             maintext = "Alt"
-        await ctx.send(name + " (" + str(level) + " " + cclass + ", " + maintext + ", " + rank + ") was added to the list")
-        logbody = ["addmem", str(ctx.author.name), dt.now().strftime("%d/%m/%Y %H:%M:%S"), str([name, rank, main, level, cclass])]
+        await send(name + " (" + str(level) + " " + cclass + ", " + maintext + ", " + rank + ") was added to the list")
+        logbody = ["addmem", str(author_name), dt.now().strftime("%d/%m/%Y %H:%M:%S"), str([name, rank, main, level, cclass])]
         await bot3ws11.aappend_row(logbody)
     else:
-        await ctx.send(name + " is already in the list!")
+        await send(name + " is already in the list!")
 
-@client.command(aliases=["rosteradministrator", "ra"])
+
+class _AddMemModal(discord.ui.Modal, title="Member name & level"):
+    """Free-text part of the Add Member form (name + level); the dropdowns on the
+    parent view supply rank / class / main."""
+    def __init__(self, parent):
+        super().__init__()
+        self.parent = parent
+        self.name_in = discord.ui.TextInput(
+            label="Character name", max_length=32,
+            placeholder="e.g. Liaa", default=parent.name or "")
+        self.level_in = discord.ui.TextInput(
+            label="Level", max_length=4, placeholder="e.g. 230",
+            default=(str(parent.level) if parent.level else ""))
+        self.add_item(self.name_in)
+        self.add_item(self.level_in)
+
+    async def on_submit(self, interaction):
+        lvl = self.level_in.value.strip()
+        if lvl and not lvl.isdigit():
+            await interaction.response.send_message("Level must be a whole number.", ephemeral=True)
+            return
+        self.parent.name = self.name_in.value.strip()
+        self.parent.level = lvl
+        await interaction.response.edit_message(content=self.parent._summary(), view=self.parent)
+
+
+class AddMemView(discord.ui.View):
+    """Guided form for $addmem: dropdowns for rank / class / main + a modal for
+    the name & level, then a Create button that runs `_addmem_core`. Restricted
+    to the user who opened it; times out after 5 minutes."""
+    def __init__(self, invoker):
+        super().__init__(timeout=300)
+        self.invoker = invoker
+        self.message = None
+        self.name = None
+        self.level = None
+        self.rank = None
+        self.cclass = None
+        self.main = None  # "True" / "False" string fed straight to _addmem_core
+
+        self.rank_sel = discord.ui.Select(
+            placeholder="Rank",
+            options=[discord.SelectOption(label=r) for r in RANKS])
+        self.class_sel = discord.ui.Select(
+            placeholder="Class",
+            options=[discord.SelectOption(label=c) for c in CLASSES])
+        self.main_sel = discord.ui.Select(
+            placeholder="Main or alt?",
+            options=[discord.SelectOption(label="Main character", value="True"),
+                     discord.SelectOption(label="Alt character", value="False")])
+        self.rank_sel.callback = self._pick_rank
+        self.class_sel.callback = self._pick_class
+        self.main_sel.callback = self._pick_main
+        self.add_item(self.rank_sel)
+        self.add_item(self.class_sel)
+        self.add_item(self.main_sel)
+
+        self.name_btn = discord.ui.Button(label="Set name & level", style=discord.ButtonStyle.primary)
+        self.name_btn.callback = self._open_name
+        self.create_btn = discord.ui.Button(label="Create", style=discord.ButtonStyle.success, disabled=True)
+        self.create_btn.callback = self._create
+        self.add_item(self.name_btn)
+        self.add_item(self.create_btn)
+
+    async def interaction_check(self, interaction):
+        if interaction.user.id != self.invoker.id:
+            await interaction.response.send_message(
+                "Only the person who opened this form can use it.", ephemeral=True)
+            return False
+        return True
+
+    def _ready(self):
+        return all([self.name, self.level, self.rank, self.cclass]) and self.main is not None
+
+    def _summary(self):
+        self.create_btn.disabled = not self._ready()
+        m = "—" if self.main is None else ("Main" if self.main == "True" else "Alt")
+        return ("**Add a member**\n"
+                f"• Name: {self.name or '—'}\n"
+                f"• Level: {self.level or '—'}\n"
+                f"• Rank: {self.rank or '—'}\n"
+                f"• Class: {self.cclass or '—'}\n"
+                f"• Type: {m}\n"
+                "Set every field, then press **Create**.")
+
+    async def _pick_rank(self, interaction):
+        self.rank = self.rank_sel.values[0]
+        await interaction.response.edit_message(content=self._summary(), view=self)
+
+    async def _pick_class(self, interaction):
+        self.cclass = self.class_sel.values[0]
+        await interaction.response.edit_message(content=self._summary(), view=self)
+
+    async def _pick_main(self, interaction):
+        self.main = self.main_sel.values[0]
+        await interaction.response.edit_message(content=self._summary(), view=self)
+
+    async def _open_name(self, interaction):
+        await interaction.response.send_modal(_AddMemModal(self))
+
+    async def _create(self, interaction):
+        if not self._ready():
+            await interaction.response.send_message("Fill in every field first.", ephemeral=True)
+            return
+        for c in self.children:
+            c.disabled = True
+        await interaction.response.edit_message(content=self._summary() + "\n\nCreating…", view=self)
+        try:
+            await _addmem_core(interaction.followup.send, self.invoker.name,
+                               self.name, self.rank, self.main, self.level, self.cclass)
+        except Exception as e:
+            logger.exception("AddMemView create failed")
+            await interaction.followup.send(f"Could not add member: {e}")
+        self.stop()
+
+    async def on_timeout(self):
+        if self.message:
+            try:
+                for c in self.children:
+                    c.disabled = True
+                await self.message.edit(content="(Add Member form timed out — run `$addmem` again.)", view=self)
+            except Exception:
+                pass
+
+
+@client.command(aliases=["addmember", "registermember", "registermem", "am"])
 @dkp_only()
 @commands.has_any_role("General", "Guardian", "REDALiCE", "Helper")
-async def rosteradmin(ctx, subcommand, name, params):
-    """roster management for admins
-    subcommands: rank, main"""
+async def addmem(ctx, name=None, rank=None, main=None, level=None, cclass=None):
+    """Adds a member to the Roster, KP Lists and loot list.
+
+    Run `$addmem` with no arguments for a guided form, or supply all five
+    arguments directly: `$addmem <name> <rank> <main true/false> <level> <class>`."""
+    if name is None:
+        view = AddMemView(ctx.author)
+        view.message = await ctx.send(view._summary(), view=view)
+        return
+    if None in (rank, main, level, cclass):
+        await ctx.send("Usage: `$addmem <name> <rank> <main true/false> <level> <class>` — or run `$addmem` with no arguments for a guided form.")
+        return
+    await _addmem_core(ctx.send, ctx.author.name, name, rank, main, level, cclass)
+
+async def _rosteradmin_core(send, author_name, subcommand, name, params):
+    """Admin roster edits (rank, main). Shared by the $rosteradmin command and the
+    guided FieldEditView."""
     params = sanitize_cell(params)  # neutralise leading =/+/-/@ formula injection in user text
     user_list = await bot5ws1.acol_values(1)
     realname, caps, spaces, suggestions = find_name(name, user_list)
@@ -2249,28 +2410,242 @@ async def rosteradmin(ctx, subcommand, name, params):
         if subcommand == "rank":
             params = params.capitalize()
             await bot5ws1.aupdate_cell(row_num, 2, params)
-            await ctx.send(realname + "'s rank has been updated to " + str(params))
+            await send(realname + "'s rank has been updated to " + str(params))
             # find all their alts and update those too
             alts = await bot5ws1.acol_values(7)
             for i in range(1, len(alts)):
                 if alts[i] == realname:
                     await bot5ws1.aupdate_cell(i + 1, 2, params)
-            logbody = ["roster", str(ctx.author.name), dt.now().strftime("%d/%m/%Y %H:%M:%S"), str([realname, subcommand, params])]
+            logbody = ["roster", str(author_name), dt.now().strftime("%d/%m/%Y %H:%M:%S"), str([realname, subcommand, params])]
             await bot3ws11.aappend_row(logbody)
         elif subcommand == "main":
             params = toBool(params)
             await bot5ws1.aupdate_cell(row_num, 3, params)
-            await ctx.send(realname + "'s main status has been updated to " + str(params))
-            logbody = ["roster", str(ctx.author.name), dt.now().strftime("%d/%m/%Y %H:%M:%S"), str([realname, subcommand, params])]
+            await send(realname + "'s main status has been updated to " + str(params))
+            logbody = ["roster", str(author_name), dt.now().strftime("%d/%m/%Y %H:%M:%S"), str([realname, subcommand, params])]
             await bot3ws11.aappend_row(logbody)
         else:
-            await ctx.send("invalid subcommand")
+            await send("invalid subcommand")
+    else:
+        await send(not_found_message(name, suggestions))
 
-@client.command(aliases=["r"])
+
+class _FieldPlayerModal(discord.ui.Modal):
+    """Captures just the player name — used when the value itself comes from a
+    dropdown (Yes/No, class, rank) on the parent FieldEditView."""
+    def __init__(self, parent):
+        super().__init__(title="Player name")
+        self.parent = parent
+        self.name_in = discord.ui.TextInput(
+            label="Player name", max_length=32, default=parent.player or "")
+        self.add_item(self.name_in)
+
+    async def on_submit(self, interaction):
+        self.parent.player = self.name_in.value.strip()
+        self.parent._render()
+        await interaction.response.edit_message(content=self.parent._summary(), view=self.parent)
+
+
+class _FieldPlayerValueModal(discord.ui.Modal):
+    """Captures player name + a free-text / number / name-list value in one form,
+    for fields that don't have a fixed set of choices."""
+    def __init__(self, parent, value_label, value_placeholder=""):
+        super().__init__(title="Edit player")
+        self.parent = parent
+        self.name_in = discord.ui.TextInput(
+            label="Player name", max_length=32, default=parent.player or "")
+        self.value_in = discord.ui.TextInput(
+            label=value_label[:45], max_length=200, placeholder=value_placeholder,
+            default=(parent.value if parent.value is not None else ""))
+        self.add_item(self.name_in)
+        self.add_item(self.value_in)
+
+    async def on_submit(self, interaction):
+        self.parent.player = self.name_in.value.strip()
+        self.parent.value = self.value_in.value.strip()
+        self.parent._render()
+        await interaction.response.edit_message(content=self.parent._summary(), view=self.parent)
+
+
+class FieldEditView(discord.ui.View):
+    """Generic guided editor shared by $roster and $rosteradmin. Given a list of
+    (key, label, kind) fields and a `_*_core` coroutine, it shows a field
+    dropdown, then the right value control for the chosen field — Yes/No, a
+    class / rank dropdown, or a modal for free text. The player name is always
+    typed (the roster can exceed Discord's 25-option dropdown cap) and matched
+    with the same fuzzy find_name as the text commands. Pressing Apply runs the
+    core. Restricted to the invoking user; times out after 5 minutes.
+
+    kinds: 'bool' (Yes/No -> "True"/"False"), 'class', 'rank', 'text', 'names',
+    'none' (no value, e.g. removealt)."""
+
+    _VALUE_HINTS = {
+        "level": "e.g. 230",
+        "faction": "tier number, e.g. 3",
+        "setmain": "alts, comma-separated, e.g. Alt1,Alt2",
+    }
+
+    def __init__(self, invoker, title, fields, core, player=None):
+        super().__init__(timeout=300)
+        self.invoker = invoker
+        self.title_text = title
+        self.fields = fields
+        self.core = core
+        self.message = None
+        self.field_key = None
+        self.field_kind = None
+        self.field_label = None
+        self.player = player  # may be pre-seeded (e.g. from a $player card edit button)
+        self.value = None
+        self._render()
+
+    async def interaction_check(self, interaction):
+        if interaction.user.id != self.invoker.id:
+            await interaction.response.send_message(
+                "Only the person who opened this menu can use it.", ephemeral=True)
+            return False
+        return True
+
+    def _value_options(self):
+        if self.field_kind == "bool":
+            pairs = [("Yes", "True"), ("No", "False")]
+        elif self.field_kind == "class":
+            pairs = [(c, c) for c in CLASSES]
+        elif self.field_kind == "rank":
+            pairs = [(r, r) for r in RANKS]
+        else:
+            pairs = []
+        return [discord.SelectOption(label=l, value=v, default=(self.value == v)) for l, v in pairs]
+
+    def _ready(self):
+        return bool(self.player) and (self.field_kind == "none" or self.value is not None)
+
+    def _value_display(self):
+        if self.value is None:
+            return "—"
+        if self.field_kind == "bool":
+            return "Yes" if self.value == "True" else "No"
+        return self.value
+
+    def _render(self):
+        self.clear_items()
+        fsel = discord.ui.Select(
+            placeholder="What to change…",
+            options=[discord.SelectOption(label=lbl, value=key, default=(key == self.field_key))
+                     for key, lbl, kind in self.fields][:25])
+        fsel.callback = self._pick_field
+        self.add_item(fsel)
+        if self.field_key is None:
+            return
+        if self.field_kind in ("bool", "class", "rank"):
+            vsel = discord.ui.Select(placeholder="Value…", options=self._value_options())
+            vsel.callback = self._pick_value
+            self.add_item(vsel)
+            pbtn = discord.ui.Button(
+                label=(f"Player: {self.player}" if self.player else "Set player"),
+                style=discord.ButtonStyle.secondary)
+            pbtn.callback = self._open_player
+            self.add_item(pbtn)
+        elif self.field_kind == "none":
+            pbtn = discord.ui.Button(
+                label=(f"Player: {self.player}" if self.player else "Set player"),
+                style=discord.ButtonStyle.secondary)
+            pbtn.callback = self._open_player
+            self.add_item(pbtn)
+        else:  # text / names — capture name + value together in a modal
+            ebtn = discord.ui.Button(label="Enter player & value", style=discord.ButtonStyle.primary)
+            ebtn.callback = self._open_text
+            self.add_item(ebtn)
+        applybtn = discord.ui.Button(label="Apply", style=discord.ButtonStyle.success, disabled=not self._ready())
+        applybtn.callback = self._apply
+        self.add_item(applybtn)
+
+    def _summary(self):
+        lines = [f"**{self.title_text}**",
+                 f"• Field: {self.field_label or '—'}",
+                 f"• Player: {self.player or '—'}"]
+        if self.field_kind != "none":
+            lines.append(f"• Value: {self._value_display()}")
+        lines.append("Pick the field, set the player, choose/enter the value, then **Apply**.")
+        return "\n".join(lines)
+
+    async def _pick_field(self, interaction):
+        key = interaction.data["values"][0]
+        self.field_key = key
+        for k, lbl, kind in self.fields:
+            if k == key:
+                self.field_label, self.field_kind = lbl, kind
+                break
+        self.value = None  # the value control depends on the field — reset it
+        self._render()
+        await interaction.response.edit_message(content=self._summary(), view=self)
+
+    async def _pick_value(self, interaction):
+        self.value = interaction.data["values"][0]
+        self._render()
+        await interaction.response.edit_message(content=self._summary(), view=self)
+
+    async def _open_player(self, interaction):
+        await interaction.response.send_modal(_FieldPlayerModal(self))
+
+    async def _open_text(self, interaction):
+        await interaction.response.send_modal(
+            _FieldPlayerValueModal(self, self.field_label, self._VALUE_HINTS.get(self.field_key, "")))
+
+    async def _apply(self, interaction):
+        if not self._ready():
+            await interaction.response.send_message(
+                "Choose a field, set the player and a value first.", ephemeral=True)
+            return
+        for c in self.children:
+            c.disabled = True
+        await interaction.response.edit_message(content=self._summary() + "\n\nApplying…", view=self)
+        params = "" if self.field_kind == "none" else self.value
+        try:
+            await self.core(interaction.followup.send, self.invoker.name,
+                            self.field_key, self.player, params)
+        except Exception as e:
+            logger.exception("FieldEditView apply failed")
+            await interaction.followup.send(f"Something went wrong: {e}")
+        self.stop()
+
+    async def on_timeout(self):
+        if self.message:
+            try:
+                for c in self.children:
+                    c.disabled = True
+                await self.message.edit(content="(Menu timed out — run the command again.)", view=self)
+            except Exception:
+                pass
+
+
+# Fields offered by the $rosteradmin guided menu (key matches the text subcommand).
+ROSTERADMIN_FIELDS = [
+    ("rank", "Rank", "rank"),
+    ("main", "Main character?", "bool"),
+]
+
+
+@client.command(aliases=["rosteradministrator", "ra"])
 @dkp_only()
-async def roster(ctx, subcommand, name, params):
-    """Roster Management Command
-    subcommands: dg, subclass, cgoffhand, dl, dlmain, dloffhand, edl, edlmain, edloffhand, setall, level, setmain, bulksetmain, faction"""
+@commands.has_any_role("General", "Guardian", "REDALiCE", "Helper")
+async def rosteradmin(ctx, subcommand=None, name=None, params=None):
+    """roster management for admins
+    subcommands: rank, main
+
+    Run `$rosteradmin` with no arguments for a guided menu."""
+    if subcommand is None:
+        view = FieldEditView(ctx.author, "Roster admin — edit a player", ROSTERADMIN_FIELDS, _rosteradmin_core)
+        view.message = await ctx.send(view._summary(), view=view)
+        return
+    if name is None or params is None:
+        await ctx.send("Usage: `$rosteradmin <rank|main> <name> <value>` — or run `$rosteradmin` with no arguments for a guided menu.")
+        return
+    await _rosteradmin_core(ctx.send, ctx.author.name, subcommand, name, params)
+
+async def _roster_core(send, author_name, subcommand, name, params):
+    """Player roster edits (gear flags, level, class, mains, faction, …). Shared
+    by the $roster command and the guided FieldEditView."""
     params = sanitize_cell(params)  # neutralise leading =/+/-/@ formula injection in user text
     user_list = await bot5ws1.acol_values(1)
     realname, caps, spaces, suggestions = find_name(name, user_list)
@@ -2280,23 +2655,23 @@ async def roster(ctx, subcommand, name, params):
         subcommand = subcommand.lower()
         if subcommand == "dg":
             await bot5ws1.aupdate_cell(row_num, 6, params)
-            await ctx.send(realname + "'s DG has been updated to " + str(params))
-            logbody = ["roster", str(ctx.author.name), dt.now().strftime("%d/%m/%Y %H:%M:%S"), str([realname, subcommand, params])]
+            await send(realname + "'s DG has been updated to " + str(params))
+            logbody = ["roster", str(author_name), dt.now().strftime("%d/%m/%Y %H:%M:%S"), str([realname, subcommand, params])]
             await bot3ws11.aappend_row(logbody)
         elif subcommand == "removealt":
             if realname != None:
                 await bot5ws1.aupdate_cell(row_num, 7, "")
-                await ctx.send(realname + "'s Main character has been removed")
-                logbody = ["roster", str(ctx.author.name), dt.now().strftime("%d/%m/%Y %H:%M:%S"), str([realname, subcommand, params])]
+                await send(realname + "'s Main character has been removed")
+                logbody = ["roster", str(author_name), dt.now().strftime("%d/%m/%Y %H:%M:%S"), str([realname, subcommand, params])]
                 await bot3ws11.aappend_row(logbody)
             else:
-                await ctx.send(params + " not in list!")
+                await send(params + " not in list!")
         elif subcommand == "setmain":
             names_list = params.split(",")
             # set the realname main to itself as well
             await bot5ws1.aupdate_cell(row_num, 7, realname)
             await bot5ws1.aupdate_cell(row_num, 3, True)
-            await ctx.send(realname + "'s Main character has been updated to " + str(realname))
+            await send(realname + "'s Main character has been updated to " + str(realname))
             if realname != None:
                 for names in names_list:
                     findnames, caps, spaces, suggestions = find_name(names, user_list)
@@ -2305,17 +2680,17 @@ async def roster(ctx, subcommand, name, params):
                         row_num = cell.row
                         await bot5ws1.aupdate_cell(row_num, 7, realname)
                         await bot5ws1.aupdate_cell(row_num, 3, False)
-                        await ctx.send(findnames + "'s Main character has been updated to " + realname)
-                        logbody = ["roster", str(ctx.author.name), dt.now().strftime("%d/%m/%Y %H:%M:%S"), str([findnames, subcommand, realname])]
+                        await send(findnames + "'s Main character has been updated to " + realname)
+                        logbody = ["roster", str(author_name), dt.now().strftime("%d/%m/%Y %H:%M:%S"), str([findnames, subcommand, realname])]
                         await bot3ws11.aappend_row(logbody)
                     else:
-                        await ctx.send(not_found_message(names, suggestions))
+                        await send(not_found_message(names, suggestions))
         elif subcommand == "bulksetmain":
             names_list = params.split(",")
             # set the realname main to itself as well
             await bot5ws1.aupdate_cell(row_num, 7, realname)
             await bot5ws1.aupdate_cell(row_num, 3, True)
-            await ctx.send(realname + "'s Main character has been updated to " + str(realname))
+            await send(realname + "'s Main character has been updated to " + str(realname))
             if realname != None:
                 for names in names_list:
                     findnames, caps, spaces, suggestions = find_name(names, user_list)
@@ -2324,70 +2699,70 @@ async def roster(ctx, subcommand, name, params):
                         row_num = cell.row
                         await bot5ws1.aupdate_cell(row_num, 7, realname)
                         await bot5ws1.aupdate_cell(row_num, 3, False)
-                        await ctx.send(findnames + "'s Main character has been updated to " + realname)
-                        logbody = ["roster", str(ctx.author.name), dt.now().strftime("%d/%m/%Y %H:%M:%S"), str([findnames, subcommand, realname])]
+                        await send(findnames + "'s Main character has been updated to " + realname)
+                        logbody = ["roster", str(author_name), dt.now().strftime("%d/%m/%Y %H:%M:%S"), str([findnames, subcommand, realname])]
                         await bot3ws11.aappend_row(logbody)
                     else:
-                        await ctx.send(not_found_message(names, suggestions))
+                        await send(not_found_message(names, suggestions))
         elif subcommand == "level":
             await bot5ws1.aupdate_cell(row_num, 4, params)
-            await ctx.send(realname + "'s level has been updated to " + str(params))
-            logbody = ["roster", str(ctx.author.name), dt.now().strftime("%d/%m/%Y %H:%M:%S"), str([realname, subcommand, params])]
+            await send(realname + "'s level has been updated to " + str(params))
+            logbody = ["roster", str(author_name), dt.now().strftime("%d/%m/%Y %H:%M:%S"), str([realname, subcommand, params])]
             await bot3ws11.aappend_row(logbody)
         elif subcommand == "class":
             params = params.capitalize()
-            if params not in ["Warrior", "Rogue", "Mage", "Druid", "Ranger"]:
-                await ctx.send("Invalid class! Please use Warrior, Rogue, Mage, Druid, or Ranger")
+            if params not in CLASSES:
+                await send("Invalid class! Please use Warrior, Rogue, Mage, Druid, or Ranger")
                 return
             await bot5ws1.aupdate_cell(row_num, 5, params)
-            await ctx.send(realname + "'s class has been updated to " + str(params))
-            logbody = ["roster", str(ctx.author.name), dt.now().strftime("%d/%m/%Y %H:%M:%S"), str([realname, subcommand, params])]
+            await send(realname + "'s class has been updated to " + str(params))
+            logbody = ["roster", str(author_name), dt.now().strftime("%d/%m/%Y %H:%M:%S"), str([realname, subcommand, params])]
             await bot3ws11.aappend_row(logbody)
         elif subcommand == "subclass":
             await bot5ws1.aupdate_cell(row_num, 8, params)
-            await ctx.send(realname + "'s Subclass has been updated to " + str(params))
-            logbody = ["roster", str(ctx.author.name), dt.now().strftime("%d/%m/%Y %H:%M:%S"), str([realname, subcommand, params])]
+            await send(realname + "'s Subclass has been updated to " + str(params))
+            logbody = ["roster", str(author_name), dt.now().strftime("%d/%m/%Y %H:%M:%S"), str([realname, subcommand, params])]
             await bot3ws11.aappend_row(logbody)
         elif subcommand == "cgoffhand":
             await bot5ws1.aupdate_cell(row_num, 9, params)
-            await ctx.send(realname + "'s CG Offhand has been updated to " + str(params))
-            logbody = ["roster", str(ctx.author.name), dt.now().strftime("%d/%m/%Y %H:%M:%S"), str([realname, subcommand, params])]
+            await send(realname + "'s CG Offhand has been updated to " + str(params))
+            logbody = ["roster", str(author_name), dt.now().strftime("%d/%m/%Y %H:%M:%S"), str([realname, subcommand, params])]
             await bot3ws11.aappend_row(logbody)
         elif subcommand == "dl":
             params = toBool(params)
             await bot5ws1.aupdate_cell(row_num, 10, params)
-            await ctx.send(realname + "'s DL has been updated to " + str(params))
-            logbody = ["roster", str(ctx.author.name), dt.now().strftime("%d/%m/%Y %H:%M:%S"), str([realname, subcommand, params])]
+            await send(realname + "'s DL has been updated to " + str(params))
+            logbody = ["roster", str(author_name), dt.now().strftime("%d/%m/%Y %H:%M:%S"), str([realname, subcommand, params])]
             await bot3ws11.aappend_row(logbody)
         elif subcommand == "dlmain":
             params = toBool(params)
             await bot5ws1.aupdate_cell(row_num, 11, params)
-            await ctx.send(realname + "'s DL Main has been updated to " + str(params))
-            logbody = ["roster", str(ctx.author.name), dt.now().strftime("%d/%m/%Y %H:%M:%S"), str([realname, subcommand, params])]
+            await send(realname + "'s DL Main has been updated to " + str(params))
+            logbody = ["roster", str(author_name), dt.now().strftime("%d/%m/%Y %H:%M:%S"), str([realname, subcommand, params])]
             await bot3ws11.aappend_row(logbody)
         elif subcommand == "dloffhand":
             params = toBool(params)
             await bot5ws1.aupdate_cell(row_num, 12, params)
-            await ctx.send(realname + "'s DL Offhand has been updated to " + str(params))
-            logbody = ["roster", str(ctx.author.name), dt.now().strftime("%d/%m/%Y %H:%M:%S"), str([realname, subcommand, params])]
+            await send(realname + "'s DL Offhand has been updated to " + str(params))
+            logbody = ["roster", str(author_name), dt.now().strftime("%d/%m/%Y %H:%M:%S"), str([realname, subcommand, params])]
             await bot3ws11.aappend_row(logbody)
         elif subcommand == "edl":
             params = toBool(params)
             await bot5ws1.aupdate_cell(row_num, 13, params)
-            await ctx.send(realname + "'s EDL has been updated to " + str(params))
-            logbody = ["roster", str(ctx.author.name), dt.now().strftime("%d/%m/%Y %H:%M:%S"), str([realname, subcommand, params])]
+            await send(realname + "'s EDL has been updated to " + str(params))
+            logbody = ["roster", str(author_name), dt.now().strftime("%d/%m/%Y %H:%M:%S"), str([realname, subcommand, params])]
             await bot3ws11.aappend_row(logbody)
         elif subcommand == "edlmain":
             params = toBool(params)
             await bot5ws1.aupdate_cell(row_num, 14, params)
-            await ctx.send(realname + "'s EDL Main has been updated to " + str(params))
-            logbody = ["roster", str(ctx.author.name), dt.now().strftime("%d/%m/%Y %H:%M:%S"), str([realname, subcommand, params])]
+            await send(realname + "'s EDL Main has been updated to " + str(params))
+            logbody = ["roster", str(author_name), dt.now().strftime("%d/%m/%Y %H:%M:%S"), str([realname, subcommand, params])]
             await bot3ws11.aappend_row(logbody)
         elif subcommand == "edloffhand":
             params = toBool(params)
             await bot5ws1.aupdate_cell(row_num, 15, params)
-            await ctx.send(realname + "'s EDL Offhand has been updated to " + str(params))
-            logbody = ["roster", str(ctx.author.name), dt.now().strftime("%d/%m/%Y %H:%M:%S"), str([realname, subcommand, params])]
+            await send(realname + "'s EDL Offhand has been updated to " + str(params))
+            logbody = ["roster", str(author_name), dt.now().strftime("%d/%m/%Y %H:%M:%S"), str([realname, subcommand, params])]
             await bot3ws11.aappend_row(logbody)
         elif subcommand == "setall":
             params = toBool(params)
@@ -2398,19 +2773,129 @@ async def roster(ctx, subcommand, name, params):
             await bot5ws1.aupdate_cell(row_num, 13, params)
             await bot5ws1.aupdate_cell(row_num, 14, params)
             await bot5ws1.aupdate_cell(row_num, 15, params)
-            await ctx.send(realname + "'s gear has all been updated to " + str(params))
-            logbody = ["roster", str(ctx.author.name), dt.now().strftime("%d/%m/%Y %H:%M:%S"), str([realname, subcommand, params])]
+            await send(realname + "'s gear has all been updated to " + str(params))
+            logbody = ["roster", str(author_name), dt.now().strftime("%d/%m/%Y %H:%M:%S"), str([realname, subcommand, params])]
             await bot3ws11.aappend_row(logbody)
         elif subcommand == "faction":
             params = int(params)
             await bot5ws1.aupdate_cell(row_num, 16, params)
-            await ctx.send(realname + "'s Valley Faction has been updated to tier " + str(params))
-            logbody = ["roster", str(ctx.author.name), dt.now().strftime("%d/%m/%Y %H:%M:%S"), str([realname, subcommand, params])]
+            await send(realname + "'s Valley Faction has been updated to tier " + str(params))
+            logbody = ["roster", str(author_name), dt.now().strftime("%d/%m/%Y %H:%M:%S"), str([realname, subcommand, params])]
             await bot3ws11.aappend_row(logbody)
         else:
-            await ctx.send("invalid subcommand")
+            await send("invalid subcommand")
     else:
-        await ctx.send(not_found_message(name, suggestions))
+        await send(not_found_message(name, suggestions))
+
+
+# Fields offered by the $roster guided menu. (key matches the text subcommand;
+# bulksetmain is intentionally omitted — it's a duplicate of setmain.)
+ROSTER_FIELDS = [
+    ("level", "Level", "text"),
+    ("class", "Class", "class"),
+    ("dg", "DG", "text"),
+    ("subclass", "Subclass", "text"),
+    ("cgoffhand", "CG Offhand", "text"),
+    ("dl", "DL", "bool"),
+    ("dlmain", "DL Main", "bool"),
+    ("dloffhand", "DL Offhand", "bool"),
+    ("edl", "EDL", "bool"),
+    ("edlmain", "EDL Main", "bool"),
+    ("edloffhand", "EDL Offhand", "bool"),
+    ("setall", "All gear flags at once", "bool"),
+    ("faction", "Valley Faction tier", "text"),
+    ("setmain", "Set main (+ link alts)", "names"),
+    ("removealt", "Remove alt's main link", "none"),
+]
+
+
+@client.command(aliases=["r"])
+@dkp_only()
+async def roster(ctx, subcommand=None, name=None, params=None):
+    """Roster Management Command
+    subcommands: dg, subclass, cgoffhand, dl, dlmain, dloffhand, edl, edlmain, edloffhand, setall, level, setmain, bulksetmain, faction
+
+    Run `$roster` with no arguments for a guided menu."""
+    if subcommand is None:
+        view = FieldEditView(ctx.author, "Roster — edit a player", ROSTER_FIELDS, _roster_core)
+        view.message = await ctx.send(view._summary(), view=view)
+        return
+    if name is None:
+        await ctx.send("Usage: `$roster <field> <name> <value>` — or run `$roster` with no arguments for a guided menu.")
+        return
+    if params is None:
+        # removealt is the only subcommand that doesn't need a value
+        if subcommand.lower() == "removealt":
+            await _roster_core(ctx.send, ctx.author.name, subcommand, name, "")
+        else:
+            await ctx.send("Usage: `$roster <field> <name> <value>` — or run `$roster` with no arguments for a guided menu.")
+        return
+    await _roster_core(ctx.send, ctx.author.name, subcommand, name, params)
+
+class PlayerCardView(discord.ui.View):
+    """An 'Edit roster' button shown under a $player / $playerfull card. Clicking
+    opens the guided FieldEditView pre-seeded with this toon, so an editor can go
+    straight from looking at a player to changing them. The spawned menu is scoped
+    to whoever clicked. Only attached in a guild (the $roster command it drives is
+    guild-only); 5-minute timeout."""
+    def __init__(self, player_name):
+        super().__init__(timeout=300)
+        self.player_name = player_name
+        self.message = None
+        self.edit_btn = discord.ui.Button(label="Edit roster", style=discord.ButtonStyle.secondary)
+        self.edit_btn.callback = self._edit
+        self.add_item(self.edit_btn)
+
+    async def _edit(self, interaction):
+        view = FieldEditView(interaction.user, f"Roster — edit {self.player_name}",
+                             ROSTER_FIELDS, _roster_core, player=self.player_name)
+        await interaction.response.send_message(content=view._summary(), view=view)
+        view.message = await interaction.original_response()
+
+    async def on_timeout(self):
+        if self.message:
+            try:
+                self.edit_btn.disabled = True
+                await self.message.edit(view=self)
+            except Exception:
+                pass
+
+
+@client.command(aliases=["rosterinfo", "rhelp", "rostermenu"])
+@dkp_only()
+async def rosterhelp(ctx):
+    """Explains the guided roster menus and their text-command equivalents."""
+    embed = discord.Embed(
+        title="Roster commands",
+        description="Each of these can be run **with no arguments** to open a "
+                    "guided menu (dropdowns + buttons), or with arguments the old "
+                    "way. You can also press **Edit roster** under any "
+                    "`$player` / `$playerfull` card to jump straight in.",
+        colour=discord.Color.orange())
+    embed.add_field(
+        name="$addmem — add a member",
+        value="Guided: `$addmem`\n"
+              "Direct: `$addmem <name> <rank> <main true/false> <level> <class>`\n"
+              "Adds the toon to the Roster, all KP lists and the loot sheet.",
+        inline=False)
+    embed.add_field(
+        name="$roster — edit a player",
+        value="Guided: `$roster`\n"
+              "Direct: `$roster <field> <name> <value>`\n"
+              "Fields: level, class, dg, subclass, cgoffhand, dl, dlmain, "
+              "dloffhand, edl, edlmain, edloffhand, setall, faction, setmain, "
+              "removealt.",
+        inline=False)
+    embed.add_field(
+        name="$rosteradmin — admin edits",
+        value="Guided: `$rosteradmin`\n"
+              "Direct: `$rosteradmin <rank|main> <name> <value>`\n"
+              "Rank changes also cascade to the player's alts. "
+              "(Requires General / Guardian / Helper.)",
+        inline=False)
+    embed.set_footer(text="Player names are typed and fuzzy-matched, so close spellings still resolve.")
+    await ctx.send(embed=embed)
+
 
 @client.command(aliases=["p", "toon", "char", "character"])
 @dkp_read()
@@ -2463,7 +2948,10 @@ async def player(ctx, *name):
         row_num8 = cell8.row
         dkprowvals7 = await bot4ws8.arow_values(row_num8, value_render_option='UNFORMATTED_VALUE')
         embed.add_field(name = "RBPP", value = "Earned: " + str(dkprowvals7[3]) + ", Current: " + str(dkprowvals7[6]), inline = False)
-        await ctx.send(embed=embed)
+        view = PlayerCardView(realname) if ctx.guild is not None else None
+        msg = await ctx.send(embed=embed, view=view)
+        if view is not None:
+            view.message = msg
     else:
         await ctx.send(not_found_message(name, suggestions))
 
@@ -2517,7 +3005,10 @@ async def playerfull(ctx, *name):
         row_num8 = cell8.row
         dkprowvals7 = await bot4ws8.arow_values(row_num8, value_render_option='UNFORMATTED_VALUE')
         embed.add_field(name = "RBPP", value = "Earned: " + str(dkprowvals7[3]) + ", Current: " + str(dkprowvals7[6]), inline = False)
-        await ctx.send(embed=embed)
+        view = PlayerCardView(realname) if ctx.guild is not None else None
+        msg = await ctx.send(embed=embed, view=view)
+        if view is not None:
+            view.message = msg
     else:
         await ctx.send(not_found_message(name, suggestions))
 
@@ -3163,94 +3654,211 @@ async def winnings(ctx, name, kp = None):
         else:
             await ctx.send(not_found_message(name, suggestions))
 
+# Pools $refunditem knows how to refund (each maps to its account-3 'deduct'
+# worksheet). RBPP is intentionally absent — refunds were never wired for it.
+REFUND_POOLS = ("VKP", "GKP", "PKP", "AKP", "RBPPUNOX", "DPKP")
+
+
+def _parse_loot_cost(cost_raw):
+    """Parse a loot cost cell like '755.0 DPKP' -> (price float, kp str). Returns
+    None when it isn't '<number> <KP>'."""
+    parts = str(cost_raw or "").split()
+    if len(parts) < 2:
+        return None
+    try:
+        return float(parts[0]), parts[1]
+    except ValueError:
+        return None
+
+
+def _refundable_items(lootlist, costlist):
+    """Given a player's loot row and cost row (col 0 = name/label), return
+    [(itemnum, itemname, cost_raw)] for slots that are non-empty and not already
+    '[REFUNDED] '. itemnum is the 1-based column index $refunditem expects."""
+    out = []
+    for itemnum in range(1, len(lootlist)):
+        itemname = str(lootlist[itemnum]).strip()
+        cost_raw = str(costlist[itemnum]).strip() if itemnum < len(costlist) else ""
+        if not itemname or not cost_raw or itemname.startswith("[REFUNDED] "):
+            continue
+        out.append((itemnum, itemname, cost_raw))
+    return out
+
+
+async def _refund_item_core(send, author_name, realname, itemnum):
+    """Refund one loot slot for `realname`: mark the item '[REFUNDED] ' and credit
+    the price back to their Spent. Shared by $refunditem and RefundItemView."""
+    cell = await bot3ws9.afind(realname, in_column=1)
+    row_num = cell.row
+    lootlist = await bot3ws9.arow_values(row_num)
+    costlist = await bot3ws9.arow_values(row_num + 1)
+    if itemnum >= len(lootlist) or itemnum >= len(costlist):
+        await send(f"Item {itemnum} is out of range for {realname} (loot has {len(lootlist) - 1} entries).")
+        return
+    itemname = lootlist[itemnum]
+    cost_raw = costlist[itemnum]
+    if not itemname or not cost_raw:
+        await send(f"Item slot {itemnum} for {realname} is empty.")
+        return
+    if itemname.startswith("[REFUNDED] "):
+        await send(f"Item {itemnum} ({itemname}) is already refunded.")
+        return
+    parsed = _parse_loot_cost(cost_raw)
+    if parsed is None:
+        await send(f"Couldn't read the cost for item {itemnum} ('{cost_raw}').")
+        return
+    itemprice, itemkp = parsed
+    if itemkp not in REFUND_POOLS:
+        await send("Invalid KP type. somehow?")
+        return
+    await bot3ws9.aupdate_cell(row_num, itemnum + 1, "[REFUNDED] " + itemname)
+    ws = KP_WORKSHEETS[itemkp]["deduct"]
+    kpcell = await ws.afind(realname, in_column=1)
+    kprow = kpcell.row
+    spent = float((await ws.acell_(kprow, 5)).value)
+    await ws.aupdate_cell(kprow, 5, spent - itemprice)
+    await send(realname + " has been refunded " + str(itemprice) + " " + itemkp + " for " + itemname)
+    logbody = ["refund", str(author_name), dt.now().strftime("%d/%m/%Y %H:%M:%S"), str([realname, itemname, itemprice, itemkp])]
+    await bot3ws11.aappend_row(logbody)
+
+
+REFUND_PAGE = 25
+
+
+class RefundItemView(discord.ui.View):
+    """Paginated dropdown of a player's refundable items (some players have
+    hundreds, well past Discord's 25-option cap) + a Confirm button that runs the
+    refund. The selection persists across page changes. Scoped to the invoker;
+    5-minute timeout."""
+    def __init__(self, invoker, realname, items):
+        super().__init__(timeout=300)
+        self.invoker = invoker
+        self.realname = realname
+        self.items = items          # [(itemnum, name, cost_raw)]
+        self.page = 0
+        self.selected = None        # itemnum
+        self.message = None
+        self._build()
+
+    def _pages(self):
+        return max(1, (len(self.items) + REFUND_PAGE - 1) // REFUND_PAGE)
+
+    def _build(self):
+        self.clear_items()
+        self.page = max(0, min(self.page, self._pages() - 1))
+        start = self.page * REFUND_PAGE
+        opts = []
+        for itemnum, name, cost in self.items[start:start + REFUND_PAGE]:
+            opts.append(discord.SelectOption(
+                label=f"{itemnum}. {name}"[:100], value=str(itemnum),
+                description=str(cost)[:100], default=(self.selected == itemnum)))
+        sel = discord.ui.Select(placeholder="Pick an item to refund…", options=opts)
+        sel.callback = self._pick
+        self.add_item(sel)
+        if self._pages() > 1:
+            prev_b = discord.ui.Button(label="Prev", style=discord.ButtonStyle.secondary)
+            prev_b.callback = self._prev
+            next_b = discord.ui.Button(label="Next", style=discord.ButtonStyle.secondary)
+            next_b.callback = self._next
+            self.add_item(prev_b)
+            self.add_item(next_b)
+        conf = discord.ui.Button(label="Refund selected", style=discord.ButtonStyle.danger,
+                                 disabled=(self.selected is None))
+        conf.callback = self._confirm
+        self.add_item(conf)
+
+    def _summary(self):
+        sel = ""
+        if self.selected is not None:
+            match = next((it for it in self.items if it[0] == self.selected), None)
+            if match:
+                sel = f"\nSelected: **{match[0]}. {match[1]}** ({match[2]})"
+        return (f"**Refund an item for {self.realname}** — {len(self.items)} "
+                f"refundable item(s), page {self.page + 1}/{self._pages()}.{sel}")
+
+    async def interaction_check(self, interaction):
+        if interaction.user.id != self.invoker.id:
+            await interaction.response.send_message(
+                "Only the person who opened this can use it.", ephemeral=True)
+            return False
+        return True
+
+    async def _pick(self, interaction):
+        self.selected = int(interaction.data["values"][0])
+        self._build()
+        await interaction.response.edit_message(content=self._summary(), view=self)
+
+    async def _prev(self, interaction):
+        self.page -= 1
+        self._build()
+        await interaction.response.edit_message(content=self._summary(), view=self)
+
+    async def _next(self, interaction):
+        self.page += 1
+        self._build()
+        await interaction.response.edit_message(content=self._summary(), view=self)
+
+    async def _confirm(self, interaction):
+        if self.selected is None:
+            await interaction.response.send_message("Pick an item first.", ephemeral=True)
+            return
+        for c in self.children:
+            c.disabled = True
+        await interaction.response.edit_message(content=self._summary() + "\n\nRefunding…", view=self)
+        try:
+            await _refund_item_core(interaction.followup.send, self.invoker.name,
+                                    self.realname, self.selected)
+        except Exception as e:
+            logger.exception("RefundItemView confirm failed")
+            await interaction.followup.send(f"Refund failed: {e}")
+        self.stop()
+
+    async def on_timeout(self):
+        if self.message:
+            try:
+                for c in self.children:
+                    c.disabled = True
+                await self.message.edit(view=self)
+            except Exception:
+                pass
+
+
 @client.command()
 @dkp_only()
 @commands.has_any_role("General", "Guardian", "REDALiCE", "Helper")
-async def refunditem(ctx, name, itemnum):
-    """Refunds an item and returns the points to the player"""
-    itemnum = int(itemnum)
-    if itemnum < 1:
-        await ctx.send("Item number must be >= 1 (column 0 holds the player name).")
+async def refunditem(ctx, name=None, itemnum=None):
+    """Refunds an item and returns the points to the player.
+    `$refunditem <name>` opens a pick-list of their items; `$refunditem <name>
+    <itemnum>` refunds that slot directly (the old behaviour)."""
+    if name is None:
+        await ctx.send("Usage: `$refunditem <name>` to pick from a list, or `$refunditem <name> <itemnum>`.")
         return
     user_list = await bot3ws9.acol_values(1)
     realname, caps, spaces, suggestions = find_name(name, user_list)
-    if realname != None:
-        cell = await bot3ws9.afind(realname, in_column=1)
-        row_num = cell.row
-        lootlist = await bot3ws9.arow_values(row_num)
-        costlist = await bot3ws9.arow_values(row_num + 1)
-        if itemnum >= len(lootlist) or itemnum >= len(costlist):
-            await ctx.send(f"Item {itemnum} is out of range for {realname} (loot has {len(lootlist) - 1} entries).")
+    if realname is None:
+        await ctx.send(not_found_message(name, suggestions))
+        return
+    if itemnum is not None:
+        try:
+            n = int(itemnum)
+        except ValueError:
+            await ctx.send("Item number must be a whole number.")
             return
-        itemname = lootlist[itemnum]
-        cost_raw = costlist[itemnum]
-        if not itemname or not cost_raw:
-            await ctx.send(f"Item slot {itemnum} for {realname} is empty.")
+        if n < 1:
+            await ctx.send("Item number must be >= 1 (column 0 holds the player name).")
             return
-        if itemname.startswith("[REFUNDED] "):
-            await ctx.send(f"Item {itemnum} ({itemname}) is already refunded.")
-            return
-        cost = cost_raw.split(" ")
-        itemprice = float(cost[0])
-        itemkp = cost[1]
-        newitemname = "[REFUNDED] " + itemname
-        await bot3ws9.aupdate_cell(row_num, itemnum + 1, newitemname)
-        if itemkp == "VKP":
-            kpcell = await bot3ws2.afind(realname, in_column=1)
-            kprow = kpcell.row
-            spent = float((await bot3ws2.acell_(kprow, 5)).value)
-            newspent = spent - itemprice
-            await bot3ws2.aupdate_cell(kprow, 5, newspent)
-            await ctx.send(realname + " has been refunded " + str(itemprice) + " VKP for " + itemname)
-            logbody = ["refund", str(ctx.author.name), dt.now().strftime("%d/%m/%Y %H:%M:%S"), str([realname, itemname, itemprice, itemkp])]
-            await bot3ws11.aappend_row(logbody)
-        elif itemkp == "GKP":
-            kpcell = await bot3ws3.afind(realname, in_column=1)
-            kprow = kpcell.row
-            spent = float((await bot3ws3.acell_(kprow, 5)).value)
-            newspent = spent - itemprice
-            await bot3ws3.aupdate_cell(kprow, 5, newspent)
-            await ctx.send(realname + " has been refunded " + str(itemprice) + " GKP for " + itemname)
-            logbody = ["refund", str(ctx.author.name), dt.now().strftime("%d/%m/%Y %H:%M:%S"), str([realname, itemname, itemprice, itemkp])]
-            await bot3ws11.aappend_row(logbody)
-        elif itemkp == "PKP":
-            kpcell = await bot3ws4.afind(realname, in_column=1)
-            kprow = kpcell.row
-            spent = float((await bot3ws4.acell_(kprow, 5)).value)
-            newspent = spent - itemprice
-            await bot3ws4.aupdate_cell(kprow, 5, newspent)
-            await ctx.send(realname + " has been refunded " + str(itemprice) + " PKP for " + itemname)
-            logbody = ["refund", str(ctx.author.name), dt.now().strftime("%d/%m/%Y %H:%M:%S"), str([realname, itemname, itemprice, itemkp])]
-            await bot3ws11.aappend_row(logbody)
-        elif itemkp == "AKP":
-            kpcell = await bot3ws5.afind(realname, in_column=1)
-            kprow = kpcell.row
-            spent = float((await bot3ws5.acell_(kprow, 5)).value)
-            newspent = spent - itemprice
-            await bot3ws5.aupdate_cell(kprow, 5, newspent)
-            await ctx.send(realname + " has been refunded " + str(itemprice) + " AKP for " + itemname)
-            logbody = ["refund", str(ctx.author.name), dt.now().strftime("%d/%m/%Y %H:%M:%S"), str([realname, itemname, itemprice, itemkp])]
-            await bot3ws11.aappend_row(logbody)
-        elif itemkp == "RBPPUNOX":
-            kpcell = await bot3ws6.afind(realname, in_column=1)
-            kprow = kpcell.row
-            spent = float((await bot3ws6.acell_(kprow, 5)).value)
-            newspent = spent - itemprice
-            await bot3ws6.aupdate_cell(kprow, 5, newspent)
-            await ctx.send(realname + " has been refunded " + str(itemprice) + " RBPPUNOX for " + itemname)
-            logbody = ["refund", str(ctx.author.name), dt.now().strftime("%d/%m/%Y %H:%M:%S"), str([realname, itemname, itemprice, itemkp])]
-            await bot3ws11.aappend_row(logbody)
-        elif itemkp == "DPKP":
-            kpcell = await bot3ws7.afind(realname, in_column=1)
-            kprow = kpcell.row
-            spent = float((await bot3ws7.acell_(kprow, 5)).value)
-            newspent = spent - itemprice
-            await bot3ws7.aupdate_cell(kprow, 5, newspent)
-            await ctx.send(realname + " has been refunded " + str(itemprice) + " DPKP for " + itemname)
-            logbody = ["refund", str(ctx.author.name), dt.now().strftime("%d/%m/%Y %H:%M:%S"), str([realname, itemname, itemprice, itemkp])]
-            await bot3ws11.aappend_row(logbody)
-        else:
-            await ctx.send("Invalid KP type. somehow?")
+        await _refund_item_core(ctx.send, ctx.author.name, realname, n)
+        return
+    cell = await bot3ws9.afind(realname, in_column=1)
+    row_num = cell.row
+    lootlist = await bot3ws9.arow_values(row_num)
+    costlist = await bot3ws9.arow_values(row_num + 1)
+    items = _refundable_items(lootlist, costlist)
+    if not items:
+        await ctx.send(f"{realname} has no refundable items.")
+        return
+    view = RefundItemView(ctx.author, realname, items)
+    view.message = await ctx.send(content=view._summary(), view=view)
 
 
 @client.command(aliases=["refundold"])
@@ -3417,6 +4025,45 @@ async def bossconfig(ctx, action, pool = None, bossname = None, points = None):
     else:
         await ctx.send("Unknown action! Use: `list`, `add`, `remove`, or `update`")
 
+def _parse_kp_snapshot(rows):
+    """Build {name: (row_number, earned)} from a KP worksheet's get_all_values output.
+    Row 1 is the header; data is 1-based with row 2 = first player. Col 1 = name,
+    col 4 = Earned. Lets attendance loops resolve a toon's row + current Earned from a
+    single snapshot instead of an afind+acell per toon — those interleave with the
+    Earned writes and, because each write invalidates the cache, force a full-sheet
+    re-fetch every iteration (the cause of $boss / approval timeouts)."""
+    snap = {}
+    for i, row in enumerate(rows[1:], start=2):
+        if row and row[0]:
+            snap[row[0]] = (i, safe_float(row[3]) if len(row) > 3 else 0.0)
+    return snap
+
+
+async def _kp_snapshot(ws):
+    """One full-sheet read of a KP worksheet -> {name: (row, earned)}."""
+    return _parse_kp_snapshot(await ws.aget_all_values())
+
+
+async def _award_pool(read_ws, ts_ws, name, points, currenttime, snaps):
+    """Add `points` to `name`'s Earned (col 4 on read_ws) and stamp Last Raid (col 2
+    on ts_ws), resolving the row + current Earned from a one-time snapshot of read_ws
+    cached in `snaps` (keyed by worksheet). Returns True if the toon was found and
+    awarded, False (logged) if they have no row on that sheet. Each toon's row is
+    written at most once per attendance run, so the snapshot can't go stale mid-run."""
+    snap = snaps.get(id(read_ws))
+    if snap is None:
+        snap = await _kp_snapshot(read_ws)
+        snaps[id(read_ws)] = snap
+    loc = snap.get(name)
+    if loc is None:
+        logger.warning(f"attendance: '{name}' has no row on worksheet {getattr(read_ws, 'title', '?')} — skipped")
+        return False
+    row, earned = loc
+    await read_ws.aupdate_cell(row, 4, earned + points)
+    await ts_ws.aupdate_cell(row, 2, currenttime)
+    return True
+
+
 @client.command()
 @dkp_only()
 @commands.has_any_role("General", "Guardian", "REDALiCE", "Helper")
@@ -3442,6 +4089,8 @@ async def boss(ctx, bossname, toonlist):
     kppool = []
     toonlist = list(set(toonlist))
     currenttime =  dt.now().strftime("%d/%m/%Y %H:%M:%S")
+    snaps = {}            # per-run KP-sheet snapshots so awards don't re-fetch per toon
+    _award_t0 = time.time()
     for t in toonlist:
         findt, caps, spaces, suggestions = find_name(t, user_list)
         if findt is not None:
@@ -3455,144 +4104,57 @@ async def boss(ctx, bossname, toonlist):
             mainchar = row[6]
             #insert level checking here if its needed
 
+            # RBPP / DPKP / RBPPUNOX / VKP go to the toon if they're a main, else to
+            # their main character. `target` reproduces the original if/elif exactly.
             if maintoon and findt not in rbpp_list:
-            # rbpp and dino and crom
-                if bossname in rbpp_bosses:
-                    cell2 = await bot2ws8.afind(findt, in_column=1)
-                    row_num2 = cell2.row
-                    earned = float((await bot2ws8.acell_(row_num2, 4)).value)
-                    new = earned + 1
-                    await bot2ws8.aupdate_cell(row_num2, 4, new)
-                    await bot5ws8.aupdate_cell(row_num2, 2, currenttime)
-                    rbpp_list.append(findt)
-                    if "RBPP" not in kppool:
-                        kppool.append("RBPP")
-                if bossname in dpkp_bosses:
-                    cell3 = await bot1ws7.afind(findt, in_column=1)
-                    row_num3 = cell3.row
-                    earned = float((await bot1ws7.acell_(row_num3, 4)).value)
-                    new = earned + dpkp_bosses[bossname]
-                    await bot1ws7.aupdate_cell(row_num3, 4, new)
-                    await bot5ws7.aupdate_cell(row_num3, 2, currenttime)
-                    dpkp_list.append(findt)
-                    if "DPKP" not in kppool:
-                        kppool.append("DPKP")
-                if bossname in rbppunox_bosses:
-                    cell8 = await bot2ws6.afind(findt, in_column=1)
-                    row_num8 = cell8.row
-                    earned = float((await bot2ws6.acell_(row_num8, 4)).value)
-                    new = earned + rbppunox_bosses[bossname]
-                    await bot2ws6.aupdate_cell(row_num8, 4, new)
-                    await bot5ws6.aupdate_cell(row_num8, 2, currenttime)
-                    rbppunox_list.append(findt)
-                    if "RBPPUNOX" not in kppool:
-                        kppool.append("RBPPUNOX")
-                if bossname in vkp_bosses:
-                    cell7 = await bot1ws2.afind(findt, in_column=1)
-                    row_num7 = cell7.row
-                    earned = float((await bot1ws2.acell_(row_num7, 4)).value)
-                    new = earned + vkp_bosses[bossname]
-                    await bot1ws2.aupdate_cell(row_num7, 4, new)
-                    await bot5ws2.aupdate_cell(row_num7, 2, currenttime)
-                    vkp_list.append(findt)
-                    if "VKP" not in kppool:
-                        kppool.append("VKP")
+                target = findt
             elif mainchar not in rbpp_list:
+                target = mainchar
+            else:
+                target = None
+            if target is not None:
                 if bossname in rbpp_bosses:
-                    cell2 = await bot2ws8.afind(mainchar, in_column=1)
-                    row_num2 = cell2.row
-                    earned = float((await bot2ws8.acell_(row_num2, 4)).value)
-                    new = earned + 1
-                    await bot2ws8.aupdate_cell(row_num2, 4, new)
-                    await bot5ws8.aupdate_cell(row_num2, 2, currenttime)
-                    rbpp_list.append(mainchar)
-                    if "RBPP" not in kppool:
-                        kppool.append("RBPP")
+                    if await _award_pool(bot2ws8, bot5ws8, target, 1, currenttime, snaps):
+                        rbpp_list.append(target)
+                        if "RBPP" not in kppool:
+                            kppool.append("RBPP")
                 if bossname in dpkp_bosses:
-                    cell3 = await bot1ws7.afind(mainchar, in_column=1)
-                    row_num3 = cell3.row
-                    earned = float((await bot1ws7.acell_(row_num3, 4)).value)
-                    new = earned + dpkp_bosses[bossname]
-                    await bot1ws7.aupdate_cell(row_num3, 4, new)
-                    await bot5ws7.aupdate_cell(row_num3, 2, currenttime)
-                    dpkp_list.append(mainchar)
-                    if "DPKP" not in kppool:
-                        kppool.append("DPKP")
+                    if await _award_pool(bot1ws7, bot5ws7, target, dpkp_bosses[bossname], currenttime, snaps):
+                        dpkp_list.append(target)
+                        if "DPKP" not in kppool:
+                            kppool.append("DPKP")
                 if bossname in rbppunox_bosses:
-                    cell8 = await bot2ws6.afind(mainchar, in_column=1)
-                    row_num8 = cell8.row
-                    earned = float((await bot2ws6.acell_(row_num8, 4)).value)
-                    new = earned + rbppunox_bosses[bossname]
-                    await bot2ws6.aupdate_cell(row_num8, 4, new)
-                    await bot5ws6.aupdate_cell(row_num8, 2, currenttime)
-                    rbppunox_list.append(mainchar)
-                    if "RBPPUNOX" not in kppool:
-                        kppool.append("RBPPUNOX")
+                    if await _award_pool(bot2ws6, bot5ws6, target, rbppunox_bosses[bossname], currenttime, snaps):
+                        rbppunox_list.append(target)
+                        if "RBPPUNOX" not in kppool:
+                            kppool.append("RBPPUNOX")
                 if bossname in vkp_bosses:
-                    cell7 = await bot1ws2.afind(mainchar, in_column=1)
-                    row_num7 = cell7.row
-                    earned = float((await bot1ws2.acell_(row_num7, 4)).value)
-                    new = earned + vkp_bosses[bossname]
-                    await bot1ws2.aupdate_cell(row_num7, 4, new)
-                    await bot5ws2.aupdate_cell(row_num7, 2, currenttime)
-                    vkp_list.append(mainchar)
-                    if "VKP" not in kppool:
-                        kppool.append("VKP")
+                    if await _award_pool(bot1ws2, bot5ws2, target, vkp_bosses[bossname], currenttime, snaps):
+                        vkp_list.append(target)
+                        if "VKP" not in kppool:
+                            kppool.append("VKP")
             if bossname in akp_bosses:
-                if level >= 220:
-                    cell4 = await bot1ws5.afind(findt, in_column=1)
-                    row_num4 = cell4.row
-                    earned = float((await bot1ws5.acell_(row_num4, 4)).value)
-                    new = earned + akp_bosses[bossname]
-                    await bot1ws5.aupdate_cell(row_num4, 4, new)
-                    await bot5ws5.aupdate_cell(row_num4, 2, currenttime)
-                    akp_list.append(findt)
-                    if "AKP" not in kppool:
-                        kppool.append("AKP")
-                else:
-                    cell4 = await bot1ws5.afind(findt, in_column=1)
-                    row_num4 = cell4.row
-                    earned = float((await bot1ws5.acell_(row_num4, 4)).value)
-                    new = earned + akp_bosses[bossname] - 5
-                    await bot1ws5.aupdate_cell(row_num4, 4, new)
-                    await bot5ws5.aupdate_cell(row_num4, 2, currenttime)
-                    akp_low_list.append(findt)
+                pts = akp_bosses[bossname] if level >= 220 else akp_bosses[bossname] - 5
+                if await _award_pool(bot1ws5, bot5ws5, findt, pts, currenttime, snaps):
+                    (akp_list if level >= 220 else akp_low_list).append(findt)
                     if "AKP" not in kppool:
                         kppool.append("AKP")
             if bossname in pkp_bosses:
-                if level >= 220 or bossname == "Bane":
-                    cell5 = await bot1ws4.afind(findt, in_column=1)
-                    row_num5 = cell5.row
-                    earned = float((await bot1ws4.acell_(row_num5, 4)).value)
-                    new = earned + pkp_bosses[bossname]
-                    await bot1ws4.aupdate_cell(row_num5, 4, new)
-                    await bot5ws4.aupdate_cell(row_num5, 2, currenttime)
-                    pkp_list.append(findt)
-                    if "PKP" not in kppool:
-                        kppool.append("PKP")
-                else:
-                    cell5 = await bot1ws4.afind(findt, in_column=1)
-                    row_num5 = cell5.row
-                    earned = float((await bot1ws4.acell_(row_num5, 4)).value)
-                    new = earned + pkp_bosses[bossname] - 5
-                    await bot1ws4.aupdate_cell(row_num5, 4, new)
-                    await bot5ws4.aupdate_cell(row_num5, 2, currenttime)
-                    pkp_low_list.append(findt)
+                hi = level >= 220 or bossname == "Bane"
+                pts = pkp_bosses[bossname] if hi else pkp_bosses[bossname] - 5
+                if await _award_pool(bot1ws4, bot5ws4, findt, pts, currenttime, snaps):
+                    (pkp_list if hi else pkp_low_list).append(findt)
                     if "PKP" not in kppool:
                         kppool.append("PKP")
             if bossname in gkp_bosses:
-                cell6 = await bot1ws3.afind(findt, in_column=1)
-                row_num6 = cell6.row
-                earned = float((await bot1ws3.acell_(row_num6, 4)).value)
-                new = earned + gkp_bosses[bossname]
-                await bot1ws3.aupdate_cell(row_num6, 4, new)
-                await bot5ws3.aupdate_cell(row_num6, 2, currenttime)
-                gkp_list.append(findt)
-                if "GKP" not in kppool:
-                    kppool.append("GKP")
+                if await _award_pool(bot1ws3, bot5ws3, findt, gkp_bosses[bossname], currenttime, snaps):
+                    gkp_list.append(findt)
+                    if "GKP" not in kppool:
+                        kppool.append("GKP")
         else:
             await ctx.send(not_found_message(t, suggestions))
             toonlist.pop(toonlist.index(t))
+    print(f"BOSS: awarded {bossname} to {len(toonlist)} toon(s) in {time.time()-_award_t0:.1f}s ({len(snaps)} sheet snapshot(s))")
     print("creating embed")
     embed = discord.Embed(title = bossname + " Attendance", colour=discord.Color.orange())
     #emptyattend = False
@@ -3678,69 +4240,37 @@ async def bosshalf(ctx, bossname, toonlist):
     kppool = []
     toonlist = list(set(toonlist))
     currenttime =  dt.now().strftime("%d/%m/%Y %H:%M:%S")
+    snaps = {}
+    _award_t0 = time.time()
     for t in toonlist:
         findt, caps, spaces, suggestions = find_name(t, user_list)
         if findt is not None:
             cell = await bot3ws1.afind(findt, in_column=1)
             row_num = cell.row
             level = safe_int((await bot3ws1.acell_(row_num, 4)).value)
-            maintoon = (await bot3ws1.acell_(row_num, 3)).value
-            maintoon = toBool(maintoon)
+            maintoon = toBool((await bot3ws1.acell_(row_num, 3)).value)
             if bossname in akp_bosses:
-                if level >= 220:
-                    cell4 = await bot1ws5.afind(findt, in_column=1)
-                    row_num4 = cell4.row
-                    earned = float((await bot1ws5.acell_(row_num4, 4)).value)
-                    new = earned + (akp_bosses[bossname])/2
-                    await bot1ws5.aupdate_cell(row_num4, 4, new)
-                    await bot5ws5.aupdate_cell(row_num4, 2, currenttime)
-                    akp_list.append(findt)
-                    if "AKP" not in kppool:
-                        kppool.append("AKP")
-                else:
-                    cell4 = await bot1ws5.afind(findt, in_column=1)
-                    row_num4 = cell4.row
-                    earned = float((await bot1ws5.acell_(row_num4, 4)).value)
-                    new = earned + (akp_bosses[bossname] - 5)/2
-                    await bot1ws5.aupdate_cell(row_num4, 4, new)
-                    await bot5ws5.aupdate_cell(row_num4, 2, currenttime)
-                    akp_low_list.append(findt)
+                pts = (akp_bosses[bossname])/2 if level >= 220 else (akp_bosses[bossname] - 5)/2
+                if await _award_pool(bot1ws5, bot5ws5, findt, pts, currenttime, snaps):
+                    (akp_list if level >= 220 else akp_low_list).append(findt)
                     if "AKP" not in kppool:
                         kppool.append("AKP")
             if bossname in pkp_bosses:
-                if level >= 220 or bossname == "Bane":
-                    cell5 = await bot1ws4.afind(findt, in_column=1)
-                    row_num5 = cell5.row
-                    earned = float((await bot1ws4.acell_(row_num5, 4)).value)
-                    new = earned + (pkp_bosses[bossname])/2
-                    await bot1ws4.aupdate_cell(row_num5, 4, new)
-                    await bot5ws4.aupdate_cell(row_num5, 2, currenttime)
-                    pkp_list.append(findt)
-                    if "PKP" not in kppool:
-                        kppool.append("PKP")
-                else:
-                    cell5 = await bot1ws4.afind(findt, in_column=1)
-                    row_num5 = cell5.row
-                    earned = float((await bot1ws4.acell_(row_num5, 4)).value)
-                    new = earned + (pkp_bosses[bossname] - 5)/2
-                    await bot1ws4.aupdate_cell(row_num5, 4, new)
-                    await bot5ws4.aupdate_cell(row_num5, 2, currenttime)
-                    pkp_low_list.append(findt)
+                hi = level >= 220 or bossname == "Bane"
+                pts = (pkp_bosses[bossname])/2 if hi else (pkp_bosses[bossname] - 5)/2
+                if await _award_pool(bot1ws4, bot5ws4, findt, pts, currenttime, snaps):
+                    (pkp_list if hi else pkp_low_list).append(findt)
                     if "PKP" not in kppool:
                         kppool.append("PKP")
             if bossname in gkp_bosses:
-                cell6 = await bot1ws3.afind(findt, in_column=1)
-                row_num6 = cell6.row
-                earned = float((await bot1ws3.acell_(row_num6, 4)).value)
-                new = earned + (gkp_bosses[bossname])/2
-                await bot1ws3.aupdate_cell(row_num6, 4, new)
-                await bot5ws3.aupdate_cell(row_num6, 2, currenttime)
-                gkp_list.append(findt)
-                if "GKP" not in kppool:
-                    kppool.append("GKP")
+                if await _award_pool(bot1ws3, bot5ws3, findt, (gkp_bosses[bossname])/2, currenttime, snaps):
+                    gkp_list.append(findt)
+                    if "GKP" not in kppool:
+                        kppool.append("GKP")
         else:
             await ctx.send(not_found_message(t, suggestions))
             toonlist.pop(toonlist.index(t))
+    print(f"BOSSHALF: awarded {bossname} to {len(toonlist)} toon(s) in {time.time()-_award_t0:.1f}s ({len(snaps)} sheet snapshot(s))")
     embed = discord.Embed(title = bossname + " Attendance", colour=discord.Color.orange())
     emptyattend = False
     if len(toonlist) == 0:
@@ -3782,76 +4312,518 @@ async def bosshalf(ctx, bossname, toonlist):
 
 
 
+# ---------------------------------------------------------------------------
+# Activity stats — built from the Bosses sheet (ws10) and Command Log (ws11).
+#
+# The aggregation is split into small pure functions (no Discord / Sheets) so it
+# is unit-tested via the AST harness. The async commands just fetch the sheet
+# snapshot once (cached read account) and hand the rows to a StatsView whose
+# dropdown switches the rolling window locally — no re-fetch per switch.
+#
+# Attendance signal: a single $boss writes one Bosses row PER KP pool, and the
+# RBPP row carries the full attendee list (every boss awards RBPP once). $bosshalf
+# writes ONE combined row whose boss name ends in " HALF". So exactly one row per
+# raid = (pool == RBPP) OR ("HALF" in boss); other per-pool rows are skipped to
+# avoid counting a full raid several times.
+#
+# Timestamps: the Command Log is written RAW so its Time column stays the literal
+# "dd/mm/yyyy HH:MM:SS"; the Bosses sheet is USER_ENTERED, so its Datetime may
+# read back as that string or as a Google date serial — _parse_sheet_dt handles
+# both.
+# ---------------------------------------------------------------------------
+STATS_WINDOWS = [
+    ("Weekly (7 days)", 7),
+    ("Monthly (30 days)", 30),
+    ("Quarterly (91 days)", 91),
+    ("Half-yearly (182 days)", 182),
+    ("Yearly (365 days)", 365),
+    ("All time", None),
+]
+
+# Officer/admin command names used by the $commandstats "admin" filter.
+OFFICER_COMMANDS = {
+    "boss", "bosshalf", "roster", "rosteradmin", "addmem", "deduct", "massdeduct",
+    "adjust", "addpoints", "addallearned", "refunditem", "refundolditem",
+    "fullpointwipe", "mainswap",
+}
+
+
+def _parse_sheet_dt(value):
+    """Parse a Bosses / Command Log timestamp into a datetime. Accepts the literal
+    'dd/mm/yyyy HH:MM:SS' string (and a few near variants) or a Google Sheets date
+    serial (days since 1899-12-30). Returns None when nothing parses — e.g. the
+    header row — so callers can just skip it."""
+    if value is None or value == "":
+        return None
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        try:
+            return dt(1899, 12, 30) + timedelta(days=float(value))
+        except (OverflowError, ValueError):
+            return None
+    s = str(value).strip()
+    for fmt in ("%d/%m/%Y %H:%M:%S", "%d/%m/%Y %H:%M", "%d/%m/%Y",
+                "%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
+        try:
+            return dt.strptime(s, fmt)
+        except ValueError:
+            pass
+    try:
+        return dt(1899, 12, 30) + timedelta(days=float(s))
+    except (ValueError, OverflowError):
+        return None
+
+
+def _parse_attendees(value):
+    """Parse the Bosses attendees cell (a Python list repr like
+    "['Liaa', 'Bob Smith']") into a list of names. Roster names are limited to
+    letters/digits/spaces, so a manual split is safe and needs no ast."""
+    s = str(value or "").strip()
+    if s.startswith("[") and s.endswith("]"):
+        s = s[1:-1]
+    out = []
+    for part in s.split(","):
+        name = part.strip().strip("'\"").strip()
+        if name:
+            out.append(name)
+    return out
+
+
+def _in_window(when, now, days):
+    """True if `when` is within the last `days` ending at `now` (days=None -> all)."""
+    if when is None:
+        return False
+    if days is None:
+        return True
+    return when >= now - timedelta(days=days)
+
+
+def _is_raid_row(boss, pool):
+    """One Bosses row counts as a single raid when it's the RBPP row of a full raid
+    or the combined ' HALF' row of a half raid; other per-pool rows are skipped."""
+    return str(pool).strip().upper() == "RBPP" or "HALF" in str(boss).upper()
+
+
+def _attendance_counts(boss_rows, now, days):
+    """-> (dict name -> raids attended, total raids) over the window."""
+    counts = {}
+    total = 0
+    for row in boss_rows:
+        if len(row) < 4 or not _in_window(_parse_sheet_dt(row[0]), now, days):
+            continue
+        if not _is_raid_row(row[1], row[2]):
+            continue
+        total += 1
+        for name in _parse_attendees(row[3]):
+            counts[name] = counts.get(name, 0) + 1
+    return counts, total
+
+
+def _player_attendance(boss_rows, player, now, days):
+    """-> (attended, total_raids, dict boss -> count) for one player over the
+    window. Matching is case-insensitive on the canonical roster name."""
+    target = (player or "").strip().lower()
+    attended = 0
+    total = 0
+    per_boss = {}
+    for row in boss_rows:
+        if len(row) < 4 or not _in_window(_parse_sheet_dt(row[0]), now, days):
+            continue
+        if not _is_raid_row(row[1], row[2]):
+            continue
+        total += 1
+        if target in [n.lower() for n in _parse_attendees(row[3])]:
+            attended += 1
+            boss = str(row[1]).strip()
+            per_boss[boss] = per_boss.get(boss, 0) + 1
+    return attended, total, per_boss
+
+
+def _boss_activity(boss_rows, now, days):
+    """-> dict boss -> (raids, avg_attendees) over the window. The ' HALF' suffix
+    is kept so half raids show separately."""
+    raids = {}
+    att = {}
+    for row in boss_rows:
+        if len(row) < 4 or not _in_window(_parse_sheet_dt(row[0]), now, days):
+            continue
+        if not _is_raid_row(row[1], row[2]):
+            continue
+        boss = str(row[1]).strip()
+        raids[boss] = raids.get(boss, 0) + 1
+        att[boss] = att.get(boss, 0) + len(_parse_attendees(row[3]))
+    return {b: (raids[b], att[b] / raids[b] if raids[b] else 0) for b in raids}
+
+
+def _command_counts(log_rows, now, days, allowed=None):
+    """-> (dict user -> count, dict command -> count, total) over the window.
+    `allowed`, if given, is a set of lowercase command names to include."""
+    per_user = {}
+    per_cmd = {}
+    total = 0
+    for row in log_rows:
+        if len(row) < 3 or not _in_window(_parse_sheet_dt(row[2]), now, days):
+            continue
+        command = str(row[0]).strip()
+        if allowed is not None and command.lower() not in allowed:
+            continue
+        user = str(row[1]).strip() or "(unknown)"
+        per_user[user] = per_user.get(user, 0) + 1
+        per_cmd[command] = per_cmd.get(command, 0) + 1
+        total += 1
+    return per_user, per_cmd, total
+
+
+def _rank_block(counts, top=20):
+    """Format a count dict as a ranked 'N. key — count' block (descending by
+    count, then key alphabetically). Returns '(none)' when empty."""
+    if not counts:
+        return "(none)"
+    ordered = sorted(counts.items(), key=lambda kv: (-kv[1], str(kv[0]).lower()))
+    return "\n".join(f"{i + 1}. {k} — {v}" for i, (k, v) in enumerate(ordered[:top]))
+
+
+def _stats_window_label(days):
+    for lbl, d in STATS_WINDOWS:
+        if d == days:
+            return lbl
+    return "All time" if days is None else f"{days} days"
+
+
+class StatsView(discord.ui.View):
+    """A stats embed with a dropdown to switch the rolling time window. Sheet rows
+    are fetched once and cached on the view, so changing window just recomputes
+    locally. Scoped to the invoker; 5-minute timeout.
+
+    kind: 'attendance' | 'command' | 'player' | 'boss'."""
+    def __init__(self, invoker, kind, rows, now, *, player=None,
+                 allowed=None, scope_label=None, days=30):
+        super().__init__(timeout=300)
+        self.invoker = invoker
+        self.kind = kind
+        self.rows = rows
+        self.now = now
+        self.player = player
+        self.allowed = allowed
+        self.scope_label = scope_label
+        self.days = days
+        self.message = None
+        self.win_sel = discord.ui.Select(
+            placeholder="Time window…",
+            options=[discord.SelectOption(label=lbl,
+                                          value=("none" if d is None else str(d)),
+                                          default=(d == days))
+                     for lbl, d in STATS_WINDOWS])
+        self.win_sel.callback = self._pick_window
+        self.add_item(self.win_sel)
+
+    async def interaction_check(self, interaction):
+        if interaction.user.id != self.invoker.id:
+            await interaction.response.send_message(
+                "Only the person who ran this can change the window.", ephemeral=True)
+            return False
+        return True
+
+    async def _pick_window(self, interaction):
+        v = interaction.data["values"][0]
+        self.days = None if v == "none" else int(v)
+        for opt in self.win_sel.options:
+            opt.default = (opt.value == v)
+        await interaction.response.edit_message(embed=self.build_embed(), view=self)
+
+    def build_embed(self):
+        days = self.days
+        wl = _stats_window_label(days)
+        if self.kind == "attendance":
+            counts, total = _attendance_counts(self.rows, self.now, days)
+            e = discord.Embed(title=f"Attendance — {wl}", colour=discord.Color.orange())
+            e.description = f"{total} raids recorded in this window."
+            e.add_field(name="Most raids attended", value=_rank_block(counts, 20), inline=False)
+            return e
+        if self.kind == "command":
+            per_user, per_cmd, total = _command_counts(self.rows, self.now, days, self.allowed)
+            e = discord.Embed(
+                title=f"Command usage — {self.scope_label or 'all commands'} — {wl}",
+                colour=discord.Color.orange())
+            e.description = f"{total} commands logged in this window."
+            e.add_field(name="By user", value=_rank_block(per_user, 20), inline=False)
+            if self.allowed is None or len(self.allowed) != 1:
+                e.add_field(name="By command", value=_rank_block(per_cmd, 15), inline=False)
+            return e
+        if self.kind == "player":
+            attended, total, per_boss = _player_attendance(self.rows, self.player, self.now, days)
+            pct = (attended / total * 100) if total else 0
+            e = discord.Embed(title=f"{self.player} — attendance — {wl}",
+                              colour=discord.Color.orange())
+            e.description = f"Attended {attended} of {total} raids ({pct:.0f}%)."
+            e.add_field(name="By boss", value=_rank_block(per_boss, 25), inline=False)
+            return e
+        if self.kind == "boss":
+            activity = _boss_activity(self.rows, self.now, days)
+            ordered = sorted(activity.items(), key=lambda kv: (-kv[1][0], kv[0].lower()))
+            e = discord.Embed(title=f"Boss activity — {wl}", colour=discord.Color.orange())
+            e.description = f"{sum(v[0] for v in activity.values())} raids recorded in this window."
+            lines = [f"{i + 1}. {b} — {c} raids, avg {a:.1f} attendees"
+                     for i, (b, (c, a)) in enumerate(ordered[:20])]
+            e.add_field(name="By boss", value="\n".join(lines) or "(none)", inline=False)
+            return e
+        return discord.Embed(title="No stats", colour=discord.Color.orange())
+
+    async def on_timeout(self):
+        if self.message:
+            try:
+                for c in self.children:
+                    c.disabled = True
+                await self.message.edit(view=self)
+            except Exception:
+                pass
+
+
+@client.command(aliases=['attstats', 'attendanceleaderboard', 'attlb'])
+@dkp_read()
+async def attendancestats(ctx, *name):
+    """Raid-attendance stats from the Bosses log, with a rolling-window dropdown.
+    Give a player name for that player's detail (raids, % and per-boss); omit it
+    for the attendance leaderboard."""
+    rows = await bot4ws10.aget_all_values()
+    now = dt.now()
+    name = " ".join(name).strip()
+    if name:
+        user_list = await acached_col_values(bot4ws1, 1, "roster_names")
+        realname, caps, spaces, suggestions = find_name(name, user_list)
+        if realname is None:
+            await ctx.send(not_found_message(name, suggestions))
+            return
+        view = StatsView(ctx.author, "player", rows, now, player=realname)
+    else:
+        view = StatsView(ctx.author, "attendance", rows, now)
+    view.message = await ctx.send(embed=view.build_embed(), view=view)
+
+
+@client.command(aliases=['bossstats', 'raidstats', 'bossactivity'])
+@dkp_read()
+async def bossleaderboard(ctx):
+    """Per-boss raid activity (raid counts + average attendees) with a window dropdown."""
+    rows = await bot4ws10.aget_all_values()
+    view = StatsView(ctx.author, "boss", rows, dt.now())
+    view.message = await ctx.send(embed=view.build_embed(), view=view)
+
+
+@client.command(aliases=['cmdstats', 'commandusage', 'adminstats'])
+@dkp_only()
+@commands.has_any_role("General", "Guardian", "REDALiCE", "Helper")
+async def commandstats(ctx, *, filter_arg: str = None):
+    """Command-Log usage per user, with a rolling-window dropdown.
+    `$commandstats` counts all commands; `$commandstats admin` only officer
+    commands; `$commandstats <command>` only that one (e.g. `$commandstats boss`)."""
+    rows = await bot4ws11.aget_all_values()
+    now = dt.now()
+    allowed = None
+    scope_label = "all commands"
+    if filter_arg:
+        f = filter_arg.strip().lower()
+        if f in ("admin", "officer"):
+            allowed, scope_label = OFFICER_COMMANDS, "officer commands"
+        else:
+            allowed, scope_label = {f}, f"'{f}' only"
+    view = StatsView(ctx.author, "command", rows, now, allowed=allowed, scope_label=scope_label)
+    view.message = await ctx.send(embed=view.build_embed(), view=view)
+
+
+# ---------------------------------------------------------------------------
+# KP leaderboards — shared dropdown UI.
+#
+# All four leaderboard commands ($pointleaderboard, $pointleaderboardlast30,
+# $classpointleaderboard, $earnedleaderboard) post a LeaderboardView: a KP-pool
+# dropdown (and a class dropdown for the class variant) plus Prev/Next paging,
+# so you can switch pool/class without re-running the command. The text args
+# (maxkp/maxatt) still apply as initial filters. The sort/filter rule is the pure
+# _rank_leaderboard so it's unit-tested; the fetch + view are the only async bits.
+# PKP is excluded from the pools, matching the original commands.
+# ---------------------------------------------------------------------------
+LEADERBOARD_POOLS = [k for k in KP_WORKSHEETS if k != "PKP"]
+LEADERBOARD_PAGE = 20
+
+
+async def _class_members(classname):
+    """Set of roster names whose class matches `classname` (case-insensitive)."""
+    names = await bot4ws1.acol_values(1)
+    classes = await bot4ws1.acol_values(5)
+    want = classname.capitalize()
+    return {names[i] for i in range(len(names))
+            if i < len(classes) and str(classes[i]).capitalize() == want}
+
+
+async def _leaderboard_rows(kp, kind, classname=None):
+    """Fetch (name, points, attendance%) rows for a pool. points is the Earned
+    column (4) for 'earned', else Current (7); attendance (col 3) is only read for
+    'last30' (None otherwise). 'class' is filtered to that class's members."""
+    ws = KP_WORKSHEETS[kp]["read"]
+    names = (await ws.acol_values(1))[1:]
+    pts = [safe_float(x) for x in (await ws.acol_values(4 if kind == "earned" else 7))[1:]]
+    att = ([safe_float(x) for x in (await ws.acol_values(3))[1:]]
+           if kind == "last30" else [None] * len(names))
+    members = await _class_members(classname) if (kind == "class" and classname) else None
+    rows = []
+    for i in range(len(names)):
+        if members is not None and names[i] not in members:
+            continue
+        rows.append((names[i],
+                     pts[i] if i < len(pts) else 0.0,
+                     att[i] if i < len(att) else None))
+    return rows
+
+
+def _rank_leaderboard(rows, kind, maxkp=None, maxatt=None):
+    """Pure filter + sort of (name, points, attendance) rows by leaderboard kind.
+    'last30' ranks by attendance desc (points > 0 only, optional maxatt cap);
+    every other kind ranks by points desc (optional maxkp cap)."""
+    out = list(rows)
+    if kind == "last30":
+        out = [r for r in out if r[2] is not None and r[1] > 0]
+        if maxatt is not None:
+            out = [r for r in out if r[2] <= maxatt]
+        out.sort(key=lambda r: (r[2], r[1]), reverse=True)
+    else:
+        if maxkp is not None:
+            out = [r for r in out if r[1] <= maxkp]
+        out.sort(key=lambda r: r[1], reverse=True)
+    return out
+
+
+def _fmt_lb_value(row, kind):
+    """Embed value for a ranked row: 'points (att%)' for last30, else points."""
+    _name, points, att = row
+    return f"{points} ({att}%)" if kind == "last30" else f"{points}"
+
+
+class LeaderboardView(discord.ui.View):
+    """KP-pool (and class) dropdowns + Prev/Next paging over a leaderboard.
+    Ranked rows are cached per (pool, class) so paging never re-fetches. Scoped to
+    the invoker; 5-minute timeout. kind: 'current'|'earned'|'last30'|'class'."""
+    _TITLES = {"current": "Current points", "earned": "Points earned",
+               "last30": "Attendance", "class": "Class points"}
+
+    def __init__(self, invoker, kind, kp, *, classname=None, maxkp=None, maxatt=None):
+        super().__init__(timeout=300)
+        self.invoker = invoker
+        self.kind = kind
+        self.kp = kp
+        self.classname = classname
+        self.maxkp = maxkp
+        self.maxatt = maxatt
+        self.page = 0
+        self.message = None
+        self._cache = {}
+        self._build_components()
+
+    def _build_components(self):
+        self.clear_items()
+        pool_sel = discord.ui.Select(
+            placeholder="KP pool…",
+            options=[discord.SelectOption(label=p, value=p, default=(p == self.kp))
+                     for p in LEADERBOARD_POOLS])
+        pool_sel.callback = self._pick_pool
+        self.add_item(pool_sel)
+        if self.kind == "class":
+            cls_sel = discord.ui.Select(
+                placeholder="Class…",
+                options=[discord.SelectOption(label=c, value=c, default=(c == self.classname))
+                         for c in CLASSES])
+            cls_sel.callback = self._pick_class
+            self.add_item(cls_sel)
+        prev_b = discord.ui.Button(label="Prev", style=discord.ButtonStyle.secondary)
+        prev_b.callback = self._prev
+        next_b = discord.ui.Button(label="Next", style=discord.ButtonStyle.secondary)
+        next_b.callback = self._next
+        self.add_item(prev_b)
+        self.add_item(next_b)
+
+    async def interaction_check(self, interaction):
+        if interaction.user.id != self.invoker.id:
+            await interaction.response.send_message(
+                "Only the person who ran this leaderboard can change it.", ephemeral=True)
+            return False
+        return True
+
+    async def _ranked(self):
+        key = (self.kp, self.classname)
+        if key not in self._cache:
+            rows = await _leaderboard_rows(self.kp, self.kind, self.classname)
+            self._cache[key] = _rank_leaderboard(rows, self.kind, self.maxkp, self.maxatt)
+        return self._cache[key]
+
+    async def build_embed(self):
+        ranked = await self._ranked()
+        pages = max(1, (len(ranked) + LEADERBOARD_PAGE - 1) // LEADERBOARD_PAGE)
+        self.page = max(0, min(self.page, pages - 1))
+        start = self.page * LEADERBOARD_PAGE
+        chunk = ranked[start:start + LEADERBOARD_PAGE]
+        cls = f" ({self.classname})" if self.kind == "class" else ""
+        e = discord.Embed(
+            title=f"{self.kp} — {self._TITLES.get(self.kind, '')}{cls} leaderboard",
+            colour=discord.Color.orange())
+        if not chunk:
+            e.description = "No entries."
+            return e
+        e.description = f"Page {self.page + 1}/{pages} · {len(ranked)} ranked"
+        for i, row in enumerate(chunk):
+            e.add_field(name=f"{start + i + 1}. {row[0]}", value=_fmt_lb_value(row, self.kind), inline=False)
+        return e
+
+    async def _render(self, interaction):
+        self._build_components()
+        await interaction.response.edit_message(embed=await self.build_embed(), view=self)
+
+    async def _pick_pool(self, interaction):
+        self.kp = interaction.data["values"][0]
+        self.page = 0
+        await self._render(interaction)
+
+    async def _pick_class(self, interaction):
+        self.classname = interaction.data["values"][0]
+        self.page = 0
+        await self._render(interaction)
+
+    async def _prev(self, interaction):
+        self.page -= 1
+        await self._render(interaction)
+
+    async def _next(self, interaction):
+        self.page += 1
+        await self._render(interaction)
+
+    async def on_timeout(self):
+        if self.message:
+            try:
+                for c in self.children:
+                    c.disabled = True
+                await self.message.edit(view=self)
+            except Exception:
+                pass
+
+
 @client.command(aliases=['plb', 'pointsleaderboard', 'pointslb', 'pointlb'])
 @dkp_read()
-async def pointleaderboard(ctx, kp, maxkp = 99999, number = 10):
-    """displays the leaderboard for current points in a certain KP pool"""
-    kp = kp.upper()
-    maxkp = float(maxkp)
-    number = int(number)
+async def pointleaderboard(ctx, kp=None, maxkp=99999, number=10):
+    """Leaderboard for current points in a KP pool, with pool dropdown + paging."""
+    kp = (kp or "VKP").upper()
     if kp not in KP_WORKSHEETS or kp == "PKP":
         await ctx.send("Invalid KP pool")
         return
-    ws = KP_WORKSHEETS[kp]["read"]
-    namelist = (await ws.acol_values(1))[1:]
-    pointlist = (await ws.acol_values(7))[1:]
-    floatpointlist = [safe_float(x) for x in pointlist]
-    combined = list(zip(namelist, floatpointlist))
-    sortedcombined = sorted(combined, key=lambda x: x[1], reverse=True)
-    # remove the people who have more than maxkp
-    sortedcombined = [x for x in sortedcombined if x[1] <= maxkp]
-    total = min(number, len(sortedcombined))
-    pagecounter = 0
-    for i in range(total):
-        if i % 20 == 0:
-            if i != 0:
-                await ctx.send(embed=embed)
-            pagecounter += 1
-            title = kp + " Leaderboard"
-            if total > 20:
-                title += " Page " + str(pagecounter)
-            embed = discord.Embed(title=title, colour=discord.Color.orange())
-        embed.add_field(name=str(i + 1) + ". " + sortedcombined[i][0], value=sortedcombined[i][1], inline=False)
-    if total > 0:
-        await ctx.send(embed=embed)
+    view = LeaderboardView(ctx.author, "current", kp, maxkp=safe_float(maxkp, 99999))
+    view.message = await ctx.send(embed=await view.build_embed(), view=view)
 
 
 @client.command(aliases=['plb30', 'pointsleaderboardlast30', 'pointslb30', 'pointlb30'])
 @dkp_read()
-async def pointleaderboardlast30(ctx, kp, maxatt = 100, number = 10):
-    """darkhealz last 30 command"""
-    kp = kp.upper()
-    maxatt = int(maxatt)
-    number = int(number)
+async def pointleaderboardlast30(ctx, kp=None, maxatt=100, number=10):
+    """Leaderboard ranked by last-30-day attendance, with pool dropdown + paging."""
+    kp = (kp or "VKP").upper()
     if kp not in KP_WORKSHEETS or kp == "PKP":
         await ctx.send("Invalid KP pool")
         return
-    ws = KP_WORKSHEETS[kp]["read"]
-    namelist = (await ws.acol_values(1))[1:]
-    pointlist = (await ws.acol_values(7))[1:]
-    attlist = (await ws.acol_values(3))[1:]
-    floatpointlist = [safe_float(x) for x in pointlist]
-    # attlist is in the format "7.49%", so we need to convert it to a float and remove the percentage sign
-    # attlist could also be '#DIV/0!' because my sheet math is no good, so we need to handle that
-    floatattlist = [safe_float(x) for x in attlist]
-    combined = list(zip(namelist, floatpointlist, floatattlist))
-    sortedcombined = sorted(combined, key=lambda x: x[2], reverse=True)
-    sortedcombined = [x for x in sortedcombined if x[2] <= maxatt]
-    sortedcombined = [x for x in sortedcombined if x[1] > 0]
-    total = min(number, len(sortedcombined))
-    pagecounter = 0
-    for i in range(total):
-        if i % 20 == 0:
-            if i != 0:
-                await ctx.send(embed=embed)
-            pagecounter += 1
-            title = kp + " Leaderboard"
-            if total > 20:
-                title += " Page " + str(pagecounter)
-            embed = discord.Embed(title=title, colour=discord.Color.orange())
-        embed.add_field(name=str(i + 1) + ". " + sortedcombined[i][0], value=f"{sortedcombined[i][1]} ({sortedcombined[i][2]}%)", inline=False)
-    if total > 0:
-        await ctx.send(embed=embed)
+    view = LeaderboardView(ctx.author, "last30", kp, maxatt=safe_float(maxatt, 100))
+    view.message = await ctx.send(embed=await view.build_embed(), view=view)
 
 
 @client.command()
@@ -3976,22 +4948,22 @@ async def newowner(ctx, confirmation, *charnames):
             # get the name, append [OLD] to the front, and update the cell
             loot_cell = await bot1ws9.afind(findc, in_column = 1)
             row = loot_cell.row
-            for col in range(2, bot1ws9.col_count + 1):
-                # handle column letter greater than 26 -> AA, AB, etc
-                colletter = ''
-                if col > 26:
-                    colletter += chr(64 + (col // 26))
-                    colletter += chr(64 + (col % 26))
-                else:
-                    colletter = chr(64 + col)
-                name = (await bot1ws9.aacell(f'{colletter}{row}')).value
-                print("changing " + str(name) + " in cell " + f'{colletter}{row}')
-                if name != '' and name is not None and not name.startswith('[OLD] '):
-                    newname = '[OLD] ' + name
-                    await bot1ws9.aupdate_acell(f'{colletter}{row}', newname)
-                else:
-                    # stop the for loop, we have reached the end
-                    break
+            # Read the whole loot row in ONE call instead of cell-by-cell — the
+            # per-cell reads were the slow part that timed out. Items are contiguous
+            # from column 2; relabel the run up to the first empty (or already-[OLD])
+            # cell, then write it back in a single batch update.
+            rowvals = await bot1ws9.arow_values(row)
+            relabelled = []
+            for idx in range(1, len(rowvals)):
+                name = rowvals[idx]
+                if name is None or name == '' or str(name).startswith('[OLD] '):
+                    break  # reached the end of this character's items
+                relabelled.append('[OLD] ' + str(name))
+            if relabelled:
+                end_col = 1 + len(relabelled)  # first item is column 2 (1-based)
+                cell_range = f"B{row}:{_col_letters(end_col)}{row}"
+                await bot1ws9.aupdate([relabelled], cell_range)
+                print(f"newowner: relabelled {len(relabelled)} loot item(s) for {findc} in {cell_range}")
             # set the points to 0 by adjusting them
             # get the current points in column g
             # add that value to column f
@@ -4044,72 +5016,30 @@ async def newowner(ctx, confirmation, *charnames):
 
 @client.command(aliases=['cplb', 'classpointsleaderboard', 'classpointslb', 'classpointlb'])
 @dkp_read()
-async def classpointleaderboard(ctx, kp, classname, maxkp = 99999, number = 10):
-    """displays the leaderboard for current points in a certain KP pool for a certain class"""
-    kp = kp.upper()
-    classname = classname.capitalize()
-    maxkp = float(maxkp)
-    sheet1names = await bot4ws1.acol_values(1)
-    sheet1classes = await bot4ws1.acol_values(5)
-    classnamelist = []
-    for i in range(len(sheet1names)):
-        if sheet1classes[i].capitalize() == classname:
-            classnamelist.append(sheet1names[i])
+async def classpointleaderboard(ctx, kp=None, classname=None, maxkp=99999, number=10):
+    """Current-points leaderboard for a class, with pool + class dropdowns + paging."""
+    kp = (kp or "VKP").upper()
     if kp not in KP_WORKSHEETS or kp == "PKP":
         await ctx.send("Invalid KP pool")
         return
-    ws = KP_WORKSHEETS[kp]["read"]
-    namelist = (await ws.acol_values(1))[1:]
-    pointlist = (await ws.acol_values(7))[1:]
-    floatpointlist = [safe_float(x) for x in pointlist]
-    combined = list(zip(namelist, floatpointlist))
-    sortedcombined = sorted(combined, key=lambda x: x[1], reverse=True)
-    sortedcombined = [x for x in sortedcombined if x[1] <= maxkp]
-    sortedcombined = [x for x in sortedcombined if x[0] in classnamelist]
-    total = min(number, len(sortedcombined))
-    pagecounter = 0
-    for i in range(total):
-        if i % 20 == 0:
-            if i != 0:
-                await ctx.send(embed=embed)
-            pagecounter += 1
-            title = kp + " Leaderboard"
-            if total > 20:
-                title += " Page " + str(pagecounter)
-            embed = discord.Embed(title=title, colour=discord.Color.orange())
-        embed.add_field(name=str(i + 1) + ". " + sortedcombined[i][0], value=sortedcombined[i][1], inline=False)
-    if total > 0:
-        await ctx.send(embed=embed)
+    classname = (classname or "Warrior").capitalize()
+    if classname not in CLASSES:
+        await ctx.send("Invalid class! Please use Warrior, Rogue, Mage, Druid, or Ranger")
+        return
+    view = LeaderboardView(ctx.author, "class", kp, classname=classname, maxkp=safe_float(maxkp, 99999))
+    view.message = await ctx.send(embed=await view.build_embed(), view=view)
 
 
 @client.command(aliases=['elb', 'earnedpointsleaderboard', 'earnedpointslb', 'earnedpointlb'])
 @dkp_read()
-async def earnedleaderboard(ctx, kp, number = 10):
-    """displays the leaderboard for total points earned in a certain KP pool"""
-    kp = kp.upper()
+async def earnedleaderboard(ctx, kp=None, number=10):
+    """Leaderboard for total points earned in a KP pool, with pool dropdown + paging."""
+    kp = (kp or "VKP").upper()
     if kp not in KP_WORKSHEETS or kp == "PKP":
         await ctx.send("Invalid KP pool")
         return
-    ws = KP_WORKSHEETS[kp]["read"]
-    namelist = (await ws.acol_values(1))[1:]
-    pointlist = (await ws.acol_values(4))[1:]
-    floatpointlist = [safe_float(x) for x in pointlist]
-    combined = list(zip(namelist, floatpointlist))
-    sortedcombined = sorted(combined, key=lambda x: x[1], reverse=True)
-    total = min(number, len(sortedcombined))
-    pagecounter = 0
-    for i in range(total):
-        if i % 20 == 0:
-            if i != 0:
-                await ctx.send(embed=embed)
-            pagecounter += 1
-            title = kp + " Leaderboard"
-            if total > 20:
-                title += " Page " + str(pagecounter)
-            embed = discord.Embed(title=title, colour=discord.Color.orange())
-        embed.add_field(name=str(i + 1) + ". " + sortedcombined[i][0], value=sortedcombined[i][1], inline=False)
-    if total > 0:
-        await ctx.send(embed=embed)
+    view = LeaderboardView(ctx.author, "earned", kp)
+    view.message = await ctx.send(embed=await view.build_embed(), view=view)
 
 class _ApproveCtx:
     """Minimal ctx shim so the boss / bosshalf command callbacks can be driven from
@@ -5245,10 +6175,18 @@ CH_WORLDS = {
     "gwydion":   15,
     "fingal":    53,
     "nuada":     56,
+    "cerridwen": 57,
     "tethra":    101,
     "rigantona": 102,
     "llyr":      103,
     "belenor":   104,
+}
+
+# World IDs that must never be tracked, polled, compared, or auto-posted —
+# e.g. admin/test servers. Filtered out of boss_get_tracked_world_ids() so they
+# stay out of "all fights" / cross-world data.
+EXCLUDED_WORLD_IDS = {
+    1004,  # Apple — admin test server
 }
 
 # UTC-anchored fire times. Bot is hosted on non-local servers, so this
@@ -6567,7 +7505,7 @@ def boss_get_tracked_world_ids(force=False):
                 continue
     except Exception:
         logger.exception("tracked-world discovery: configured-guild scan failed")
-    ids = {w for w in ids if w > 0}
+    ids = {w for w in ids if w > 0 and w not in EXCLUDED_WORLD_IDS}
     with _boss_tracked_worlds_lock:
         _boss_tracked_worlds_cache["ids"] = set(ids)
         _boss_tracked_worlds_cache["loaded_at"] = now
@@ -6589,6 +7527,8 @@ def _collect_auto_post_targets():
         try:
             wid = int(entry.get("world_id", 0))
         except Exception:
+            continue
+        if wid in EXCLUDED_WORLD_IDS:
             continue
         cid = entry.get("channel_id")
         if not cid:
@@ -8385,6 +9325,135 @@ async def historyinfo(ctx):
 # These commands have NO guild_ids restriction so they work in any server the
 # bot is invited to. Each gates with is_server_setup_authorized so only admins
 # or the configured setup_role can change settings.
+
+class _SetupWorldModal(discord.ui.Modal, title="Set world by ID or name"):
+    """Free-text world entry for the setup wizard — handles numeric IDs and names
+    that aren't in the known-names dropdown."""
+    def __init__(self, parent):
+        super().__init__()
+        self.parent = parent
+        self.world_in = discord.ui.TextInput(
+            label="World ID or name", placeholder="e.g. 15 or gwydion", max_length=32)
+        self.add_item(self.world_in)
+
+    async def on_submit(self, interaction):
+        wid, _canon = resolve_world(self.world_in.value.strip())
+        if wid is None or wid <= 0:
+            await interaction.response.send_message(
+                "Couldn't resolve that world. Use a positive number or a known name "
+                "(`$listworlds`).", ephemeral=True)
+            return
+        await self.parent._apply_world(interaction, wid)
+
+
+class SetupView(discord.ui.View):
+    """Guided per-server setup: world (dropdown of known names + a modal for any
+    other ID/name), auto-post channel (native channel picker), and an optional
+    setup role (native role picker). Each choice writes server_config immediately.
+    Restricted to the admin who started it; 5-minute timeout."""
+    def __init__(self, invoker, guild):
+        super().__init__(timeout=300)
+        self.invoker = invoker
+        self.guild = guild
+        self.message = None
+        self.world_sel = discord.ui.Select(
+            placeholder="World (known names)…",
+            options=[discord.SelectOption(label=n.capitalize(), value=str(wid))
+                     for n, wid in sorted(CH_WORLDS.items())][:25])
+        self.world_sel.callback = self._pick_world
+        self.add_item(self.world_sel)
+        self.chan_sel = discord.ui.ChannelSelect(
+            placeholder="Auto-post channel (optional)…",
+            channel_types=[discord.ChannelType.text, discord.ChannelType.news],
+            min_values=0, max_values=1)
+        self.chan_sel.callback = self._pick_channel
+        self.add_item(self.chan_sel)
+        self.role_sel = discord.ui.RoleSelect(
+            placeholder="Setup role (optional)…", min_values=0, max_values=1)
+        self.role_sel.callback = self._pick_role
+        self.add_item(self.role_sel)
+        self.world_btn = discord.ui.Button(label="Enter world ID/name", style=discord.ButtonStyle.secondary)
+        self.world_btn.callback = self._open_world
+        self.add_item(self.world_btn)
+        self.done_btn = discord.ui.Button(label="Done", style=discord.ButtonStyle.success)
+        self.done_btn.callback = self._done
+        self.add_item(self.done_btn)
+
+    async def interaction_check(self, interaction):
+        if interaction.user.id != self.invoker.id:
+            await interaction.response.send_message(
+                "Only the person who started setup can use it.", ephemeral=True)
+            return False
+        return True
+
+    def build_embed(self):
+        entry = get_server_entry(self.guild.id) or {}
+        wid = entry.get("world_id")
+        cid = entry.get("channel_id")
+        role = entry.get("setup_role")
+        e = discord.Embed(title=f"Server setup — {self.guild.name}", colour=discord.Color.orange())
+        e.add_field(name="World", value=(f"{display_world(wid)} (`{wid}`)" if wid else "not set"), inline=False)
+        e.add_field(name="Auto-post channel", value=(f"<#{cid}>" if cid else "disabled"), inline=False)
+        e.add_field(name="Setup role",
+                    value=(f"`{role}`" if role else "(admins / Winston Admin / REDALiCE only)"),
+                    inline=False)
+        e.set_footer(text="Pick a world, channel and optional role — changes save instantly. Press Done when finished.")
+        return e
+
+    async def _apply_world(self, interaction, wid):
+        set_server_entry(self.guild.id, world_id=wid)
+        try:
+            initialize_posted_fights_if_needed(world_id=wid)
+        except Exception:
+            logger.exception(f"setup wizard: could not seed posted_fights for world {wid}")
+        await interaction.response.edit_message(embed=self.build_embed(), view=self)
+
+    async def _pick_world(self, interaction):
+        await self._apply_world(interaction, int(interaction.data["values"][0]))
+
+    async def _open_world(self, interaction):
+        await interaction.response.send_modal(_SetupWorldModal(self))
+
+    async def _pick_channel(self, interaction):
+        vals = self.chan_sel.values
+        set_server_entry(self.guild.id, channel_id=(vals[0].id if vals else 0))
+        await interaction.response.edit_message(embed=self.build_embed(), view=self)
+
+    async def _pick_role(self, interaction):
+        vals = self.role_sel.values
+        set_server_entry(self.guild.id, setup_role=(vals[0].name if vals else ""))
+        await interaction.response.edit_message(embed=self.build_embed(), view=self)
+
+    async def _done(self, interaction):
+        for c in self.children:
+            c.disabled = True
+        await interaction.response.edit_message(embed=self.build_embed(), view=self)
+        self.stop()
+
+    async def on_timeout(self):
+        if self.message:
+            try:
+                for c in self.children:
+                    c.disabled = True
+                await self.message.edit(view=self)
+            except Exception:
+                pass
+
+
+@client.command(name="setup", aliases=['setupwizard', 'serversetup', 'setupserver'])
+async def setup_wizard(ctx):
+    """Guided server setup wizard — world, auto-post channel and setup role in one
+    menu. Same permissions as the individual $setworld / $setchannel commands."""
+    if ctx.guild is None:
+        await ctx.send("This command can't be used in DMs.")
+        return
+    entry = get_server_entry(ctx.guild.id)
+    if not is_server_setup_authorized(ctx.author, entry):
+        await ctx.send("You don't have permission to configure this server.")
+        return
+    view = SetupView(ctx.author, ctx.guild)
+    view.message = await ctx.send(embed=view.build_embed(), view=view)
+
 
 @client.command(aliases=['setceltichero', 'setworldid', 'setceltherosserver'])
 async def setworld(ctx, *, world_token: str = None):
